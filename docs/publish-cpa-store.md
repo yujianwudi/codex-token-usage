@@ -17,7 +17,6 @@ CPA 插件商店读取官方仓库 `router-for-me/CLIProxyAPI-Plugins-Store` 的
    ```text
    codex-token-usage_0.1.6_linux_amd64.zip
    codex-token-usage_0.1.6_linux_arm64.zip
-   codex-token-usage_0.1.6_darwin_amd64.zip
    codex-token-usage_0.1.6_darwin_arm64.zip
    codex-token-usage_0.1.6_windows_amd64.zip
    checksums.txt
