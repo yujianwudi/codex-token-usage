@@ -67,7 +67,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.20"
+	pluginVersion    = "0.1.21"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -1644,7 +1644,11 @@ func recordInvalidAuthIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord,
 	if authID == "" {
 		return nil
 	}
-	return upsertInvalidAuth(ctx, db, rec, status, reason, authID, authFile, authFileMTime, time.Now().Unix())
+	invalidatedAt := rec.RequestedAt.Unix()
+	if invalidatedAt <= 0 {
+		invalidatedAt = time.Now().Unix()
+	}
+	return upsertInvalidAuth(ctx, db, rec, status, reason, authID, authFile, authFileMTime, invalidatedAt)
 }
 
 func upsertInvalidAuth(ctx context.Context, db *sql.DB, rec usageRecord, status int, reason, authID, authFile string, authFileMTime int64, invalidatedAt int64) error {
@@ -3215,6 +3219,9 @@ LIMIT 1000`)
 			continue
 		}
 		if !codexAuthRecordLooksFileBacked(rec) {
+			continue
+		}
+		if authFile, authFileMTime := authFileStateForRecord(rec); authFileMTime > finishedAt && authFile != "" {
 			continue
 		}
 		if hasLaterSuccessfulUsage(ctx, db, rec, finishedAt) {
