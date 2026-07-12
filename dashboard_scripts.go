@@ -511,9 +511,9 @@ function authAliasVariants(value){
   return [...new Set(out)];
 }
 function invalidAuthKey(r){return firstText(r.auth_file,r.auth_id,r.auth_index,r.source,r.email,r.name,'invalid-auth')}
-function invalidAuthFileName(r){return fileNameOnly(firstText(r.auth_file,r.auth_id,r.auth_index))}
+function invalidAuthFileName(r){const name=fileNameOnly(firstText(r.auth_file));return /\.json$/i.test(name)?name:''}
 function workspaceDeactivatedKey(r){return firstText(r.auth_file,r.auth_id,r.auth_index,r.source,r.email,r.name,'workspace-deactivated')}
-function workspaceDeactivatedFileName(r){return fileNameOnly(firstText(r.auth_file,r.auth_id,r.auth_index))}
+function workspaceDeactivatedFileName(r){const name=fileNameOnly(firstText(r.auth_file));return /\.json$/i.test(name)?name:''}
 function autobanReleaseKey(r){return firstText(r.auth_file,r.auth_id,r.auth_index,r.source,'autoban-release')}
 function fileNameOnly(value){value=String(value||'').trim();if(!value)return '';return value.split(/[\\/]/).pop()}
 function fileNameSet(names){return new Set((names||[]).map(fileNameOnly).filter(Boolean))}
@@ -774,13 +774,15 @@ async function deleteInvalidAuthRows(rows,confirmText,runningText){
   try{
     const res=await fetch(managementAuthFilesApi,{method:'DELETE',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({names:names})});
     const body=await readResponseBody(res);
-    if(!res.ok&&res.status!==207&&!authFileDeleteAlreadyApplied(res,body)){
+    const deleteResult=parseAuthFileDeleteResult(res,body,names);
+    if(!deleteResult.ok){
+      removeAuthFilesFromCurrentData(deleteResult.deleted);
       if(res.status===401)rejectManagementKey(key);
-      throw new Error('HTTP '+res.status+' '+body);
+      throw new Error(deleteResult.message);
     }
     setAuthDeleteProgress(invalidAuthStatusEl,'删除成功，正在刷新统计...','ok',72);
     invalidAuthSelected.clear();
-    removeAuthFilesFromCurrentData(names);
+    removeAuthFilesFromCurrentData(deleteResult.deleted);
     renderInvalidAuthModal();
     await load(true,true);
     setAuthDeleteBusy('invalid-auth',false);
@@ -805,13 +807,15 @@ async function deleteWorkspaceDeactivatedRows(rows,confirmText,runningText){
   try{
     const res=await fetch(managementAuthFilesApi,{method:'DELETE',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({names:names})});
     const body=await readResponseBody(res);
-    if(!res.ok&&res.status!==207&&!authFileDeleteAlreadyApplied(res,body)){
+    const deleteResult=parseAuthFileDeleteResult(res,body,names);
+    if(!deleteResult.ok){
+      removeAuthFilesFromCurrentData(deleteResult.deleted);
       if(res.status===401)rejectManagementKey(key);
-      throw new Error('HTTP '+res.status+' '+body);
-    }
+      throw new Error(deleteResult.message);
+	}
     setAuthDeleteProgress(workspaceDeactivatedStatusEl,'删除成功，正在刷新统计...','ok',72);
     workspaceDeactivatedSelected.clear();
-    removeAuthFilesFromCurrentData(names);
+    removeAuthFilesFromCurrentData(deleteResult.deleted);
     renderWorkspaceDeactivatedModal();
     await load(true,true);
     setAuthDeleteBusy('workspace-deactivated',false);
@@ -997,6 +1001,22 @@ async function readResponseBody(res){const text=await res.text();return text}
 function authFileDeleteAlreadyApplied(res,body){
   const text=String(body||'').toLowerCase();
   return !!res&&res.status===404&&(text.includes('auth file not found')||text.includes('auth_file_not_found'));
+}
+function parseAuthFileDeleteResult(res,body,requested){
+  const status=res?res.status:0;
+  const parsed=parseJSONBody(body);
+  if(res&&res.ok){
+    const deleted=Array.isArray(parsed.files)?parsed.files.map(fileNameOnly).filter(Boolean):requested.slice();
+    return {ok:true,deleted:[...new Set(deleted)],message:''};
+  }
+  if(status===404&&authFileDeleteAlreadyApplied(res,body))return {ok:true,deleted:[],message:''};
+  if(status===207){
+    const deleted=Array.isArray(parsed.files)?parsed.files.map(fileNameOnly).filter(Boolean):[];
+    const failed=Array.isArray(parsed.failed)?parsed.failed.map(item=>firstText(item&&item.name,item&&item.error)).filter(Boolean):[];
+    if(failed.length)return {ok:false,deleted:[...new Set(deleted)],message:'HTTP 207 部分删除失败：'+failed.join('；')};
+    return {ok:true,deleted:[...new Set(deleted)],message:''};
+  }
+  return {ok:false,deleted:[],message:'HTTP '+status+' '+body};
 }
 function codexAuthFiles(files){
   return (files||[]).filter(f=>{
@@ -1977,8 +1997,10 @@ function renderAccounts(){
   const start=(accountPage-1)*accountPageSize;
   const pageRows=rows.slice(start,start+accountPageSize);
   const externalCount=rows.filter(r=>r.external_use_suspected).length;
-  const invalidCount=rows.filter(r=>isXAIPool()?r.xai_state==='unauthorized':r.invalid_auth).length;
-  const workspaceDeactivatedCount=rows.filter(r=>isXAIPool()?r.xai_state==='forbidden':r.workspace_deactivated).length;
+  const allInvalidRows=isXAIPool()?((data.accounts||[]).filter(r=>r.xai_state==='unauthorized')):invalidAuthRows();
+  const allWorkspaceRows=isXAIPool()?((data.accounts||[]).filter(r=>r.xai_state==='forbidden')):workspaceDeactivatedRows();
+  const invalidCount=allInvalidRows.length;
+  const workspaceDeactivatedCount=allWorkspaceRows.length;
   const active429Count=isXAIPool()?rows.filter(r=>r.xai_state==='free_usage_exhausted'||r.xai_state==='rate_limited').length:autobanReleaseRows().length;
   const triggerFailed=rows.filter(r=>r.quota_trigger_status&&r.quota_trigger_status!=='success'&&r.quota_trigger_status!=='skipped').length;
   const riskCount=rows.filter(r=>findBan(r)||r.invalid_auth||r.workspace_deactivated||r.xai_state||r.external_use_suspected||r.disabled||r.expired||triggerRisk(r)||maxQuota(r)>=90||((r.requests||0)>0&&successRate(r)<80)).length;

@@ -41,3 +41,17 @@ func TestXAITierDisplayUsesMetadataFields(t *testing.T) {
 		}
 	}
 }
+
+func TestInvalidAuthManagementUsesUnfilteredCountsAndPartialDeleteResults(t *testing.T) {
+	for _, marker := range []string{
+		"const allInvalidRows=",
+		"const allWorkspaceRows=",
+		"parseAuthFileDeleteResult(res,body,names)",
+		"HTTP 207 部分删除失败",
+		"/\\.json$/i.test(name)?name:''",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("401 management marker %q not found", marker)
+		}
+	}
+}
