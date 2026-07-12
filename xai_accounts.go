@@ -262,7 +262,7 @@ func applyXAIStates(accounts []accountRow, states []xaiAccountStateRow) {
 
 func clearReplacedOrMissingXAIStates(ctx context.Context, db *sql.DB) error {
 	configured := readConfiguredXAIAccounts()
-	if configuredAuthDirectoryReadable() {
+	if globalXAIAuthSource.authoritative() {
 		states, err := queryActiveXAIStates(ctx, db, time.Now().Unix())
 		if err != nil {
 			return err

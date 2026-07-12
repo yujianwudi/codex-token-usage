@@ -1539,6 +1539,9 @@ const i18nEn={
   '当前没有认证失效':'No invalid credentials',
   '当前没有权限拒绝':'No permission denials',
   '免费额度':'Free usage',
+	'套餐分布':'Tier distribution',
+	'认证元数据识别':'Detected from auth metadata',
+	'识别来源':'Detection source',
   '当前没有免费额度耗尽':'No free usage exhaustion',
   '当前没有短期限流':'No temporary rate limits',
   '更换或重新登录 xAI 认证文件后解除':'Clears after replacing or signing in to the xAI credential again',
@@ -1966,7 +1969,7 @@ function bindTrendTooltip(svg,points,cfg){
 }
 function renderAccounts(){
   const data=poolData(); const total=(data.totals||{}).total_tokens||0; const q=(document.getElementById('account-filter').value||'').toLowerCase(); const sort=document.getElementById('account-sort').value;
-  let rows=(data.accounts||[]).filter(r=>(r.auth_index+' '+r.auth_id+' '+r.source+' '+r.provider+' '+r.email+' '+r.name+' '+r.auth_file+' '+r.chatgpt_account_id+' '+r.plan_type+' '+r.invalid_auth_reason+' '+r.workspace_deactivated_reason+' '+r.xai_state+' '+r.xai_state_reason+' '+r.external_use_reason+' '+r.quota_trigger_status+' '+r.quota_trigger_error).toLowerCase().includes(q));
+  let rows=(data.accounts||[]).filter(r=>(r.auth_index+' '+r.auth_id+' '+r.source+' '+r.provider+' '+r.email+' '+r.name+' '+r.auth_file+' '+r.chatgpt_account_id+' '+r.plan_type+' '+r.xai_tier+' '+r.xai_tier_source+' '+r.invalid_auth_reason+' '+r.workspace_deactivated_reason+' '+r.xai_state+' '+r.xai_state_reason+' '+r.external_use_reason+' '+r.quota_trigger_status+' '+r.quota_trigger_error).toLowerCase().includes(q));
   rows.sort((a,b)=>sort==='cost'?(b.cost_usd||0)-(a.cost_usd||0):sort==='quotaRemain'?quotaRemainingSortValue(a)-quotaRemainingSortValue(b):sort==='quotaTotal'?quotaTotalSortValue(b)-quotaTotalSortValue(a):sort==='latency'?(b.avg_latency_ms||0)-(a.avg_latency_ms||0):sort==='invalid'?(Number(!!b.invalid_auth)-Number(!!a.invalid_auth))||Date.parse(b.invalid_auth_at||0)-Date.parse(a.invalid_auth_at||0):sort==='workspace'?(Number(!!b.workspace_deactivated)-Number(!!a.workspace_deactivated))||Date.parse(b.workspace_deactivated_at||0)-Date.parse(a.workspace_deactivated_at||0):sort==='external'?(Number(!!b.external_use_suspected)-Number(!!a.external_use_suspected))||((b.external_use_delta_percent||0)-(a.external_use_delta_percent||0)):sort==='trigger'?triggerSortScore(b)-triggerSortScore(a):sort==='quota'?maxQuota(b)-maxQuota(a):sort==='cache'?cacheRate(b)-cacheRate(a):sort==='429'?(b.rate_limited||0)-(a.rate_limited||0):sort==='success'?successRate(a)-successRate(b):sort==='recent'?Date.parse(b.last_seen||0)-Date.parse(a.last_seen||0):(b.total_tokens||0)-(a.total_tokens||0));
   const allCount=(data.accounts||[]).length;
   const pages=Math.max(1,Math.ceil(rows.length/accountPageSize));
@@ -2054,6 +2057,7 @@ function accountIdentityCell(r){
   const name=accountName(r);
   const badges=['<span class="pill">'+esc(r.provider||'codex')+'</span>'];
   if(r.plan_type)badges.push('<span class="pill">'+esc(r.plan_type)+'</span>');
+	if(isXAIPool()&&r.xai_tier){const tier=String(r.xai_tier).toLowerCase();const label=tier==='heavy'?'Heavy':tier==='super'?'Super':'Free';const detail=[r.xai_tier_source,r.xai_tier_detail].filter(Boolean).join(' · ');badges.push('<span class="pill tier-'+esc(tier)+'" title="'+esc(tr('识别来源')+': '+detail)+'">'+label+'</span>')}
 	if(r.xai_state)badges.push('<span class="pill danger" title="'+esc(r.xai_state_reason||'')+'">'+esc(xaiStateLabel(r.xai_state))+'</span>');
 	if(r.protection_concurrency_limit)badges.push('<span class="pill">在途 '+fmt(r.protection_in_flight||0)+' / '+fmt(r.protection_concurrency_limit)+'</span>');
 	if(r.protection_token_limit)badges.push('<span class="pill'+(r.protection_token_demoted?' danger':'')+'">5m '+compact(r.protection_window_tokens||0)+' / '+compact(r.protection_token_limit)+'</span>');
@@ -2123,9 +2127,10 @@ function costCell(r){return r.cost_available||Number(r.cost_usd||0)>0?'<span cla
 function renderInsights(data){
   const accounts=[...(data.accounts||[])]; const t=data.totals||{}; const total=t.total_tokens||0; const bans=data.autobans||[];
   if(data.provider==='xai'){
-    const top=accounts[0]; const unauthorized=accounts.find(r=>r.xai_state==='unauthorized'); const forbidden=accounts.find(r=>r.xai_state==='forbidden'); const exhausted=accounts.find(r=>r.xai_state==='free_usage_exhausted'); const limited=accounts.find(r=>r.xai_state==='rate_limited'); const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0];
+    const top=accounts[0]; const unauthorized=accounts.find(r=>r.xai_state==='unauthorized'); const forbidden=accounts.find(r=>r.xai_state==='forbidden'); const exhausted=accounts.find(r=>r.xai_state==='free_usage_exhausted'); const limited=accounts.find(r=>r.xai_state==='rate_limited'); const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0];const tierCounts={free:0,super:0,heavy:0};accounts.forEach(r=>{const tier=String(r.xai_tier||'free').toLowerCase();tierCounts[tier]=(tierCounts[tier]||0)+1});
     const items=[
       ['Token 集中度',top?accountName(top):'-',top?'Top 占 '+pct(ratio(top.total_tokens,total)):'暂无账号',ratio(top?.total_tokens||0,total)>50?'tone-orange':''],
+		['套餐分布','Free '+fmt(tierCounts.free)+' · Super '+fmt(tierCounts.super)+' · Heavy '+fmt(tierCounts.heavy),'认证元数据识别',''],
       ['401 失效',unauthorized?accountName(unauthorized):'0 个账号',unauthorized?'更换或重新登录 xAI 认证文件后解除':'当前没有认证失效','tone-'+(unauthorized?'red':'green')],
       ['403 拒绝',forbidden?accountName(forbidden):'0 个账号',forbidden?'xAI 权限拒绝，需检查账号权限或认证':'当前没有权限拒绝','tone-'+(forbidden?'red':'green')],
       ['免费额度',exhausted?accountName(exhausted):'正常',exhausted?'subscription:free-usage-exhausted，按 24 小时恢复':'当前没有免费额度耗尽',exhausted?'tone-red':'tone-green'],

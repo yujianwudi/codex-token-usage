@@ -35,6 +35,7 @@ type authDiagnostics struct {
 	Anthropic             int `json:"anthropic"`
 	Antigravity           int `json:"antigravity"`
 	Gemini                int `json:"gemini"`
+	XAI                   int `json:"xai"`
 	Disabled              int `json:"disabled"`
 	Expired               int `json:"expired"`
 	Invalid401            int `json:"invalid_401"`
@@ -104,13 +105,14 @@ type modelPriceDiagnostics struct {
 }
 
 type diagnosticsSummary struct {
-	Database     databaseDiagnostics   `json:"database"`
-	AuthFiles    authDiagnostics       `json:"auth_files"`
-	Scheduler    schedulerDiagnostics  `json:"scheduler"`
-	Providers    providerDiagnostics   `json:"providers"`
-	ModelPrices  modelPriceDiagnostics `json:"model_prices"`
-	QuotaTrigger quotaTriggerState     `json:"quota_trigger"`
-	Retention    retentionState        `json:"retention"`
+	Database     databaseDiagnostics      `json:"database"`
+	AuthFiles    authDiagnostics          `json:"auth_files"`
+	XAIAuth      xaiAuthSourceDiagnostics `json:"xai_auth"`
+	Scheduler    schedulerDiagnostics     `json:"scheduler"`
+	Providers    providerDiagnostics      `json:"providers"`
+	ModelPrices  modelPriceDiagnostics    `json:"model_prices"`
+	QuotaTrigger quotaTriggerState        `json:"quota_trigger"`
+	Retention    retentionState           `json:"retention"`
 }
 
 type dashboardAlert struct {
@@ -244,6 +246,7 @@ func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts [
 	return diagnosticsSummary{
 		Database:     queryDatabaseDiagnostics(ctx, db, dbPath),
 		AuthFiles:    buildAuthDiagnostics(accounts, invalidAuths, autobans, externalAlerts),
+		XAIAuth:      globalXAIAuthSource.status(),
 		Scheduler:    globalSchedulerDiagnostics.status(len(autobans)),
 		Providers:    buildProviderDiagnostics(providers),
 		ModelPrices:  buildModelPriceDiagnostics(priceState),
@@ -299,6 +302,7 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 	files := readConfiguredAuthFiles()
 	out := authDiagnostics{
 		Files:                len(files),
+		XAI:                  globalXAIAuthSource.status().Accounts,
 		Invalid401:           len(invalidAuths),
 		Autoban429:           count429Autobans(autobans),
 		ExternalUseSuspected: len(externalAlerts),

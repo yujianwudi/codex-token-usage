@@ -758,12 +758,12 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	}
 	configuredXAIAccounts := readConfiguredXAIAccounts()
 	xaiAccounts = mergeConfiguredAccounts(xaiAccounts, configuredXAIAccounts)
-	xaiAccounts = filterCurrentConfiguredAccounts(xaiAccounts, configuredXAIAccounts, authDirReadable)
+	xaiAccounts = filterCurrentConfiguredAccounts(xaiAccounts, configuredXAIAccounts, globalXAIAuthSource.authoritative())
 	xaiStates, err := queryActiveXAIStates(ctx, db, now)
 	if err != nil {
 		return nil, err
 	}
-	xaiStates = filterMissingXAIStateRows(xaiStates, configuredXAIAccounts, authDirReadable)
+	xaiStates = filterMissingXAIStateRows(xaiStates, configuredXAIAccounts, globalXAIAuthSource.authoritative())
 	applyXAIStates(xaiAccounts, xaiStates)
 	quotaSince := time.Now().Add(-35 * 24 * time.Hour).Unix()
 	applyLatestQuotaSnapshots(ctx, db, accounts, quotaSince)
@@ -1025,6 +1025,12 @@ type accountRow struct {
 	WorkspaceDeactivatedAt          string   `json:"workspace_deactivated_at,omitempty"`
 	WorkspaceDeactivatedReason      string   `json:"workspace_deactivated_reason,omitempty"`
 	PlanType                        string   `json:"plan_type,omitempty"`
+	XAITier                         string   `json:"xai_tier,omitempty"`
+	XAITierSource                   string   `json:"xai_tier_source,omitempty"`
+	XAITierDetail                   string   `json:"xai_tier_detail,omitempty"`
+	RuntimeStatus                   string   `json:"runtime_status,omitempty"`
+	RuntimeMessage                  string   `json:"runtime_message,omitempty"`
+	RuntimeUnavailable              bool     `json:"runtime_unavailable,omitempty"`
 	XAIState                        string   `json:"xai_state,omitempty"`
 	XAIStateReason                  string   `json:"xai_state_reason,omitempty"`
 	XAIStateObservedAt              string   `json:"xai_state_observed_at,omitempty"`
@@ -1092,19 +1098,25 @@ type accountRow struct {
 }
 
 type configuredAccount struct {
-	AuthIndex        string
-	AuthID           string
-	Source           string
-	Provider         string
-	Email            string
-	Name             string
-	AuthFile         string
-	AuthFileMTime    int64
-	Disabled         bool
-	Expired          bool
-	PlanType         string
-	AccessToken      string
-	ChatGPTAccountID string
+	AuthIndex          string
+	AuthID             string
+	Source             string
+	Provider           string
+	Email              string
+	Name               string
+	AuthFile           string
+	AuthFileMTime      int64
+	Disabled           bool
+	Expired            bool
+	PlanType           string
+	XAITier            string
+	XAITierSource      string
+	XAITierDetail      string
+	RuntimeStatus      string
+	RuntimeMessage     string
+	RuntimeUnavailable bool
+	AccessToken        string
+	ChatGPTAccountID   string
 }
 
 type triggerAuthAccount struct {
@@ -1430,6 +1442,10 @@ func readConfiguredAuthAccounts() []configuredAccount {
 }
 
 func readConfiguredXAIAccounts() []configuredAccount {
+	accounts, err := globalXAIAuthSource.hostAccounts()
+	if err == nil {
+		return accounts
+	}
 	files := readConfiguredAuthFiles()
 	out := make([]configuredAccount, 0, len(files))
 	for _, file := range files {
@@ -1437,6 +1453,7 @@ func readConfiguredXAIAccounts() []configuredAccount {
 			out = append(out, file)
 		}
 	}
+	globalXAIAuthSource.markFilesystemFallback(out, err)
 	return out
 }
 
@@ -1477,6 +1494,10 @@ func readConfiguredAuthFiles() []configuredAccount {
 		name := stringFromAny(doc["name"])
 		authFile := entry.Name()
 		source := firstNonEmptyString(email, name, authFile)
+		xaiTier := xaiTierClassification{}
+		if strings.EqualFold(authType, "xai") {
+			xaiTier = classifyXAITierDocument(doc)
+		}
 		out = append(out, configuredAccount{
 			AuthIndex:     authFile,
 			AuthID:        email,
@@ -1489,6 +1510,9 @@ func readConfiguredAuthFiles() []configuredAccount {
 			Disabled:      boolFromAny(doc["disabled"]),
 			Expired:       boolFromAny(doc["expired"]),
 			PlanType:      firstNonEmptyString(stringFromAny(doc["plan_type"]), stringFromAny(doc["plan"])),
+			XAITier:       xaiTier.Tier,
+			XAITierSource: xaiTier.Source,
+			XAITierDetail: xaiTier.Detail,
 			AccessToken: firstNonEmptyString(
 				stringFromAny(doc["access_token"]),
 				stringFromAny(doc["accessToken"]),
@@ -1939,18 +1963,24 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 			continue
 		}
 		row := accountRow{
-			AuthIndex:        cfg.AuthIndex,
-			AuthID:           cfg.AuthID,
-			Source:           cfg.Source,
-			Provider:         firstNonEmptyString(cfg.Provider, "codex"),
-			Email:            cfg.Email,
-			Name:             cfg.Name,
-			AuthFile:         cfg.AuthFile,
-			ChatGPTAccountID: cfg.ChatGPTAccountID,
-			Configured:       true,
-			Disabled:         cfg.Disabled,
-			Expired:          cfg.Expired,
-			PlanType:         cfg.PlanType,
+			AuthIndex:          cfg.AuthIndex,
+			AuthID:             cfg.AuthID,
+			Source:             cfg.Source,
+			Provider:           firstNonEmptyString(cfg.Provider, "codex"),
+			Email:              cfg.Email,
+			Name:               cfg.Name,
+			AuthFile:           cfg.AuthFile,
+			ChatGPTAccountID:   cfg.ChatGPTAccountID,
+			Configured:         true,
+			Disabled:           cfg.Disabled,
+			Expired:            cfg.Expired,
+			PlanType:           cfg.PlanType,
+			XAITier:            cfg.XAITier,
+			XAITierSource:      cfg.XAITierSource,
+			XAITierDetail:      cfg.XAITierDetail,
+			RuntimeStatus:      cfg.RuntimeStatus,
+			RuntimeMessage:     cfg.RuntimeMessage,
+			RuntimeUnavailable: cfg.RuntimeUnavailable,
 		}
 		merged = append(merged, row)
 		rowIndex := len(merged) - 1
@@ -2029,6 +2059,12 @@ func enrichConfiguredAccount(row *accountRow, cfg configuredAccount) {
 	row.Disabled = cfg.Disabled
 	row.Expired = cfg.Expired
 	row.PlanType = firstNonEmptyString(row.PlanType, cfg.PlanType)
+	row.XAITier = firstNonEmptyString(row.XAITier, cfg.XAITier)
+	row.XAITierSource = firstNonEmptyString(row.XAITierSource, cfg.XAITierSource)
+	row.XAITierDetail = firstNonEmptyString(row.XAITierDetail, cfg.XAITierDetail)
+	row.RuntimeStatus = firstNonEmptyString(row.RuntimeStatus, cfg.RuntimeStatus)
+	row.RuntimeMessage = firstNonEmptyString(row.RuntimeMessage, cfg.RuntimeMessage)
+	row.RuntimeUnavailable = row.RuntimeUnavailable || cfg.RuntimeUnavailable
 	row.Email = firstNonEmptyString(row.Email, cfg.Email)
 	row.Name = firstNonEmptyString(row.Name, cfg.Name)
 	row.AuthFile = firstNonEmptyString(row.AuthFile, cfg.AuthFile)

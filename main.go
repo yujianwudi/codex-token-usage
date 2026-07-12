@@ -33,6 +33,25 @@ typedef struct {
 extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void cliproxyPluginFree(void*, size_t);
 extern void cliproxyPluginShutdown(void);
+
+static const cliproxy_host_api* stored_host;
+
+static void store_host_api(const cliproxy_host_api* host) {
+	stored_host = host;
+}
+
+static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+	if (stored_host == NULL || stored_host->call == NULL) {
+		return 1;
+	}
+	return stored_host->call(stored_host->host_ctx, method, request, request_len, response);
+}
+
+static void free_host_buffer(void* ptr, size_t len) {
+	if (stored_host != NULL && stored_host->free_buffer != NULL && ptr != NULL) {
+		stored_host->free_buffer(ptr, len);
+	}
+}
 */
 import "C"
 
@@ -67,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.24"
+	pluginVersion    = "0.1.25"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -300,11 +319,11 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if plugin == nil {
 		return 1
 	}
+	C.store_host_api(host)
 	plugin.abi_version = C.uint32_t(abiVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
 	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
-	_ = host
 	return 0
 }
 
@@ -348,6 +367,50 @@ func cliproxyPluginShutdown() {
 	globalSummaryMaintenance.stop()
 	globalSummaryPrecomputer.stop()
 	globalStore.close()
+}
+
+func callHost(method string, payload any) (json.RawMessage, error) {
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal host callback %s: %w", method, err)
+	}
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+	var response C.cliproxy_buffer
+	var requestPtr *C.uint8_t
+	if len(rawPayload) > 0 {
+		ptr := C.CBytes(rawPayload)
+		if ptr == nil {
+			return nil, fmt.Errorf("allocate host callback payload %s", method)
+		}
+		defer C.free(ptr)
+		requestPtr = (*C.uint8_t)(ptr)
+	}
+	code := C.call_host_api(cMethod, requestPtr, C.size_t(len(rawPayload)), &response)
+	var rawResponse []byte
+	if response.ptr != nil && response.len > 0 {
+		rawResponse = C.GoBytes(response.ptr, C.int(response.len))
+	}
+	if response.ptr != nil {
+		C.free_host_buffer(response.ptr, response.len)
+	}
+	if len(rawResponse) == 0 {
+		return nil, fmt.Errorf("host callback %s unavailable, code=%d", method, int(code))
+	}
+	var env envelope
+	if err := json.Unmarshal(rawResponse, &env); err != nil {
+		return nil, fmt.Errorf("decode host callback %s: %w", method, err)
+	}
+	if !env.OK {
+		if env.Error != nil {
+			return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+		}
+		return nil, fmt.Errorf("host callback %s failed", method)
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("host callback %s returned code=%d", method, int(code))
+	}
+	return append(json.RawMessage(nil), env.Result...), nil
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {

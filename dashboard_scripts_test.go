@@ -33,3 +33,11 @@ func TestXAITabRequiresConfiguredAccount(t *testing.T) {
 		t.Fatal("removed xAI auth must return the dashboard to Codex")
 	}
 }
+
+func TestXAITierDisplayUsesMetadataFields(t *testing.T) {
+	for _, marker := range []string{"r.xai_tier", "tier-free", "tier-super", "tier-heavy", "套餐分布"} {
+		if !strings.Contains(dashboardScripts+dashboardStyles, marker) {
+			t.Fatalf("xAI tier display marker %q not found", marker)
+		}
+	}
+}
