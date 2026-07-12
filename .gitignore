@@ -7,6 +7,10 @@
 *.tgz
 dist/
 outputs/
+.playwright-cli/
+*.bak
+*.log
+*.tmp
 
 # Local databases and runtime state
 *.db

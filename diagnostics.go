@@ -660,6 +660,8 @@ func exportLogRecords(ctx context.Context, db *sql.DB, filters logExportFilter, 
 	switch scope {
 	case "providers", "provider":
 		where = append(where, usageScopeSQL("other"))
+	case "xai":
+		where = append(where, usageScopeSQL("xai"))
 	default:
 		where = append(where, usageScopeSQL("codex"))
 	}
@@ -694,7 +696,7 @@ func exportLogRecords(ctx context.Context, db *sql.DB, filters logExportFilter, 
 	}
 	query := `
 SELECT requested_at,
-CASE WHEN ` + usageScopeSQL("codex") + ` THEN 'codex' ELSE 'providers' END AS scope_key,
+CASE WHEN ` + usageScopeSQL("codex") + ` THEN 'codex' WHEN ` + usageScopeSQL("xai") + ` THEN 'xai' ELSE 'providers' END AS scope_key,
 ` + providerExpr + ` AS provider_key,
 api_key, auth_id, auth_index, source, model, alias, reasoning_effort, service_tier,
 latency_ms, ttft_ms, status_code, failed, input_tokens, output_tokens, reasoning_tokens,

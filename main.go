@@ -67,7 +67,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.21"
+	pluginVersion    = "0.1.24"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -127,6 +127,19 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
+	AccountProtectionEnabled                bool
+	AccountProtectionFreeConcurrency        int
+	AccountProtectionPlusConcurrency        int
+	AccountProtectionK12Concurrency         int
+	AccountProtectionTeamConcurrency        int
+	AccountProtectionProConcurrency         int
+	AccountProtectionFreeTokenLimit         int64
+	AccountProtectionPlusTokenLimit         int64
+	AccountProtectionK12TokenLimit          int64
+	AccountProtectionTeamTokenLimit         int64
+	AccountProtectionProTokenLimit          int64
+	AccountProtectionTokenWindowSeconds     int
+	AccountProtectionReservationTTLSeconds  int
 	QuotaTriggerEnabled                     bool
 	QuotaTriggerIntervalMinutes             int
 	QuotaTriggerMode                        string
@@ -402,6 +415,19 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 func pluginConfigFields() []configField {
 	return []configField{
+		{Name: "开启账号保护调度", Type: "boolean", Description: "按套餐并发保护和 Token 软降级。默认关闭。"},
+		{Name: "Free 并发上限", Type: "number", Description: "Free 账号最大同时在途请求数。默认 2。"},
+		{Name: "Plus 并发上限", Type: "number", Description: "Plus 或未知套餐账号最大同时在途请求数。默认 5。"},
+		{Name: "K12 并发上限", Type: "number", Description: "K12 账号最大同时在途请求数。默认 5。"},
+		{Name: "Team 并发上限", Type: "number", Description: "Team 账号最大同时在途请求数。默认 5。"},
+		{Name: "Pro 并发上限", Type: "number", Description: "Pro 账号最大同时在途请求数。默认 10。"},
+		{Name: "Free 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 2000000。"},
+		{Name: "Plus 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
+		{Name: "K12 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
+		{Name: "Team 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
+		{Name: "Pro 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 12000000。"},
+		{Name: "账号保护 Token 窗口秒数", Type: "number", Description: "滑动 Token 统计窗口。默认 300 秒。"},
+		{Name: "账号保护预约超时秒数", Type: "number", Description: "没有完成回调时自动释放并发名额。默认 900 秒。"},
 		{Name: "开启定时额度触发", Type: "boolean", Description: "是否开启 Codex 账号定时额度触发。默认关闭。"},
 		{Name: "触发间隔分钟", Type: "number", Description: "每轮触发间隔，单位分钟。默认 10。"},
 		{Name: "触发模式", Type: "enum", Description: "probe=真实极小模型请求，会消耗少量 token；旧 quota 配置会自动按 probe 执行。默认 probe。"},
@@ -511,6 +537,19 @@ func parseInt(value string, fallback, min, max int) int {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
+		AccountProtectionEnabled:                false,
+		AccountProtectionFreeConcurrency:        2,
+		AccountProtectionPlusConcurrency:        5,
+		AccountProtectionK12Concurrency:         5,
+		AccountProtectionTeamConcurrency:        5,
+		AccountProtectionProConcurrency:         10,
+		AccountProtectionFreeTokenLimit:         2_000_000,
+		AccountProtectionPlusTokenLimit:         8_000_000,
+		AccountProtectionK12TokenLimit:          8_000_000,
+		AccountProtectionTeamTokenLimit:         8_000_000,
+		AccountProtectionProTokenLimit:          12_000_000,
+		AccountProtectionTokenWindowSeconds:     300,
+		AccountProtectionReservationTTLSeconds:  900,
 		QuotaTriggerEnabled:                     false,
 		QuotaTriggerIntervalMinutes:             10,
 		QuotaTriggerMode:                        "probe",
@@ -549,6 +588,7 @@ func configurePlugin(request []byte) error {
 		cfg = parsePluginConfigYAML(raw, cfg)
 	}
 	cfg = normalizePluginConfig(cfg)
+	globalAccountProtection.configure(cfg)
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
 	globalRetentionCleaner.configure(cfg)
@@ -578,6 +618,45 @@ func lifecycleConfigYAML(raw json.RawMessage) ([]byte, error) {
 
 func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	values := yamlScalars(string(raw))
+	if value, ok := configValue(values, "account_protection_enabled", "开启账号保护调度"); ok {
+		cfg.AccountProtectionEnabled = parseBoolString(value, cfg.AccountProtectionEnabled)
+	}
+	if value, ok := configValue(values, "account_protection_free_concurrency", "Free 并发上限"); ok {
+		cfg.AccountProtectionFreeConcurrency = parseInt(value, cfg.AccountProtectionFreeConcurrency, 1, 100)
+	}
+	if value, ok := configValue(values, "account_protection_plus_concurrency", "Plus 并发上限"); ok {
+		cfg.AccountProtectionPlusConcurrency = parseInt(value, cfg.AccountProtectionPlusConcurrency, 1, 100)
+	}
+	if value, ok := configValue(values, "account_protection_k12_concurrency", "K12 并发上限"); ok {
+		cfg.AccountProtectionK12Concurrency = parseInt(value, cfg.AccountProtectionK12Concurrency, 1, 100)
+	}
+	if value, ok := configValue(values, "account_protection_team_concurrency", "Team 并发上限"); ok {
+		cfg.AccountProtectionTeamConcurrency = parseInt(value, cfg.AccountProtectionTeamConcurrency, 1, 100)
+	}
+	if value, ok := configValue(values, "account_protection_pro_concurrency", "Pro 并发上限"); ok {
+		cfg.AccountProtectionProConcurrency = parseInt(value, cfg.AccountProtectionProConcurrency, 1, 100)
+	}
+	if value, ok := configValue(values, "account_protection_free_token_limit", "Free 5 分钟 Token 上限"); ok {
+		cfg.AccountProtectionFreeTokenLimit = int64(parseInt(value, int(cfg.AccountProtectionFreeTokenLimit), 1, 100_000_000))
+	}
+	if value, ok := configValue(values, "account_protection_plus_token_limit", "Plus 5 分钟 Token 上限"); ok {
+		cfg.AccountProtectionPlusTokenLimit = int64(parseInt(value, int(cfg.AccountProtectionPlusTokenLimit), 1, 100_000_000))
+	}
+	if value, ok := configValue(values, "account_protection_k12_token_limit", "K12 5 分钟 Token 上限"); ok {
+		cfg.AccountProtectionK12TokenLimit = int64(parseInt(value, int(cfg.AccountProtectionK12TokenLimit), 1, 100_000_000))
+	}
+	if value, ok := configValue(values, "account_protection_team_token_limit", "Team 5 分钟 Token 上限"); ok {
+		cfg.AccountProtectionTeamTokenLimit = int64(parseInt(value, int(cfg.AccountProtectionTeamTokenLimit), 1, 100_000_000))
+	}
+	if value, ok := configValue(values, "account_protection_pro_token_limit", "Pro 5 分钟 Token 上限"); ok {
+		cfg.AccountProtectionProTokenLimit = int64(parseInt(value, int(cfg.AccountProtectionProTokenLimit), 1, 100_000_000))
+	}
+	if value, ok := configValue(values, "account_protection_token_window_seconds", "账号保护 Token 窗口秒数"); ok {
+		cfg.AccountProtectionTokenWindowSeconds = parseInt(value, cfg.AccountProtectionTokenWindowSeconds, 30, 3600)
+	}
+	if value, ok := configValue(values, "account_protection_reservation_ttl_seconds", "账号保护预约超时秒数"); ok {
+		cfg.AccountProtectionReservationTTLSeconds = parseInt(value, cfg.AccountProtectionReservationTTLSeconds, 30, 7200)
+	}
 	if value, ok := configValue(values, "quota_trigger_enabled", "开启定时额度触发"); ok {
 		cfg.QuotaTriggerEnabled = parseBoolString(value, cfg.QuotaTriggerEnabled)
 	}
@@ -648,6 +727,18 @@ func configValue(values map[string]string, keys ...string) (string, bool) {
 }
 
 func normalizePluginConfig(cfg pluginConfig) pluginConfig {
+	cfg.AccountProtectionFreeConcurrency = clampInt(cfg.AccountProtectionFreeConcurrency, 1, 100)
+	cfg.AccountProtectionPlusConcurrency = clampInt(cfg.AccountProtectionPlusConcurrency, 1, 100)
+	cfg.AccountProtectionK12Concurrency = clampInt(cfg.AccountProtectionK12Concurrency, 1, 100)
+	cfg.AccountProtectionTeamConcurrency = clampInt(cfg.AccountProtectionTeamConcurrency, 1, 100)
+	cfg.AccountProtectionProConcurrency = clampInt(cfg.AccountProtectionProConcurrency, 1, 100)
+	cfg.AccountProtectionFreeTokenLimit = int64(clampInt(int(cfg.AccountProtectionFreeTokenLimit), 1, 100_000_000))
+	cfg.AccountProtectionPlusTokenLimit = int64(clampInt(int(cfg.AccountProtectionPlusTokenLimit), 1, 100_000_000))
+	cfg.AccountProtectionK12TokenLimit = int64(clampInt(int(cfg.AccountProtectionK12TokenLimit), 1, 100_000_000))
+	cfg.AccountProtectionTeamTokenLimit = int64(clampInt(int(cfg.AccountProtectionTeamTokenLimit), 1, 100_000_000))
+	cfg.AccountProtectionProTokenLimit = int64(clampInt(int(cfg.AccountProtectionProTokenLimit), 1, 100_000_000))
+	cfg.AccountProtectionTokenWindowSeconds = clampInt(cfg.AccountProtectionTokenWindowSeconds, 30, 3600)
+	cfg.AccountProtectionReservationTTLSeconds = clampInt(cfg.AccountProtectionReservationTTLSeconds, 30, 7200)
 	cfg.QuotaTriggerIntervalMinutes = clampInt(cfg.QuotaTriggerIntervalMinutes, 1, 1440)
 	cfg.QuotaTriggerMaxConcurrency = clampInt(cfg.QuotaTriggerMaxConcurrency, 1, 32)
 	cfg.QuotaTriggerTimeoutSeconds = clampInt(cfg.QuotaTriggerTimeoutSeconds, 3, 300)
@@ -1327,6 +1418,9 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 		if err := clearReplacedInvalidAuths(ctx, db); err != nil {
 			return struct{}{}, err
 		}
+		if err := clearReplacedOrMissingXAIStates(ctx, db); err != nil {
+			return struct{}{}, err
+		}
 		configuredAccounts := readConfiguredAuthAccounts()
 		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, configuredAuthDirectoryReadable()); err != nil {
 			return struct{}{}, err
@@ -1617,6 +1711,12 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 		primaryPct, primaryReset, secondaryPct, secondaryReset,
 	)
 	if err != nil {
+		return err
+	}
+	if err := releaseProtectionReservation(ctx, db, rec); err != nil {
+		return err
+	}
+	if err := recordXAIStateIfNeeded(ctx, db, rec, status); err != nil {
 		return err
 	}
 	if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
@@ -2856,6 +2956,9 @@ func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedul
 }
 
 func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
+	if isXAISchedulerRequest(req) {
+		return s.pickXAIAuthOnce(ctx, req)
+	}
 	if !isCodexSchedulerRequest(req) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
@@ -2887,7 +2990,8 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
 	}
-	if len(bans) == 0 && len(invalids) == 0 {
+	protectionCfg := globalAccountProtection.config()
+	if len(bans) == 0 && len(invalids) == 0 && !protectionCfg.AccountProtectionEnabled {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	effectiveBans := mergeEffectiveAutobans(bans, invalids)
@@ -2913,11 +3017,64 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if banFilteredCandidates > 0 {
 		globalSchedulerDiagnostics.record(len(effectiveBans), banFilteredCandidates, maxInt(0, len(effectiveBans)-len(matchedBanIndexes)))
 	}
-	if !filtered {
+	if !filtered && !protectionCfg.AccountProtectionEnabled {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	if len(available) == 0 {
 		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now)
+	}
+	if protectionCfg.AccountProtectionEnabled {
+		chosen, err := s.pickProtectedAuth(ctx, db, available, protectionCfg)
+		if err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+	}
+	chosen := chooseFillFirstSchedulerCandidate(available)
+	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+}
+
+func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
+	if len(req.Candidates) == 0 {
+		return schedulerPickResponse{Handled: false}, nil
+	}
+	db, _, err := s.open(ctx)
+	if err != nil {
+		return schedulerPickResponse{Handled: false}, err
+	}
+	if err := clearReplacedOrMissingXAIStates(ctx, db); err != nil {
+		return schedulerPickResponse{Handled: false}, err
+	}
+	now := time.Now().Unix()
+	states, err := queryActiveXAIStates(ctx, db, now)
+	if err != nil {
+		return schedulerPickResponse{Handled: false}, err
+	}
+	if len(states) == 0 {
+		return schedulerPickResponse{Handled: false}, nil
+	}
+	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
+	filtered := false
+	for _, candidate := range req.Candidates {
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "xai") {
+			available = append(available, candidate)
+			continue
+		}
+		if candidateMatchesXAIState(candidate, states) {
+			filtered = true
+			continue
+		}
+		available = append(available, candidate)
+	}
+	if !filtered {
+		return schedulerPickResponse{Handled: false}, nil
+	}
+	if len(available) == 0 {
+		message := "no available xAI auth candidates: all candidates are unavailable by 401/403/429"
+		if resetAt := earliestXAIStateReset(states, now); resetAt > 0 {
+			message += "; earliest retry at " + unixTime(resetAt)
+		}
+		return schedulerPickResponse{}, &schedulerRejectError{Code: "auth_unavailable", Message: message, HTTPStatus: http.StatusServiceUnavailable}
 	}
 	chosen := chooseFillFirstSchedulerCandidate(available)
 	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil

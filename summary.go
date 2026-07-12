@@ -53,6 +53,9 @@ type storeRevision struct {
 	BanActive         int64
 	BanMaxChanged     int64
 	NextBanResetAt    int64
+	XAIStateActive    int64
+	XAIStateChanged   int64
+	NextXAIResetAt    int64
 	AuthFilesRevision string
 }
 
@@ -613,6 +616,12 @@ WHERE active=1`).Scan(&r.InvalidActive, &r.InvalidMaxChanged); err != nil {
 		return storeRevision{}, err
 	}
 	if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*), COALESCE(MAX(observed_at),0), COALESCE(MIN(CASE WHEN active=1 AND reset_at>0 THEN reset_at END),0)
+FROM xai_account_states
+WHERE active=1`).Scan(&r.XAIStateActive, &r.XAIStateChanged, &r.NextXAIResetAt); err != nil {
+		return storeRevision{}, err
+	}
+	if err := db.QueryRowContext(ctx, `
 SELECT COUNT(*),
   COALESCE(MAX(CASE WHEN released_at > banned_at THEN released_at ELSE banned_at END),0),
   COALESCE(MIN(CASE WHEN active=1 THEN reset_at END),0)
@@ -626,6 +635,7 @@ WHERE active=1 OR released_at > 0`).Scan(&r.BanActive, &r.BanMaxChanged, &r.Next
 		"q:" + strconv.FormatInt(r.QuotaMaxID, 10),
 		"i:" + strconv.FormatInt(r.InvalidActive, 10) + ":" + strconv.FormatInt(r.InvalidMaxChanged, 10),
 		"b:" + strconv.FormatInt(r.BanActive, 10) + ":" + strconv.FormatInt(r.BanMaxChanged, 10) + ":" + strconv.FormatInt(r.NextBanResetAt, 10),
+		"x:" + strconv.FormatInt(r.XAIStateActive, 10) + ":" + strconv.FormatInt(r.XAIStateChanged, 10) + ":" + strconv.FormatInt(r.NextXAIResetAt, 10),
 		"a:" + r.AuthFilesRevision,
 	}, "|")
 	return r, nil
@@ -717,9 +727,16 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err := applyCosts(ctx, db, since, &providerTotals, prices, "other"); err != nil {
 		return nil, err
 	}
+	xaiTotals, err := queryOneTotals(ctx, db, since, "xai")
+	if err != nil {
+		return nil, err
+	}
+	if err := applyCosts(ctx, db, since, &xaiTotals, prices, "xai"); err != nil {
+		return nil, err
+	}
 	now := time.Now().Unix()
 	authDirReadable := configuredAuthDirectoryReadable()
-	accounts, err := queryAccounts(ctx, db, since, limit)
+	accounts, err := queryAccounts(ctx, db, since, limit, "codex")
 	if err != nil {
 		return nil, err
 	}
@@ -729,6 +746,25 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	configuredAccounts := readConfiguredAuthAccounts()
 	accounts = mergeConfiguredAccounts(accounts, configuredAccounts)
 	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, authDirReadable)
+	if globalAccountProtection.enabled() {
+		applyAccountProtectionState(ctx, db, accounts)
+	}
+	xaiAccounts, err := queryAccounts(ctx, db, since, limit, "xai")
+	if err != nil {
+		return nil, err
+	}
+	if err := applyScopedAccountCosts(ctx, db, since, xaiAccounts, prices, "xai"); err != nil {
+		return nil, err
+	}
+	configuredXAIAccounts := readConfiguredXAIAccounts()
+	xaiAccounts = mergeConfiguredAccounts(xaiAccounts, configuredXAIAccounts)
+	xaiAccounts = filterCurrentConfiguredAccounts(xaiAccounts, configuredXAIAccounts, authDirReadable)
+	xaiStates, err := queryActiveXAIStates(ctx, db, now)
+	if err != nil {
+		return nil, err
+	}
+	xaiStates = filterMissingXAIStateRows(xaiStates, configuredXAIAccounts, authDirReadable)
+	applyXAIStates(xaiAccounts, xaiStates)
 	quotaSince := time.Now().Add(-35 * 24 * time.Hour).Unix()
 	applyLatestQuotaSnapshots(ctx, db, accounts, quotaSince)
 	applySecondaryQuotaEstimates(ctx, db, accounts, &totals, quotaSince)
@@ -779,6 +815,13 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err := applyModelCosts(ctx, db, since, providerModels, prices, "other"); err != nil {
 		return nil, err
 	}
+	xaiModels, err := queryModels(ctx, db, since, limit, "xai")
+	if err != nil {
+		return nil, err
+	}
+	if err := applyModelCosts(ctx, db, since, xaiModels, prices, "xai"); err != nil {
+		return nil, err
+	}
 	trend, err := queryTrend(ctx, db, since, label, "codex")
 	if err != nil {
 		return nil, err
@@ -787,11 +830,19 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err != nil {
 		return nil, err
 	}
+	xaiTrend, err := queryTrend(ctx, db, since, label, "xai")
+	if err != nil {
+		return nil, err
+	}
 	recent, err := queryRecent(ctx, db, since, 30, "codex", prices)
 	if err != nil {
 		return nil, err
 	}
 	providerRecent, err := queryProviderRecent(ctx, db, since, 30, providerRecentLimit(limit), prices)
+	if err != nil {
+		return nil, err
+	}
+	xaiRecent, err := queryRecent(ctx, db, since, 30, "xai", prices)
 	if err != nil {
 		return nil, err
 	}
@@ -812,15 +863,21 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		"db_path":                     path,
 		"totals":                      totals,
 		"provider_totals":             providerTotals,
+		"xai_totals":                  xaiTotals,
 		"accounts":                    accounts,
+		"xai_accounts":                xaiAccounts,
 		"providers":                   providers,
 		"key_summaries":               keySummaries,
 		"models":                      models,
 		"provider_models":             providerModels,
+		"xai_models":                  xaiModels,
 		"trend":                       trend,
 		"provider_trend":              providerTrend,
+		"xai_trend":                   xaiTrend,
 		"recent":                      recent,
 		"provider_recent":             providerRecent,
+		"xai_recent":                  xaiRecent,
+		"xai_states":                  xaiStates,
 		"autobans":                    autobans,
 		"invalid_auths":               unauthorizedInvalidAuths,
 		"workspace_deactivated_auths": workspaceDeactivatedAuths,
@@ -968,6 +1025,19 @@ type accountRow struct {
 	WorkspaceDeactivatedAt          string   `json:"workspace_deactivated_at,omitempty"`
 	WorkspaceDeactivatedReason      string   `json:"workspace_deactivated_reason,omitempty"`
 	PlanType                        string   `json:"plan_type,omitempty"`
+	XAIState                        string   `json:"xai_state,omitempty"`
+	XAIStateReason                  string   `json:"xai_state_reason,omitempty"`
+	XAIStateObservedAt              string   `json:"xai_state_observed_at,omitempty"`
+	XAIStateResetAt                 int64    `json:"xai_state_reset_at,omitempty"`
+	XAIStateResetAtText             string   `json:"xai_state_reset_at_text,omitempty"`
+	XAIStateSecondsRemaining        int64    `json:"xai_state_seconds_remaining,omitempty"`
+	XAILastStatusCode               int      `json:"xai_last_status_code,omitempty"`
+	ProtectionPlan                  string   `json:"protection_plan,omitempty"`
+	ProtectionInFlight              int      `json:"protection_in_flight,omitempty"`
+	ProtectionConcurrencyLimit      int      `json:"protection_concurrency_limit,omitempty"`
+	ProtectionWindowTokens          int64    `json:"protection_window_tokens,omitempty"`
+	ProtectionTokenLimit            int64    `json:"protection_token_limit,omitempty"`
+	ProtectionTokenDemoted          bool     `json:"protection_token_demoted,omitempty"`
 	Requests                        int64    `json:"requests"`
 	Failed                          int64    `json:"failed"`
 	RateLimited                     int64    `json:"rate_limited"`
@@ -1253,11 +1323,14 @@ AND LOWER(COALESCE(NULLIF(auth_id,''), '')) NOT LIKE 'codex:apikey:%'
 AND COALESCE(NULLIF(source,''), '') NOT LIKE 'sk-%'
 AND COALESCE(NULLIF(source,''), '') NOT LIKE 'Bearer sk-%')`
 	codexAPIKey := codexAPIKeyProviderScopeSQL(entries)
+	xaiAccount := `(LOWER(COALESCE(NULLIF(provider,''), '')) = 'xai' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%xai%')`
 	switch strings.ToLower(strings.TrimSpace(scope)) {
 	case "codex":
 		return codexAccount
 	case "other":
-		return "((NOT " + codexAccount + ") AND (NOT (LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' AND LOWER(COALESCE(NULLIF(auth_type,''), '')) IN ('apikey', 'api_key', 'key')) OR " + codexAPIKey + "))"
+		return "((NOT " + codexAccount + ") AND (NOT " + xaiAccount + ") AND (NOT (LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' AND LOWER(COALESCE(NULLIF(auth_type,''), '')) IN ('apikey', 'api_key', 'key')) OR " + codexAPIKey + "))"
+	case "xai":
+		return xaiAccount
 	default:
 		return "1=1"
 	}
@@ -1306,7 +1379,7 @@ FROM usage_events WHERE requested_at >= ? AND ` + usageScopeSQL(scope)
 	return row, err
 }
 
-func queryAccounts(ctx context.Context, db *sql.DB, since int64, limit int) ([]accountRow, error) {
+func queryAccounts(ctx context.Context, db *sql.DB, since int64, limit int, scope string) ([]accountRow, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT COALESCE(NULLIF(auth_index,''), NULLIF(auth_id,''), 'unknown') AS account_key,
 MAX(auth_id), MAX(source), MAX(provider),
@@ -1321,7 +1394,7 @@ COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
 COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0),
 MAX(requested_at)
 FROM usage_events
-WHERE requested_at >= ? AND `+usageScopeSQL("codex")+` AND (auth_index <> '' OR auth_id <> '' OR source <> '')
+WHERE requested_at >= ? AND `+usageScopeSQL(scope)+` AND (auth_index <> '' OR auth_id <> '' OR source <> '')
 GROUP BY account_key
 ORDER BY SUM(total_tokens) DESC
 LIMIT ?`, since, limit)
@@ -1350,6 +1423,17 @@ func readConfiguredAuthAccounts() []configuredAccount {
 	out := make([]configuredAccount, 0, len(files))
 	for _, file := range files {
 		if isCodexAuthProvider(file.Provider) {
+			out = append(out, file)
+		}
+	}
+	return out
+}
+
+func readConfiguredXAIAccounts() []configuredAccount {
+	files := readConfiguredAuthFiles()
+	out := make([]configuredAccount, 0, len(files))
+	for _, file := range files {
+		if strings.EqualFold(strings.TrimSpace(file.Provider), "xai") {
 			out = append(out, file)
 		}
 	}
@@ -1432,6 +1516,8 @@ func normalizeAuthProvider(value, filename string) string {
 		return "antigravity"
 	case value == "gemini" || value == "google":
 		return "gemini"
+	case value == "xai" || value == "grok":
+		return "xai"
 	}
 	name := strings.ToLower(strings.TrimSpace(filename))
 	switch {
@@ -1441,6 +1527,8 @@ func normalizeAuthProvider(value, filename string) string {
 		return "antigravity"
 	case strings.Contains(name, "gemini") || strings.Contains(name, "google"):
 		return "gemini"
+	case strings.Contains(name, "xai") || strings.Contains(name, "grok"):
+		return "xai"
 	default:
 		return "codex"
 	}
@@ -1876,8 +1964,13 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 }
 
 func filterCurrentConfiguredAccounts(accounts []accountRow, configured []configuredAccount, authDirReadable bool) []accountRow {
-	if !authDirReadable || len(configured) == 0 {
+	if !authDirReadable {
 		return accounts
+	}
+	// A readable but empty auth directory means every configured account was removed.
+	// Do not fall back to historical usage rows in that case.
+	if len(configured) == 0 {
+		return nil
 	}
 	aliases := make(map[string]struct{}, len(configured)*6)
 	for _, cfg := range configured {

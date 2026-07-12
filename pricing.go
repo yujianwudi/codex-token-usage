@@ -177,13 +177,17 @@ GROUP BY model, alias, provider, service_tier`, since)
 }
 
 func applyAccountCosts(ctx context.Context, db *sql.DB, since int64, accounts []accountRow, prices map[string]modelPrice) error {
+	return applyScopedAccountCosts(ctx, db, since, accounts, prices, "codex")
+}
+
+func applyScopedAccountCosts(ctx context.Context, db *sql.DB, since int64, accounts []accountRow, prices map[string]modelPrice, scope string) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT COALESCE(NULLIF(auth_index,''), NULLIF(auth_id,''), 'unknown') AS account_key,
 model, alias, provider, service_tier,
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cached_tokens),0),
 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(total_tokens),0)
 FROM usage_events
-WHERE requested_at >= ? AND `+usageScopeSQL("codex")+` AND (auth_index <> '' OR auth_id <> '' OR source <> '')
+WHERE requested_at >= ? AND `+usageScopeSQL(scope)+` AND (auth_index <> '' OR auth_id <> '' OR source <> '')
 GROUP BY account_key, model, alias, provider, service_tier`, since)
 	if err != nil {
 		return err

@@ -5,7 +5,7 @@ const dashboardBody = `</style>
 <body>
 <main>
   <div class="hero">
-    <div><h1>CPA Token Usage</h1><div class="hint">按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、5h/7d 额度窗口和最近异常。</div></div>
+    <div><h1>CPA Token Usage</h1><div class="hint" id="pool-hero-hint">按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、5h/7d 额度窗口和最近异常。</div></div>
     <div class="controls">
       <input id="key" class="fallback-key" type="password" autocomplete="current-password" aria-label="CPA 管理密码备用输入" placeholder="管理密钥备用输入">
       <button id="batch-proxy-open" class="ghost" type="button">批量写入代理</button>
@@ -19,6 +19,7 @@ const dashboardBody = `</style>
   <div class="tabs" role="tablist" aria-label="统计页面">
     <div class="tab-strip" id="tab-strip">
       <button class="tab active" data-target="codex" role="tab" aria-selected="true">Codex 账号池<span class="tab-count" id="tab-codex-count">-</span></button>
+      <button class="tab" data-target="xai" role="tab" aria-selected="false" hidden>xAI 账号池<span class="tab-count" id="tab-xai-count">-</span></button>
       <button class="tab" data-target="providers" role="tab" aria-selected="false">AI 总览<span class="tab-count" id="tab-provider-count">-</span></button>
       <span id="provider-tabs" class="tab-strip"></span>
     </div>
@@ -31,16 +32,16 @@ const dashboardBody = `</style>
   <div class="command-grid">
     <section class="section"><h2><span>运行总览</span><span class="mini">请求 / Token / 缓存 / 限流</span></h2><div class="section-body"><div class="cards">
       <div class="metric" style="--accent:var(--blue)"><div class="label">请求数</div><div class="value" id="m-requests">-</div><div class="sub" id="m-success">成功率 -</div></div>
-      <div class="metric" style="--accent:var(--cyan)"><div class="label">总 Token</div><div class="value" id="m-total">-</div><div class="sub">Codex 账号池合计</div></div>
+      <div class="metric" style="--accent:var(--cyan)"><div class="label">总 Token</div><div class="value" id="m-total">-</div><div class="sub" id="m-total-sub">Codex 账号池合计</div></div>
       <div class="metric" style="--accent:var(--blue)"><div class="label">费用估算</div><div class="value" id="m-cost">-</div><div class="sub" id="m-cost-sub">按模型价格估算</div></div>
       <div class="metric" style="--accent:var(--cyan)"><div class="label">输入 Token</div><div class="value" id="m-input">-</div><div class="sub" id="m-input-share">占比 -</div></div>
       <div class="metric" style="--accent:var(--violet)"><div class="label">输出 Token</div><div class="value" id="m-output">-</div><div class="sub" id="m-output-share">占比 -</div></div>
       <div class="metric" style="--accent:var(--orange)"><div class="label">缓存 Token</div><div class="value" id="m-cache">-</div><div class="sub" id="m-cache-share">缓存率 -</div></div>
-      <div class="metric" style="--accent:var(--red)"><div class="label">429 次数</div><div class="value bad" id="m-429">-</div><div class="sub">限流/额度打满</div></div>
-      <div class="metric" style="--accent:var(--red)"><div class="label">自动禁用</div><div class="value bad" id="m-bans">-</div><div class="sub">Codex 429 Auto Ban</div></div>
+      <div class="metric" style="--accent:var(--red)"><div class="label">429 次数</div><div class="value bad" id="m-429">-</div><div class="sub" id="m-429-sub">限流/额度打满</div></div>
+      <div class="metric" style="--accent:var(--red)"><div class="label" id="m-bans-label">自动禁用</div><div class="value bad" id="m-bans">-</div><div class="sub" id="m-bans-sub">Codex 429 Auto Ban</div></div>
       <div class="metric" style="--accent:var(--blue)"><div class="label">活跃账号</div><div class="value" id="m-accounts">-</div><div class="sub">可识别账号</div></div>
-      <div class="metric" style="--accent:var(--cyan)"><div class="label">7d/月剩余额度</div><div class="value" id="m-7d-remaining">-</div><div class="sub" id="m-7d-remaining-sub">按账号额度快照估算</div></div>
-      <div class="metric" style="--accent:var(--violet)"><div class="label">额度触发</div><div class="value" id="m-trigger">-</div><div class="sub" id="m-trigger-sub">默认关闭</div></div>
+      <div class="metric" id="m-quota-card" style="--accent:var(--cyan)"><div class="label">7d/月剩余额度</div><div class="value" id="m-7d-remaining">-</div><div class="sub" id="m-7d-remaining-sub">按账号额度快照估算</div></div>
+      <div class="metric" id="m-trigger-card" style="--accent:var(--violet)"><div class="label">额度触发</div><div class="value" id="m-trigger">-</div><div class="sub" id="m-trigger-sub">默认关闭</div></div>
       <div class="metric" style="--accent:var(--cyan)"><div class="label">Top 账号占比</div><div class="value" id="m-topshare">-</div><div class="sub">Token 集中度</div></div>
       <div class="metric" style="--accent:var(--blue)"><div class="label">平均耗时</div><div class="value" id="m-latency">-</div><div class="sub" id="m-latency-sub">慢请求 -</div></div>
       <div class="metric" style="--accent:var(--cyan)"><div class="label">首 Token</div><div class="value" id="m-ttft">-</div><div class="sub" id="m-ttft-sub">慢首包 -</div></div>

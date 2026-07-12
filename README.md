@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.19`
+Current version: `0.1.24`
 
 ## Features
 
@@ -16,6 +16,8 @@ Current version: `0.1.19`
 - CSV / JSON export support; the dashboard exposes account export buttons and the backend can export accounts, providers, models, and recent requests.
 - Built-in price fallbacks plus automatic LiteLLM model price updates.
 - Manual Chinese / English language switch saved in the browser.
+- xAI account-pool dashboard for xAI OAuth JSON credentials, with xAI-specific 401/403/429 and free-usage-exhausted states.
+- Optional account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
 
 ## Install Manually
 
@@ -48,6 +50,20 @@ plugins:
       单账号超时秒数: 20
       单账号最小冷却分钟: 10
 
+      开启账号保护调度: false
+      Free 并发上限: 2
+      Plus 并发上限: 5
+      K12 并发上限: 5
+      Team 并发上限: 5
+      Pro 并发上限: 10
+      Free 5 分钟 Token 上限: 2000000
+      Plus 5 分钟 Token 上限: 8000000
+      K12 5 分钟 Token 上限: 8000000
+      Team 5 分钟 Token 上限: 8000000
+      Pro 5 分钟 Token 上限: 12000000
+      账号保护 Token 窗口秒数: 300
+      账号保护预约超时秒数: 900
+
       自动更新模型价格表: true
       模型价格更新间隔小时: 6
       模型价格表地址: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
@@ -67,6 +83,19 @@ quota_trigger_mode: probe
 quota_trigger_max_concurrency: 1
 quota_trigger_timeout_seconds: 20
 quota_trigger_min_account_cooldown_minutes: 10
+account_protection_enabled: false
+account_protection_free_concurrency: 2
+account_protection_plus_concurrency: 5
+account_protection_k12_concurrency: 5
+account_protection_team_concurrency: 5
+account_protection_pro_concurrency: 10
+account_protection_free_token_limit: 2000000
+account_protection_plus_token_limit: 8000000
+account_protection_k12_token_limit: 8000000
+account_protection_team_token_limit: 8000000
+account_protection_pro_token_limit: 12000000
+account_protection_token_window_seconds: 300
+account_protection_reservation_ttl_seconds: 900
 model_price_auto_update_enabled: true
 model_price_update_interval_hours: 6
 model_price_update_url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
@@ -118,11 +147,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.19_linux_amd64.zip
-codex-token-usage_0.1.19_linux_arm64.zip
-codex-token-usage_0.1.19_windows_amd64.zip
-codex-token-usage_0.1.19_darwin_amd64.zip
-codex-token-usage_0.1.19_darwin_arm64.zip
+codex-token-usage_0.1.24_linux_amd64.zip
+codex-token-usage_0.1.24_linux_arm64.zip
+codex-token-usage_0.1.24_windows_amd64.zip
+codex-token-usage_0.1.24_darwin_amd64.zip
+codex-token-usage_0.1.24_darwin_arm64.zip
 checksums.txt
 ```
 
