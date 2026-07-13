@@ -119,7 +119,7 @@ func TestCommitAuthImportSkipsExistingUnlessOverwrite(t *testing.T) {
 			return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{Name: fileName, Provider: "codex"}}})
 		case "host.auth.save":
 			saves++
-			return json.Marshal(map[string]any{"name": fileName}), nil
+			return json.Marshal(map[string]any{"name": fileName})
 		default:
 			return nil, os.ErrNotExist
 		}
