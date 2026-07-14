@@ -1294,6 +1294,10 @@ function providerPageHTML(name){
   '</section>';
 }
 const i18nEn={
+  '账号 JSON 导入':'Import account JSON',
+  '窗口：':'Window: ',
+  '数据库：':'DB: ',
+  '更新时间：':'Updated: ',
   '按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、5h/7d 额度窗口和最近异常。':'Aggregate CPA usage by account: tokens, cache rate, request health, 5h/7d quota windows, and recent anomalies.',
   '语言':'Language',
   '中文':'Chinese',
@@ -1676,6 +1680,7 @@ function tr(text){
   if(i18nEn[source])return i18nEn[source];
   let out=source;
   const exact=(zh,en)=>{out=out.split(zh).join(en)};
+  Object.entries(i18nEn).sort((left,right)=>right[0].length-left[0].length).forEach(pair=>exact(pair[0],pair[1]));
   [
     ['成功率 ','Success '],['缓存率 ','Cache rate '],['占总 ','total share '],['占 ','share '],
     ['占比 ','share '],['覆盖 ','Covers '],[' 个 xAI 401 失效账号',' xAI accounts with invalid credentials'],[' 个 xAI 403 权限拒绝账号',' xAI accounts with permission denials'],

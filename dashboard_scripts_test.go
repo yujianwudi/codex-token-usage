@@ -69,3 +69,18 @@ func TestNonStandardAuthImportUIUsesPluginHostSaveFlow(t *testing.T) {
 		}
 	}
 }
+
+func TestEnglishLocaleTranslatesDynamicPhrasesBeforeUnits(t *testing.T) {
+	for _, marker := range []string{
+		"'账号 JSON 导入':'Import account JSON'",
+		"'窗口：':'Window: '",
+		"Object.entries(i18nEn).sort((left,right)=>right[0].length-left[0].length).forEach(pair=>exact(pair[0],pair[1]))",
+		"'部分模型缺价格':'Some model prices missing'",
+		"'管理接口':'Management API'",
+		"'显示接入点':'Show endpoints'",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard script missing English dynamic-phrase translation marker %q", marker)
+		}
+	}
+}

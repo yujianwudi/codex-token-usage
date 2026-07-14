@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -46,24 +47,38 @@ func xaiStateForRecord(rec usageRecord, status int, now int64) (state, reason st
 	if !rec.Failed {
 		return "", "", 0
 	}
-	switch status {
-	case http.StatusUnauthorized:
-		return xaiStateUnauthorized, "401 unauthorized: xAI credential is invalid", 0
-	case http.StatusForbidden:
-		return xaiStateForbidden, "403 forbidden: xAI access is denied", 0
-	case http.StatusTooManyRequests:
-		if xaiFreeUsageExhaustedBody(rec.Failure.Body) {
-			return xaiStateFreeExhausted, "429 subscription:free-usage-exhausted: xAI free usage is exhausted", now + int64((24 * time.Hour).Seconds())
-		}
-		return xaiStateRateLimited, "429 rate limited: temporary xAI throttling", xaiRetryAfterUnix(rec.ResponseHeaders, now)
+	parsed := parseXAIError(status, rec.Failure.Body)
+	switch parsed.Kind {
+	case xaiErrorUnauthorized, xaiErrorTokenExpired, xaiErrorTokenRevoked:
+		return xaiStateUnauthorized, xaiErrorReason(status, parsed, "xAI credential is invalid"), 0
+	case xaiErrorPermissionDenied, xaiErrorAccountUnavailable:
+		return xaiStateForbidden, xaiErrorReason(status, parsed, "xAI access is denied"), 0
+	case xaiErrorFreeUsageExhausted:
+		return xaiStateFreeExhausted, xaiErrorReason(status, parsed, "xAI free usage is exhausted"), now + int64((24 * time.Hour).Seconds())
+	case xaiErrorRateLimited:
+		return xaiStateRateLimited, xaiErrorReason(status, parsed, "temporary xAI throttling"), xaiRetryAfterUnix(rec.ResponseHeaders, now)
 	default:
 		return "", "", 0
 	}
 }
 
 func xaiFreeUsageExhaustedBody(body string) bool {
-	text := strings.ToLower(strings.TrimSpace(body))
-	return strings.Contains(text, "subscription:free-usage-exhausted") || strings.Contains(text, "free-usage-exhausted")
+	return parseXAIError(0, body).Kind == xaiErrorFreeUsageExhausted
+}
+
+func xaiErrorReason(status int, parsed xaiParsedError, fallback string) string {
+	evidence := firstNonEmptyString(parsed.Code, parsed.Message)
+	if parsed.Code != "" && parsed.Message != "" && !strings.EqualFold(parsed.Code, parsed.Message) {
+		evidence = parsed.Code + ": " + parsed.Message
+	}
+	evidence = sanitizeTriggerError(evidence)
+	if evidence == "" {
+		evidence = fallback
+	}
+	if status > 0 {
+		return fmt.Sprintf("%d %s: %s", status, parsed.Kind, evidence)
+	}
+	return fmt.Sprintf("%s: %s", parsed.Kind, evidence)
 }
 
 func xaiRetryAfterUnix(headers map[string][]string, now int64) int64 {

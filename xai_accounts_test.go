@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -30,6 +31,29 @@ func TestXAIStateClassification(t *testing.T) {
 				t.Fatalf("state=%q resetAt=%d, want %q %d", state, resetAt, test.state, test.resetAt)
 			}
 		})
+	}
+}
+
+func TestXAIStateUsesStructuredErrorEvidence(t *testing.T) {
+	now := int64(1_700_000_000)
+	rec := usageRecord{
+		Failed:  true,
+		Failure: usageFailure{StatusCode: http.StatusUnauthorized, Body: `{"error":{"code":"invalid_grant","message":"Token is expired"}}`},
+	}
+	state, reason, resetAt := xaiStateForRecord(rec, http.StatusUnauthorized, now)
+	if state != xaiStateUnauthorized || resetAt != 0 {
+		t.Fatalf("state=%q resetAt=%d", state, resetAt)
+	}
+	if !strings.Contains(reason, "token_expired") || !strings.Contains(reason, "invalid_grant") || !strings.Contains(reason, "Token is expired") {
+		t.Fatalf("reason=%q, want structured error evidence", reason)
+	}
+
+	modelFailure := usageRecord{
+		Failed:  true,
+		Failure: usageFailure{StatusCode: http.StatusForbidden, Body: `{"error":{"code":"model_not_found","message":"Model does not exist"}}`},
+	}
+	if state, _, _ := xaiStateForRecord(modelFailure, http.StatusForbidden, now); state != "" {
+		t.Fatalf("state=%q, model errors must not mark the account unavailable", state)
 	}
 }
 
