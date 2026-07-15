@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -45,11 +46,15 @@ type authImportResult struct {
 }
 
 func handleAuthImportPreview(raw []byte) managementResponse {
+	return handleAuthImportPreviewContext(context.Background(), raw)
+}
+
+func handleAuthImportPreviewContext(ctx context.Context, raw []byte) managementResponse {
 	request, response := decodeAuthImportRequest(raw)
 	if response != nil {
 		return *response
 	}
-	result, err := previewAuthImport(request.Text)
+	result, err := previewAuthImportContext(ctx, request.Text)
 	if err != nil {
 		return jsonResponse(httpStatusForAuthImportError(err), map[string]any{"error": "auth_import_preview_failed", "message": err.Error()})
 	}
@@ -57,11 +62,15 @@ func handleAuthImportPreview(raw []byte) managementResponse {
 }
 
 func handleAuthImportCommit(raw []byte) managementResponse {
+	return handleAuthImportCommitContext(context.Background(), raw)
+}
+
+func handleAuthImportCommitContext(ctx context.Context, raw []byte) managementResponse {
 	request, response := decodeAuthImportRequest(raw)
 	if response != nil {
 		return *response
 	}
-	result, err := commitAuthImport(request.Text, request.Overwrite)
+	result, err := commitAuthImportContext(ctx, request.Text, request.Overwrite)
 	if err != nil {
 		return jsonResponse(httpStatusForAuthImportError(err), map[string]any{"error": "auth_import_failed", "message": err.Error()})
 	}
@@ -106,8 +115,18 @@ func httpStatusForAuthImportError(err error) int {
 }
 
 func previewAuthImport(text string) (authImportResult, error) {
+	return previewAuthImportContext(context.Background(), text)
+}
+
+func previewAuthImportContext(ctx context.Context, text string) (authImportResult, error) {
+	if err := ctx.Err(); err != nil {
+		return authImportResult{}, err
+	}
 	items, parseErrors := parseAuthImportText(text)
-	existing, err := existingHostAuthFileNames()
+	if err := ctx.Err(); err != nil {
+		return authImportResult{}, err
+	}
+	existing, err := existingHostAuthFileNamesContext(ctx)
 	if err != nil {
 		return authImportResult{}, err
 	}
@@ -118,13 +137,26 @@ func previewAuthImport(text string) (authImportResult, error) {
 }
 
 func commitAuthImport(text string, overwrite bool) (authImportResult, error) {
+	return commitAuthImportContext(context.Background(), text, overwrite)
+}
+
+func commitAuthImportContext(ctx context.Context, text string, overwrite bool) (authImportResult, error) {
+	if err := ctx.Err(); err != nil {
+		return authImportResult{}, err
+	}
 	items, parseErrors := parseAuthImportText(text)
-	existing, err := existingHostAuthFileNames()
+	if err := ctx.Err(); err != nil {
+		return authImportResult{}, err
+	}
+	existing, err := existingHostAuthFileNamesContext(ctx)
 	if err != nil {
 		return authImportResult{}, err
 	}
 	result := authImportResult{Detected: len(items), Items: items, Errors: append([]string(nil), parseErrors...), Skipped: len(parseErrors)}
 	for i := range result.Items {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		item := &result.Items[i]
 		_, item.Existing = existing[strings.ToLower(item.FileName)]
 		if item.Existing && !overwrite {
@@ -138,11 +170,17 @@ func commitAuthImport(text string, overwrite bool) (authImportResult, error) {
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: encode failed", item.FileName))
 			continue
 		}
+		// The host ABI callback is synchronous and has no cancellation primitive.
+		// Context checks before and after it prevent new or subsequent writes after
+		// cancellation, but an already-running callback must return on its own.
 		_, err = hostAuthCaller("host.auth.save", map[string]any{"name": item.FileName, "json": json.RawMessage(rawJSON)})
 		if err != nil {
 			result.Failed++
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: %s", item.FileName, sanitizeTriggerError(err)))
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return result, err
 		}
 		result.Imported++
 		existing[strings.ToLower(item.FileName)] = struct{}{}
@@ -151,8 +189,20 @@ func commitAuthImport(text string, overwrite bool) (authImportResult, error) {
 }
 
 func existingHostAuthFileNames() (map[string]struct{}, error) {
+	return existingHostAuthFileNamesContext(context.Background())
+}
+
+func existingHostAuthFileNamesContext(ctx context.Context) (map[string]struct{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// See the save path above: this synchronous host callback cannot be
+	// interrupted once entered, so cancellation is enforced at its boundaries.
 	raw, err := hostAuthCaller("host.auth.list", map[string]any{})
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	var response hostAuthListResponse

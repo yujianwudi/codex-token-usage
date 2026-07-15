@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.34`
+Current version: `0.1.35`
 
 ## Features
 
@@ -179,11 +179,11 @@ Each platform zip contains the dynamic library, `LICENSE`, and `THIRD_PARTY_NOTI
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.34_linux_amd64.zip
-codex-token-usage_0.1.34_linux_arm64.zip
-codex-token-usage_0.1.34_windows_amd64.zip
-codex-token-usage_0.1.34_darwin_amd64.zip
-codex-token-usage_0.1.34_darwin_arm64.zip
+codex-token-usage_0.1.35_linux_amd64.zip
+codex-token-usage_0.1.35_linux_arm64.zip
+codex-token-usage_0.1.35_windows_amd64.zip
+codex-token-usage_0.1.35_darwin_amd64.zip
+codex-token-usage_0.1.35_darwin_arm64.zip
 checksums.txt
 ```
 
@@ -196,6 +196,8 @@ checksums.txt
 - Confirm `go test ./...` passes before publishing.
 
 ## Common Issues
+
+- Auth import uses the host's synchronous `host.auth.*` callback ABI. Cancellation is checked before and between callbacks, but a callback that is already running cannot be interrupted by the plugin; shutdown therefore waits for the host callback to return.
 
 - `未注册 / 未生效`: confirm the file is under the correct plugin directory and restart CLIProxyAPI.
 - `401`: the auth JSON is invalid and will not be used until replaced or removed.

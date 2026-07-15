@@ -186,15 +186,20 @@ ON CONFLICT(state_key) DO UPDATE SET
 func clearRecoveredXAIState(ctx context.Context, db *sql.DB, rec usageRecord) (bool, error) {
 	authFile, _ := xaiAuthFileStateForRecord(rec)
 	aliases := normalizeAccountAliases(authFile, rec.AuthID, rec.AuthIndex, rec.Source)
+	recoveredAt := rec.RequestedAt.Unix()
+	if recoveredAt <= 0 {
+		recoveredAt = time.Now().Unix()
+	}
 	changed := false
 	for _, alias := range aliases {
 		result, err := db.ExecContext(ctx, `
 UPDATE xai_account_states SET active=0
 WHERE active=1
 AND state IN (?, ?, ?)
+AND observed_at <= ?
 AND (lower(state_key)=? OR lower(auth_id)=? OR lower(auth_index)=? OR lower(source)=? OR lower(auth_file)=?)`,
 			xaiStateUnauthorized, xaiStateForbidden, xaiStateRateLimited,
-			alias, alias, alias, alias, alias)
+			recoveredAt, alias, alias, alias, alias, alias)
 		if err != nil {
 			return false, err
 		}

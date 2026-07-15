@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-const currentSQLiteSchemaVersion = 3
+const currentSQLiteSchemaVersion = 5
 
 func migrateSQLiteStore(ctx context.Context, db *sql.DB, dbPath string) error {
 	var version int
@@ -15,6 +15,12 @@ func migrateSQLiteStore(ctx context.Context, db *sql.DB, dbPath string) error {
 	}
 	if version > currentSQLiteSchemaVersion {
 		return fmt.Errorf("usage database schema %d is newer than supported schema %d", version, currentSQLiteSchemaVersion)
+	}
+	// Reservation auth_file became part of the persisted identity in v5. Add it
+	// before both the v3 privacy rewrite and the schema-version fast path so
+	// direct migrations and repaired mature databases use the same shape.
+	if err := ensureAccountProtectionReservationColumns(ctx, db); err != nil {
+		return err
 	}
 	if version == currentSQLiteSchemaVersion {
 		return nil
@@ -26,6 +32,23 @@ func migrateSQLiteStore(ctx context.Context, db *sql.DB, dbPath string) error {
 	defer tx.Rollback()
 	if version < 3 {
 		if err := bindAPIKeyFingerprintSecret(ctx, tx, dbPath); err != nil {
+			return err
+		}
+	}
+	if version < 4 {
+		// Millisecond reset timestamps were accepted by early releases. Normalize
+		// them once during the schema upgrade instead of scanning the potentially
+		// large usage_events table on every process start.
+		if err := normalizeStoredResetColumns(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if version < 5 {
+		// Reservations belong to in-flight calls from the previous plugin
+		// process. They cannot be assigned safely to the new file-scoped identity,
+		// and no such calls survive the plugin upgrade, so discard them instead of
+		// temporarily under-counting duplicate credentials until their TTLs expire.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM account_protection_reservations`); err != nil {
 			return err
 		}
 	}
@@ -65,4 +88,26 @@ WHERE lower(trim(window)) NOT IN ('today','24h','7d','30d','all')
 		return err
 	}
 	return tx.Commit()
+}
+
+type sqliteStoreExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func normalizeStoredResetColumns(ctx context.Context, exec sqliteStoreExecer) error {
+	statements := []string{
+		`UPDATE usage_events SET primary_reset_at = CAST(primary_reset_at / 1000 AS INTEGER) WHERE primary_reset_at > 1000000000000`,
+		`UPDATE usage_events SET secondary_reset_at = CAST(secondary_reset_at / 1000 AS INTEGER) WHERE secondary_reset_at > 1000000000000`,
+		`UPDATE autoban_bans SET reset_at = CAST(reset_at / 1000 AS INTEGER) WHERE reset_at > 1000000000000`,
+		`UPDATE autoban_bans SET primary_reset_at = CAST(primary_reset_at / 1000 AS INTEGER) WHERE primary_reset_at > 1000000000000`,
+		`UPDATE autoban_bans SET secondary_reset_at = CAST(secondary_reset_at / 1000 AS INTEGER) WHERE secondary_reset_at > 1000000000000`,
+		`UPDATE quota_trigger_runs SET primary_reset_at = CAST(primary_reset_at / 1000 AS INTEGER) WHERE primary_reset_at > 1000000000000`,
+		`UPDATE quota_trigger_runs SET secondary_reset_at = CAST(secondary_reset_at / 1000 AS INTEGER) WHERE secondary_reset_at > 1000000000000`,
+	}
+	for _, statement := range statements {
+		if _, err := exec.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
 }

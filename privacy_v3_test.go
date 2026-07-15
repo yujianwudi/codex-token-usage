@@ -30,6 +30,60 @@ func isolateAPIKeyPrivacyQuarantineForTest(t *testing.T) {
 	t.Helper()
 }
 
+func TestPrivacySafeUsageRecordProtectsAuthFile(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "usage.db")
+	raw := "sk-proj-auth-file-secret-1234567890"
+	rec, err := privacySafeUsageRecord(dbPath, usageRecord{
+		APIKey:   raw,
+		AuthFile: "codex-" + raw + ".json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rec.AuthFile, raw) {
+		t.Fatalf("AuthFile retained raw credential: %q", rec.AuthFile)
+	}
+	if !strings.Contains(rec.AuthFile, rec.APIKey) {
+		t.Fatalf("AuthFile = %q, want protected fingerprint %q", rec.AuthFile, rec.APIKey)
+	}
+}
+
+func TestStoredCredentialBearerRequiresSpaceDelimiter(t *testing.T) {
+	ordinary := "bearer-account-1"
+	if got := storedCredentialAlias(ordinary); got != "" {
+		t.Fatalf("storedCredentialAlias(%q) = %q, want ordinary alias", ordinary, got)
+	}
+	if got := configuredCredentialWholeValue(ordinary); got != ordinary {
+		t.Fatalf("configuredCredentialWholeValue(%q) = %q", ordinary, got)
+	}
+	if credential, whole := credentialFromStoredIdentity(ordinary, nil); credential != "" || whole {
+		t.Fatalf("credentialFromStoredIdentity(%q) = %q/%v", ordinary, credential, whole)
+	}
+
+	credential := "opaque-provider-key-1234567890"
+	if got := configuredCredentialWholeValue("bEaReR " + credential); got != credential {
+		t.Fatalf("valid Bearer credential = %q, want %q", got, credential)
+	}
+	if got, whole := credentialFromStoredIdentity("bEaReR "+credential, nil); got != credential || !whole {
+		t.Fatalf("valid Bearer identity = %q/%v, want %q/true", got, whole, credential)
+	}
+}
+
+func TestSanitizeTriggerErrorFailsClosedWhenFingerprintSidecarUnavailable(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CPA_TOKEN_USAGE_DIR", blocked)
+	resetAPIKeySecretCacheForTest(blocked)
+	if got := storedCredentialAlias("xai-short-secret"); got != "" {
+		t.Fatalf("stored credential alias unexpectedly succeeded: %q", got)
+	}
+	if got := sanitizeTriggerError("upstream returned xai-short-secret"); got != "trigger failed" {
+		t.Fatalf("sanitizeTriggerError failed open: %q", got)
+	}
+}
+
 func refreshAPIKeyPrivacyQuarantineForTest(t *testing.T, s *store, db *sql.DB, path string) {
 	t.Helper()
 	if err := s.refreshAPIKeyPrivacyQuarantine(context.Background(), db, path); err != nil {
@@ -256,7 +310,6 @@ func TestV3MigrationPreservesSafeActiveStatesAndSanitizesCredentials(t *testing.
 	}
 	for _, query := range []string{
 		`SELECT auth_id||auth_index||source FROM usage_events WHERE api_key=''`,
-		`SELECT auth_id||auth_index||source FROM account_protection_reservations`,
 		`SELECT auth_id||auth_index||source||auth_file FROM quota_trigger_runs`,
 	} {
 		var value string
@@ -266,6 +319,13 @@ func TestV3MigrationPreservesSafeActiveStatesAndSanitizesCredentials(t *testing.
 		if strings.Contains(value, raw) || !strings.Contains(value, "keyfp:v1:") {
 			t.Fatalf("derived identity migration left an unsafe value for %q: %q", query, value)
 		}
+	}
+	var reservations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations`).Scan(&reservations); err != nil {
+		t.Fatal(err)
+	}
+	if reservations != 0 {
+		t.Fatalf("ephemeral reservations retained during v5 migration: %d", reservations)
 	}
 	var cacheRows int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM summary_cache`).Scan(&cacheRows); err != nil {
@@ -680,12 +740,11 @@ func TestLegacyV0IsLocallyRekeyedAndDiagnosedAsUnlinkable(t *testing.T) {
 		t.Fatalf("legacy fingerprint migration = %q / %q", migrated, authID)
 	}
 	status := apiKeyFingerprintStatus(context.Background(), db)
-	if status.LegacyUnlinkableRows != 4 || !strings.Contains(status.Compatibility, "cannot be linked") {
+	if status.LegacyUnlinkableRows != 3 || !strings.Contains(status.Compatibility, "cannot be linked") {
 		t.Fatalf("privacy diagnostics = %+v", status)
 	}
 	for _, query := range []string{
 		`SELECT auth_id FROM invalid_auths`,
-		`SELECT auth_id FROM account_protection_reservations`,
 		`SELECT auth_file FROM quota_trigger_runs`,
 	} {
 		var value string
@@ -695,6 +754,13 @@ func TestLegacyV0IsLocallyRekeyedAndDiagnosedAsUnlinkable(t *testing.T) {
 		if strings.Contains(strings.ToLower(value), "keyfp:v0:") || !strings.Contains(strings.ToLower(value), "keyfp:v1:") {
 			t.Fatalf("legacy identity was not locally re-keyed for %q: %q", query, value)
 		}
+	}
+	var reservations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations`).Scan(&reservations); err != nil {
+		t.Fatal(err)
+	}
+	if reservations != 0 {
+		t.Fatalf("legacy reservations retained during v5 migration: %d", reservations)
 	}
 }
 

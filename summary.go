@@ -1317,6 +1317,7 @@ type providerRow struct {
 
 type keySummaryRow struct {
 	KeyID                 string  `json:"key_id"`
+	KeyDisplay            string  `json:"key_display"`
 	RawKeyID              string  `json:"-"`
 	Protocol              string  `json:"protocol"`
 	Provider              string  `json:"provider,omitempty"`
@@ -3522,7 +3523,8 @@ LIMIT ?`
 		); err != nil {
 			return nil, err
 		}
-		r.KeyID = maskAPIKeyForDisplay(r.RawKeyID)
+		r.KeyID = keySummaryFilterID(r.RawKeyID)
+		r.KeyDisplay = maskAPIKeyForDisplay(r.RawKeyID)
 		r.ProviderNames = normalizeKeyProviderNames(providers)
 		r.Provider = firstKeyProviderName(r.ProviderNames)
 		r.QuotaUsedTokens = r.TotalTokens

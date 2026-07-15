@@ -51,12 +51,7 @@ func ensurePrivateDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return err
-		}
-	}
-	return nil
+	return enforcePrivatePath(dir, true)
 }
 
 func ensurePrivateFile(path string) error {
@@ -67,12 +62,7 @@ func ensurePrivateFile(path string) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(path, 0o600); err != nil {
-			return err
-		}
-	}
-	return nil
+	return enforcePrivatePath(path, false)
 }
 
 func defaultConfigCandidates() []string {

@@ -19,6 +19,39 @@ const (
 var pluginLifecycleGate sync.RWMutex
 var pluginLifecycleStopped = true
 
+var pluginOperationState struct {
+	sync.RWMutex
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func resetPluginOperationContext() {
+	pluginOperationState.Lock()
+	if pluginOperationState.cancel != nil {
+		pluginOperationState.cancel()
+	}
+	pluginOperationState.ctx, pluginOperationState.cancel = context.WithCancel(context.Background())
+	pluginOperationState.Unlock()
+}
+
+func currentPluginOperationContext() context.Context {
+	pluginOperationState.RLock()
+	ctx := pluginOperationState.ctx
+	pluginOperationState.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func cancelPluginOperationContext() {
+	pluginOperationState.Lock()
+	if pluginOperationState.cancel != nil {
+		pluginOperationState.cancel()
+	}
+	pluginOperationState.Unlock()
+}
+
 // sync.RWMutex gives a pending writer priority over subsequent readers.
 // Shutdown publishes pluginLifecycleStopped and closes the store while holding
 // the write side, so an invocation queued behind shutdown must observe

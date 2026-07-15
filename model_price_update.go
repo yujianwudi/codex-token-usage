@@ -376,13 +376,7 @@ func modelPriceURLForDiagnostics(raw string) string {
 	}
 	target, err := url.Parse(raw)
 	if err != nil {
-		if before, _, ok := strings.Cut(raw, "?"); ok {
-			raw = before
-		}
-		if before, _, ok := strings.Cut(raw, "#"); ok {
-			raw = before
-		}
-		return raw
+		return "<invalid URL>"
 	}
 	target.RawQuery = ""
 	target.ForceQuery = false

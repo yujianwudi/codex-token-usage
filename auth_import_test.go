@@ -1,13 +1,65 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestAuthImportCanceledContextPreventsHostCalls(t *testing.T) {
+	oldCaller := hostAuthCaller
+	t.Cleanup(func() { hostAuthCaller = oldCaller })
+	calls := 0
+	hostAuthCaller = func(string, any) (json.RawMessage, error) {
+		calls++
+		return nil, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := previewAuthImportContext(ctx, `{}`); !errors.Is(err, context.Canceled) {
+		t.Fatalf("preview error = %v, want context canceled", err)
+	}
+	if _, err := commitAuthImportContext(ctx, `{}`, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("commit error = %v, want context canceled", err)
+	}
+	if calls != 0 {
+		t.Fatalf("host calls = %d, want 0", calls)
+	}
+}
+
+func TestAuthImportCancellationStopsSubsequentHostSaves(t *testing.T) {
+	oldCaller := hostAuthCaller
+	t.Cleanup(func() { hostAuthCaller = oldCaller })
+	ctx, cancel := context.WithCancel(context.Background())
+	saves := 0
+	hostAuthCaller = func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case "host.auth.list":
+			return json.Marshal(hostAuthListResponse{})
+		case "host.auth.save":
+			saves++
+			cancel()
+			return json.RawMessage(`{}`), nil
+		default:
+			return nil, errors.New("unexpected host method")
+		}
+	}
+	text := `[
+		{"email":"a@example.com","account_id":"account-a","access_token":"token-a"},
+		{"email":"b@example.com","account_id":"account-b","access_token":"token-b"}
+	]`
+	if _, err := commitAuthImportContext(ctx, text, true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("commit error = %v, want context canceled", err)
+	}
+	if saves != 1 {
+		t.Fatalf("host saves = %d, want 1", saves)
+	}
+}
 
 func TestAuthImportRejectsOversizedEnvelopeBeforeJSONDecode(t *testing.T) {
 	raw := make([]byte, maxAuthImportRequestBytes+1)

@@ -7,7 +7,7 @@ if [[ ! -d "${directory}" ]]; then
   echo "Release asset directory not found: ${directory}" >&2
   exit 1
 fi
-for tool in awk diff find jq mktemp sha256sum sort tr unzip wc; do
+for tool in awk diff jq mktemp sha256sum sort tr unzip wc; do
   if ! command -v "${tool}" >/dev/null 2>&1; then
     echo "${tool} is required to verify release assets" >&2
     exit 2
@@ -23,6 +23,42 @@ platforms=(
 )
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
+
+release_assets=()
+for platform in "${platforms[@]}"; do
+  archive_name="codex-token-usage_${version}_${platform}.zip"
+  sbom_name="codex-token-usage_${version}_${platform}.spdx.json"
+  release_assets+=("${archive_name}" "${sbom_name}")
+done
+
+# The verified input bundle is closed: exactly five archives and five SPDX
+# documents, all as top-level regular files. In particular, reject stale
+# checksums, hidden files, directories, and symlinks before inspecting content.
+shopt -s nullglob dotglob
+directory_entries=("${directory}"/*)
+shopt -u nullglob dotglob
+if (( ${#directory_entries[@]} != ${#release_assets[@]} )); then
+  echo "Expected exactly ${#release_assets[@]} top-level release assets; found ${#directory_entries[@]}" >&2
+  exit 1
+fi
+for entry in "${directory_entries[@]}"; do
+  name="${entry##*/}"
+  if [[ -L "${entry}" || ! -f "${entry}" ]]; then
+    echo "Release bundle entry is not a top-level regular file: ${name}" >&2
+    exit 1
+  fi
+  expected=false
+  for expected_name in "${release_assets[@]}"; do
+    if [[ "${name}" == "${expected_name}" ]]; then
+      expected=true
+      break
+    fi
+  done
+  if [[ "${expected}" != "true" ]]; then
+    echo "Unexpected release asset: ${name}" >&2
+    exit 1
+  fi
+done
 
 for platform in "${platforms[@]}"; do
   zip="${directory}/codex-token-usage_${version}_${platform}.zip"
@@ -95,16 +131,15 @@ for platform in "${platforms[@]}"; do
   fi
 done
 
-zip_count="$(find "${directory}" -maxdepth 1 -type f -name '*.zip' | wc -l | tr -d ' ')"
-sbom_count="$(find "${directory}" -maxdepth 1 -type f -name '*.spdx.json' | wc -l | tr -d ' ')"
-if [[ "${zip_count}" != "${#platforms[@]}" || "${sbom_count}" != "${#platforms[@]}" ]]; then
-  echo "Expected ${#platforms[@]} archives and SBOMs; found ${zip_count} archives and ${sbom_count} SBOMs" >&2
+checksums="$(
+  cd "${directory}"
+  LC_ALL=C sha256sum -- "${release_assets[@]}" | LC_ALL=C sort -k2,2
+)"
+checksum_count="$(printf '%s\n' "${checksums}" | wc -l | tr -d ' ')"
+if [[ "${checksum_count}" != "${#release_assets[@]}" ]]; then
+  echo "Expected ${#release_assets[@]} checksum entries; generated ${checksum_count}" >&2
   exit 1
 fi
+printf '%s\n' "${checksums}" > "${directory}/checksums.txt"
 
-(
-  cd "${directory}"
-  LC_ALL=C sha256sum -- *.zip *.spdx.json | LC_ALL=C sort -k2,2 > checksums.txt
-)
-
-echo "Verified ${zip_count} release archives and ${sbom_count} SBOMs"
+echo "Verified ${#release_assets[@]} release assets and generated checksums.txt"

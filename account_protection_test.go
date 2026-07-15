@@ -167,6 +167,147 @@ func TestAccountProtectionReconfigureCancelsAndJoinsPlanRefresh(t *testing.T) {
 	}
 }
 
+func TestAccountProtectionStopDoesNotWaitForStuckPlanLoader(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
+	t.Setenv("CPA_AUTH_DIR", filepath.Join(dir, "auth"))
+	var manager accountProtectionManager
+	var releaseOnce sync.Once
+	release := make(chan struct{})
+	releaseLoader := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseLoader()
+		manager.stop()
+	})
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	manager.configure(cfg)
+
+	started := make(chan context.Context, 1)
+	manager.mu.Lock()
+	manager.plans = map[string]string{"stable": "free"}
+	manager.plansLoadedAt = time.Now().Add(-accountProtectionPlanRefreshInterval - time.Second)
+	manager.plansLoader = func(ctx context.Context) map[string]string {
+		started <- ctx
+		<-release // Deliberately ignore cancellation like a stuck filesystem call.
+		return map[string]string{"stale": "team"}
+	}
+	manager.mu.Unlock()
+	manager.configuredPlans()
+
+	var refreshCtx context.Context
+	select {
+	case refreshCtx = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background plan refresh did not start")
+	}
+	manager.mu.RLock()
+	done := manager.plansRefreshDone
+	manager.mu.RUnlock()
+	if done == nil {
+		t.Fatal("background plan refresh did not publish a completion channel")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		manager.stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		releaseLoader()
+		t.Fatal("account protection stop waited indefinitely for a stuck loader")
+	}
+	if refreshCtx.Err() == nil {
+		releaseLoader()
+		t.Fatal("account protection stop did not cancel the stuck refresh context")
+	}
+
+	releaseLoader()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("released plan loader did not exit")
+	}
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	if _, published := manager.plans["stale"]; published {
+		t.Fatal("stuck plan refresh published after stop")
+	}
+}
+
+func TestAccountProtectionReconfigureDoesNotWaitForStuckPlanLoader(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
+	t.Setenv("CPA_AUTH_DIR", filepath.Join(dir, "auth"))
+	var manager accountProtectionManager
+	var releaseOnce sync.Once
+	release := make(chan struct{})
+	releaseLoader := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseLoader()
+		manager.stop()
+	})
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	manager.configure(cfg)
+
+	started := make(chan struct{})
+	manager.mu.Lock()
+	manager.plansLoadedAt = time.Now().Add(-accountProtectionPlanRefreshInterval - time.Second)
+	manager.plansLoader = func(context.Context) map[string]string {
+		close(started)
+		<-release // Deliberately ignore cancellation like a stuck filesystem call.
+		return map[string]string{"stale": "team"}
+	}
+	manager.mu.Unlock()
+	manager.configuredPlans()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background plan refresh did not start")
+	}
+	manager.mu.RLock()
+	done := manager.plansRefreshDone
+	manager.mu.RUnlock()
+	if done == nil {
+		t.Fatal("background plan refresh did not publish a completion channel")
+	}
+
+	disabled := cfg
+	disabled.AccountProtectionEnabled = false
+	reconfigured := make(chan struct{})
+	go func() {
+		manager.configure(disabled)
+		close(reconfigured)
+	}()
+	select {
+	case <-reconfigured:
+	case <-time.After(time.Second):
+		releaseLoader()
+		t.Fatal("account protection reconfigure waited indefinitely for a stuck loader")
+	}
+	manager.mu.Lock()
+	manager.plans = map[string]string{"current": "pro"}
+	manager.mu.Unlock()
+
+	releaseLoader()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("released old-generation plan loader did not exit")
+	}
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	if got := manager.plans["current"]; got != "pro" {
+		t.Fatalf("current generation plan = %q, want pro", got)
+	}
+	if _, published := manager.plans["stale"]; published {
+		t.Fatal("old-generation stuck refresh overwrote reconfigured plans")
+	}
+}
+
 func newProtectionTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite3", ":memory:")
@@ -349,6 +490,123 @@ func TestProtectionReservationExpiresAndReleasesOnUsage(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("reservation count = %d, want 0", count)
+	}
+}
+
+func TestProtectionReservationReleaseKeepsSiblingWithSharedAliases(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	for _, reservation := range []struct {
+		authFile  string
+		createdAt int64
+	}{
+		{authFile: "b.json", createdAt: now - 10},
+		{authFile: "a.json", createdAt: now},
+	} {
+		if _, err := db.Exec(`INSERT INTO account_protection_reservations
+			(auth_id, auth_index, source, auth_file, plan_type, created_at, expires_at)
+			VALUES ('shared-workspace', 'shared-workspace', 'shared@example.com', ?, 'plus', ?, ?)`, reservation.authFile, reservation.createdAt, now+900); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := releaseProtectionReservation(context.Background(), db, usageRecord{
+		Provider:  "codex",
+		AuthID:    "shared-workspace",
+		AuthIndex: "shared-workspace",
+		Source:    "shared@example.com",
+		AuthFile:  "a.json",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var remaining string
+	if err := db.QueryRow(`SELECT auth_file FROM account_protection_reservations`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != "b.json" {
+		t.Fatalf("remaining reservation = %q, want b.json", remaining)
+	}
+}
+
+func TestProtectionReservationSnapshotSeparatesDuplicateFiles(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	for _, authFile := range []string{"a.json", "b.json"} {
+		if _, err := db.Exec(`INSERT INTO account_protection_reservations
+			(auth_id, auth_index, source, auth_file, plan_type, created_at, expires_at)
+			VALUES ('shared-workspace', 'shared-workspace', 'shared@example.com', ?, 'plus', ?, ?)`, authFile, now, now+900); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := loadProtectionReservationSnapshot(context.Background(), db, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexed := newProtectionSnapshot(snapshot, nil)
+	for _, authFile := range []string{"a.json", "b.json"} {
+		inFlight, _ := indexed.metrics([]string{authFile})
+		if inFlight != 1 {
+			t.Fatalf("%s in-flight = %d, want 1", authFile, inFlight)
+		}
+	}
+}
+
+func TestProtectionReservationCanonicalizesSchedulerAuthFile(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	globalSchedulerRotation.reset()
+	db := newProtectionTestDB(t)
+	cfg := defaultPluginConfig()
+	authPath := filepath.Join(t.TempDir(), "nested", "a.json")
+	candidate := schedulerAuthCandidate{
+		ID:       "shared-workspace",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"auth_index": "shared-workspace",
+			"source":     authPath,
+			"plan_type":  "plus",
+		},
+	}
+	if _, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{candidate}, cfg, "persist-auth-file"); err != nil {
+		t.Fatal(err)
+	}
+	var authFile string
+	if err := db.QueryRow(`SELECT auth_file FROM account_protection_reservations`).Scan(&authFile); err != nil {
+		t.Fatal(err)
+	}
+	if authFile != "a.json" {
+		t.Fatalf("stored auth file = %q, want a.json", authFile)
+	}
+	if err := releaseProtectionReservation(context.Background(), db, usageRecord{
+		Provider:  "codex",
+		AuthID:    "shared-workspace",
+		AuthIndex: "shared-workspace",
+		Source:    authPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("canonical file reservation was not released: %d remain", count)
+	}
+}
+
+func TestSchedulerCandidateAuthFileUsesAllFileIdentityFields(t *testing.T) {
+	fullPath := filepath.Join("nested", "a.json")
+	for name, candidate := range map[string]schedulerAuthCandidate{
+		"auth_file":  {Attributes: map[string]string{"auth_file": fullPath}},
+		"path":       {Attributes: map[string]string{"path": fullPath}},
+		"file":       {Metadata: map[string]any{"file": fullPath}},
+		"source":     {Attributes: map[string]string{"source": fullPath}},
+		"auth_index": {Attributes: map[string]string{"auth_index": fullPath}},
+		"id":         {ID: fullPath},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := schedulerCandidateAuthFile(candidate); got != "a.json" {
+				t.Fatalf("schedulerCandidateAuthFile = %q, want a.json", got)
+			}
+		})
 	}
 }
 

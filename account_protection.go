@@ -21,7 +21,7 @@ type accountProtectionManager struct {
 	plansRefreshStarted uint64
 	plansCtx            context.Context
 	plansCancel         context.CancelFunc
-	plansWG             sync.WaitGroup
+	plansRefreshDone    <-chan struct{}
 	plansLoader         func(context.Context) map[string]string
 
 	reservationCleanupDB *sql.DB
@@ -36,6 +36,7 @@ type accountProtectionManager struct {
 
 const (
 	accountProtectionPlanRefreshInterval        = 30 * time.Second
+	accountProtectionPlanRefreshStopTimeout     = 100 * time.Millisecond
 	accountProtectionReservationCleanupInterval = 30 * time.Second
 )
 
@@ -121,8 +122,10 @@ func (m *accountProtectionManager) stop() {
 func (m *accountProtectionManager) stopPlanRefreshLocked() {
 	m.mu.Lock()
 	cancel := m.plansCancel
+	done := m.plansRefreshDone
 	m.plansCancel = nil
 	m.plansCtx = nil
+	m.plansRefreshDone = nil
 	m.plansRefreshing = false
 	// Invalidate any refresh that began before cancellation so it cannot publish
 	// a filesystem snapshot after reconfiguration or plugin shutdown.
@@ -131,7 +134,21 @@ func (m *accountProtectionManager) stopPlanRefreshLocked() {
 	if cancel != nil {
 		cancel()
 	}
-	m.plansWG.Wait()
+	if done == nil {
+		return
+	}
+	// Filesystem discovery can enter an OS call that cannot be interrupted by a
+	// Go context (for example, a stalled network mount). Give cooperative
+	// loaders a short grace period to finish, but do not let shutdown or
+	// reconfiguration wait forever. The generation checks in
+	// refreshConfiguredPlans prevent an abandoned old generation from
+	// publishing if it eventually returns.
+	timer := time.NewTimer(accountProtectionPlanRefreshStopTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 func (m *accountProtectionManager) config() pluginConfig {
@@ -152,8 +169,9 @@ func (m *accountProtectionManager) configuredPlans() map[string]string {
 		m.plansRefreshing = true
 		m.plansRefreshStarted = m.plansGeneration
 		generation := m.plansGeneration
-		m.plansWG.Add(1)
-		go m.refreshConfiguredPlans(ctx, generation)
+		done := make(chan struct{})
+		m.plansRefreshDone = done
+		go m.refreshConfiguredPlans(ctx, generation, done)
 	}
 	m.mu.Unlock()
 	return plans
@@ -176,8 +194,8 @@ func (m *accountProtectionManager) loadConfiguredPlans(ctx context.Context) map[
 	return plans
 }
 
-func (m *accountProtectionManager) refreshConfiguredPlans(ctx context.Context, generation uint64) {
-	defer m.plansWG.Done()
+func (m *accountProtectionManager) refreshConfiguredPlans(ctx context.Context, generation uint64, done chan<- struct{}) {
+	defer close(done)
 	if ctx.Err() != nil {
 		return
 	}
@@ -193,6 +211,7 @@ func (m *accountProtectionManager) refreshConfiguredPlans(ctx context.Context, g
 	m.plans = plans
 	m.plansLoadedAt = time.Now()
 	m.plansRefreshing = false
+	m.plansRefreshDone = nil
 }
 
 func normalizedProtectionPlan(value string) string {
@@ -246,7 +265,7 @@ func schedulerCandidateIdentity(candidate schedulerAuthCandidate) accountIdentit
 		AuthID:    strings.TrimSpace(candidate.ID),
 		AuthIndex: firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"])),
 		Source:    firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"])),
-		AuthFile:  firstNonEmptyString(candidate.Attributes["auth_file"], stringFromAny(candidate.Metadata["auth_file"])),
+		AuthFile:  schedulerCandidateAuthFile(candidate),
 	}
 }
 
@@ -362,15 +381,16 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		states = append(states, state)
 	}
 	chosen := chooseProtectedCandidate(states, rotationKey)
-	storedAuthID, storedAuthIndex, storedSource, err := privacySafeSchedulerIdentity(
-		s.privacyDatabasePath(), chosen.Candidate, chosen.AuthID, chosen.AuthIndex, chosen.Source,
+	chosenIdentity := schedulerCandidateIdentity(chosen.Candidate)
+	storedAuthID, storedAuthIndex, storedSource, storedAuthFile, err := privacySafeSchedulerIdentity(
+		s.privacyDatabasePath(), chosen.Candidate, chosen.AuthID, chosen.AuthIndex, chosen.Source, chosenIdentity.AuthFile,
 	)
 	if err != nil {
 		return schedulerAuthCandidate{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `
-INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at)
-VALUES (?, ?, ?, ?, ?, ?)`, storedAuthID, storedAuthIndex, storedSource, chosen.PlanType, now, now+int64(cfg.AccountProtectionReservationTTLSeconds)); err != nil {
+INSERT INTO account_protection_reservations (auth_id, auth_index, source, auth_file, plan_type, created_at, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)`, storedAuthID, storedAuthIndex, storedSource, storedAuthFile, chosen.PlanType, now, now+int64(cfg.AccountProtectionReservationTTLSeconds)); err != nil {
 		return schedulerAuthCandidate{}, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -456,13 +476,7 @@ func protectionCandidateAliasSets(candidates []schedulerAuthCandidate) [][]strin
 			out[i] = raw[i]
 			continue
 		}
-		authFile := firstNonEmptyString(
-			candidates[i].Attributes["auth_file"],
-			stringFromAny(candidates[i].Metadata["auth_file"]),
-			candidates[i].Attributes["path"],
-			stringFromAny(candidates[i].Metadata["path"]),
-		)
-		aliases := strictFileIdentityAliases(fileNameIfJSON(authFile))
+		aliases := strictFileIdentityAliases(schedulerCandidateAuthFile(candidates[i]))
 		for _, alias := range raw[i] {
 			if counts[alias] == 1 {
 				seen := false
@@ -607,22 +621,22 @@ func newProtectionSnapshotWithUsageIndex(reservations []protectionReservationSam
 func loadProtectionReservationSnapshot(ctx context.Context, db protectionRowsQueryer, now int64) ([]protectionReservationSample, error) {
 	var snapshot []protectionReservationSample
 	rows, err := db.QueryContext(ctx, `
-SELECT auth_id, auth_index, source, COUNT(*)
+SELECT auth_id, auth_index, source, auth_file, COUNT(*)
 FROM account_protection_reservations
 WHERE expires_at > ?
-GROUP BY auth_id, auth_index, source`, now)
+GROUP BY auth_id, auth_index, source, auth_file`, now)
 	if err != nil {
 		return snapshot, err
 	}
 	for rows.Next() {
-		var authID, authIndex, source string
+		var authID, authIndex, source, authFile string
 		var count int
-		if err := rows.Scan(&authID, &authIndex, &source, &count); err != nil {
+		if err := rows.Scan(&authID, &authIndex, &source, &authFile, &count); err != nil {
 			_ = rows.Close()
 			return snapshot, err
 		}
 		snapshot = append(snapshot, protectionReservationSample{
-			Aliases: normalizeAccountAliases(authID, authIndex, source),
+			Aliases: normalizeAccountAliases(authID, authIndex, source, authFile),
 			Count:   count,
 		})
 	}
@@ -706,24 +720,45 @@ func releaseProtectionReservation(ctx context.Context, db *sql.DB, rec usageReco
 	if provider := strings.TrimSpace(rec.Provider); provider != "" && !strings.EqualFold(provider, "codex") {
 		return nil
 	}
+	recordAliases := normalizeAccountAliases(rec.AuthID, rec.AuthIndex, rec.Source, rec.AuthFile)
+	recordStrictAliases := strictAuthStateAliasesForValues(rec.AuthID, rec.AuthIndex, rec.Source, rec.AuthFile)
+	if len(recordStrictAliases) > 0 {
+		recordAliases = recordStrictAliases
+	}
+	if len(recordAliases) == 0 {
+		return nil
+	}
+	condition, conditionArgs := sqlLowerInCondition([]string{"auth_id", "auth_index", "source", "auth_file"}, recordAliases)
+	if condition == "" {
+		return nil
+	}
+	args := []any{time.Now().Unix()}
+	args = append(args, conditionArgs...)
 	rows, err := db.QueryContext(ctx, `
-SELECT id, auth_id, auth_index, source
+SELECT id, auth_id, auth_index, source, auth_file
 FROM account_protection_reservations
 WHERE expires_at > ?
-ORDER BY created_at, id`, time.Now().Unix())
+AND (`+condition+`)
+ORDER BY created_at, id`, args...)
 	if err != nil {
 		return err
 	}
-	recordAliases := normalizeAccountAliases(rec.AuthID, rec.AuthIndex, rec.Source, rec.AuthFile)
 	var matchIDs []int64
 	for rows.Next() {
 		var id int64
-		var authID, authIndex, source string
-		if err := rows.Scan(&id, &authID, &authIndex, &source); err != nil {
+		var authID, authIndex, source, authFile string
+		if err := rows.Scan(&id, &authID, &authIndex, &source, &authFile); err != nil {
 			_ = rows.Close()
 			return err
 		}
-		if !aliasesOverlap(recordAliases, normalizeAccountAliases(authID, authIndex, source)) {
+		reservationAliases := normalizeAccountAliases(authID, authIndex, source, authFile)
+		if len(recordStrictAliases) > 0 {
+			reservationAliases = strictAuthStateAliasesForValues(authID, authIndex, source, authFile)
+			if len(reservationAliases) == 0 {
+				continue
+			}
+		}
+		if !aliasesOverlap(recordAliases, reservationAliases) {
 			continue
 		}
 		matchIDs = append(matchIDs, id)

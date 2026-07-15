@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.34"
+	pluginVersion    = "0.1.35"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/yujianwudi/codex-token-usage"
 )
@@ -312,6 +312,25 @@ type usageDetail struct {
 	TotalTokens         int64 `json:"TotalTokens"`
 }
 
+type usagePostProcessError struct {
+	err error
+}
+
+func (e *usagePostProcessError) Error() string {
+	return "usage stored but derived account state update failed: " + e.err.Error()
+}
+
+func (e *usagePostProcessError) Unwrap() error {
+	return e.err
+}
+
+func appendUsagePostProcessError(errs []error, name string, err error) []error {
+	if err == nil {
+		return errs
+	}
+	return append(errs, fmt.Errorf("%s: %w", name, err))
+}
+
 const forbiddenInvalidAuthThreshold = 3
 
 func main() {}
@@ -328,6 +347,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
 	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
+	resetPluginOperationContext()
 	pluginLifecycleStopped = false
 	return 0
 }
@@ -379,11 +399,11 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	cancelPluginOperationContext()
 	pluginLifecycleGate.Lock()
 	defer pluginLifecycleGate.Unlock()
 	pluginLifecycleStopped = true
 	globalSchedulerStateRefresher.stop()
-	globalSchedulerState.invalidate()
 	globalAccountProtection.stop()
 	globalQuotaTrigger.stop()
 	globalModelPriceUpdater.stop()
@@ -391,6 +411,10 @@ func cliproxyPluginShutdown() {
 	globalDBHealth.stop()
 	globalSummaryMaintenance.stop()
 	globalSummaryPrecomputer.stop()
+	// Invalidate only after every background publisher has stopped. Otherwise a
+	// maintenance pass that was already in flight can republish a snapshot after
+	// the earlier invalidation while shutdown is still joining other workers.
+	globalSchedulerState.invalidate()
 	globalStore.close()
 }
 
@@ -480,7 +504,14 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &rec); err != nil {
 			return okJSON(map[string]any{"ignored": true, "error": err.Error()})
 		}
-		if err := globalStore.recordUsage(context.Background(), rec); err != nil {
+		if err := globalStore.recordUsage(currentPluginOperationContext(), rec); err != nil {
+			var postProcessErr *usagePostProcessError
+			if errors.As(err, &postProcessErr) {
+				return okJSON(map[string]any{
+					"stored":  true,
+					"warning": "usage stored; derived account state update failed",
+				})
+			}
 			return okJSON(map[string]any{"stored": false, "error": err.Error()})
 		}
 		return okJSON(map[string]any{"stored": true})
@@ -489,7 +520,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return okJSON(schedulerPickResponse{Handled: false})
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+		ctx, cancel := context.WithTimeout(currentPluginOperationContext(), 750*time.Millisecond)
 		defer cancel()
 		resp, err := globalStore.pickAuth(ctx, req)
 		if err != nil {
@@ -543,6 +574,7 @@ func pluginConfigFields() []configField {
 }
 
 func handleManagement(req managementRequest) managementResponse {
+	ctx := currentPluginOperationContext()
 	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/dashboard") {
 		return managementResponse{
 			StatusCode: http.StatusOK,
@@ -570,14 +602,14 @@ func handleManagement(req managementRequest) managementResponse {
 		var data map[string]any
 		var err error
 		if syncRefresh {
-			if err := globalStore.runSummaryMaintenance(context.Background()); err != nil {
+			if err := globalStore.runSummaryMaintenance(ctx); err != nil {
 				return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
 			}
-			data, err = globalSummaryPrecomputer.summarySync(context.Background(), globalStore, window, limit)
+			data, err = globalSummaryPrecomputer.summarySync(ctx, globalStore, window, limit)
 		} else if forceRefresh {
-			data, err = globalSummaryPrecomputer.summaryFresh(context.Background(), globalStore, window, limit)
+			data, err = globalSummaryPrecomputer.summaryFresh(ctx, globalStore, window, limit)
 		} else {
-			data, err = globalSummaryPrecomputer.summary(context.Background(), globalStore, window, limit)
+			data, err = globalSummaryPrecomputer.summary(ctx, globalStore, window, limit)
 		}
 		if err != nil {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
@@ -593,7 +625,7 @@ func handleManagement(req managementRequest) managementResponse {
 		limit := parseInt(firstQuery(req.Query, "limit", "5000"), 5000, 1, 20000)
 		kind := firstQuery(req.Query, "type", "accounts")
 		format := firstQuery(req.Query, "format", "csv")
-		return handleExportWithFilters(context.Background(), window, kind, format, limit, req.Query)
+		return handleExportWithFilters(ctx, window, kind, format, limit, req.Query)
 	}
 	if req.Path == "/v0/management/plugins/"+pluginID+"/autobans/release" {
 		if !strings.EqualFold(req.Method, http.MethodPost) {
@@ -605,11 +637,11 @@ func handleManagement(req managementRequest) managementResponse {
 				return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()})
 			}
 		}
-		db, _, err := globalStore.open(context.Background())
+		db, _, err := globalStore.open(ctx)
 		if err != nil {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "release_failed", "message": err.Error()})
 		}
-		result, err := releaseAutobans(context.Background(), db, body)
+		result, err := releaseAutobans(ctx, db, body)
 		if err != nil {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "release_failed", "message": err.Error()})
 		}
@@ -619,13 +651,13 @@ func handleManagement(req managementRequest) managementResponse {
 		if !strings.EqualFold(req.Method, http.MethodPost) {
 			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
 		}
-		return handleAuthImportPreview(req.Body)
+		return handleAuthImportPreviewContext(ctx, req.Body)
 	}
 	if req.Path == "/v0/management/plugins/"+pluginID+"/auth-import/commit" {
 		if !strings.EqualFold(req.Method, http.MethodPost) {
 			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
 		}
-		return handleAuthImportCommit(req.Body)
+		return handleAuthImportCommitContext(ctx, req.Body)
 	}
 	return jsonResponse(http.StatusNotFound, map[string]any{"error": "not_found"})
 }
@@ -1069,9 +1101,6 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB, path string) error {
 	if err := ensureSummaryCacheColumns(ctx, db); err != nil {
 		return err
 	}
-	if err := normalizeStoredResetColumns(ctx, db); err != nil {
-		return err
-	}
 	if err := ensureUsageEventColumns(ctx, db); err != nil {
 		return err
 	}
@@ -1119,6 +1148,39 @@ func ensureSummaryCacheColumns(ctx context.Context, db *sql.DB) error {
 			continue
 		}
 		if _, err := db.ExecContext(ctx, `ALTER TABLE summary_cache ADD COLUMN `+column.name+` `+column.def); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureAccountProtectionReservationColumns(ctx context.Context, db *sql.DB) error {
+	existing := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(account_protection_reservations)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !existing["auth_file"] {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE account_protection_reservations ADD COLUMN auth_file TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -1612,24 +1674,6 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 	return err
 }
 
-func normalizeStoredResetColumns(ctx context.Context, db *sql.DB) error {
-	statements := []string{
-		`UPDATE usage_events SET primary_reset_at = CAST(primary_reset_at / 1000 AS INTEGER) WHERE primary_reset_at > 1000000000000`,
-		`UPDATE usage_events SET secondary_reset_at = CAST(secondary_reset_at / 1000 AS INTEGER) WHERE secondary_reset_at > 1000000000000`,
-		`UPDATE autoban_bans SET reset_at = CAST(reset_at / 1000 AS INTEGER) WHERE reset_at > 1000000000000`,
-		`UPDATE autoban_bans SET primary_reset_at = CAST(primary_reset_at / 1000 AS INTEGER) WHERE primary_reset_at > 1000000000000`,
-		`UPDATE autoban_bans SET secondary_reset_at = CAST(secondary_reset_at / 1000 AS INTEGER) WHERE secondary_reset_at > 1000000000000`,
-		`UPDATE quota_trigger_runs SET primary_reset_at = CAST(primary_reset_at / 1000 AS INTEGER) WHERE primary_reset_at > 1000000000000`,
-		`UPDATE quota_trigger_runs SET secondary_reset_at = CAST(secondary_reset_at / 1000 AS INTEGER) WHERE secondary_reset_at > 1000000000000`,
-	}
-	for _, statement := range statements {
-		if _, err := db.ExecContext(ctx, statement); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func ensureQuotaTriggerRunColumns(ctx context.Context, db *sql.DB) error {
 	columns := []struct {
 		name string
@@ -1894,26 +1938,15 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err != nil {
 		return err
 	}
-	if err := releaseProtectionReservation(ctx, db, storedRec); err != nil {
-		return err
-	}
-	if err := recordXAIStateIfNeeded(ctx, db, storedRec, status); err != nil {
-		return err
-	}
-	if err := recordInvalidAuthIfNeeded(ctx, db, storedRec, status); err != nil {
-		return err
-	}
-	if err := recordRepeatedForbiddenIfNeeded(ctx, db, storedRec, status); err != nil {
-		return err
-	}
-	if err := clearRecoveredAuthStateIfNeeded(ctx, db, storedRec, status); err != nil {
-		return err
-	}
-	if err := recordAutobanIfNeeded(ctx, db, storedRec, status, primaryPct, primaryReset, secondaryPct, secondaryReset); err != nil {
-		return err
-	}
-	if strings.EqualFold(trim(rec.Provider), "codex") && (status == http.StatusUnauthorized || status == http.StatusPaymentRequired || status == http.StatusForbidden || status == http.StatusTooManyRequests) {
-		globalSchedulerState.setRestricted("codex", true)
+	var postProcessErrors []error
+	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "release protection reservation", releaseProtectionReservation(ctx, db, storedRec))
+	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "record xAI state", recordXAIStateIfNeeded(ctx, db, storedRec, status))
+	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "record invalid auth", recordInvalidAuthIfNeeded(ctx, db, storedRec, status))
+	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "record repeated forbidden", recordRepeatedForbiddenIfNeeded(ctx, db, storedRec, status))
+	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "clear recovered auth state", clearRecoveredAuthStateIfNeeded(ctx, db, storedRec, status))
+	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "record auto-ban", recordAutobanIfNeeded(ctx, db, storedRec, status, primaryPct, primaryReset, secondaryPct, secondaryReset))
+	if len(postProcessErrors) > 0 {
+		return &usagePostProcessError{err: errors.Join(postProcessErrors...)}
 	}
 	return nil
 }
@@ -2028,6 +2061,10 @@ func clearRecoveredAuthStateIfNeeded(ctx context.Context, db *sql.DB, rec usageR
 		return nil
 	}
 	aliases, strict := recoveryMatchAliasesForRecord(rec)
+	recoveredAt := rec.RequestedAt.Unix()
+	if recoveredAt <= 0 {
+		recoveredAt = time.Now().Unix()
+	}
 	changed := false
 	for _, alias := range aliases {
 		if strict {
@@ -2035,11 +2072,12 @@ func clearRecoveredAuthStateIfNeeded(ctx context.Context, db *sql.DB, rec usageR
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
+AND invalidated_at <= ?
 AND (
   lower(auth_file)=?
   OR lower(auth_id)=?
   OR lower(auth_index)=?
-)`, alias, alias, alias)
+)`, recoveredAt, alias, alias, alias)
 			if err != nil {
 				return err
 			}
@@ -2050,10 +2088,11 @@ AND (
 UPDATE autoban_bans
 SET active=0
 WHERE active=1
+AND banned_at <= ?
 AND (
   lower(auth_id)=?
   OR lower(auth_index)=?
-)`, alias, alias)
+)`, recoveredAt, alias, alias)
 			if err != nil {
 				return err
 			}
@@ -2066,12 +2105,13 @@ AND (
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
+AND invalidated_at <= ?
 AND (
   lower(auth_id)=?
   OR lower(auth_index)=?
   OR lower(source)=?
   OR lower(auth_file)=?
-)`, alias, alias, alias, alias)
+)`, recoveredAt, alias, alias, alias, alias)
 		if err != nil {
 			return err
 		}
@@ -2082,11 +2122,12 @@ AND (
 UPDATE autoban_bans
 SET active=0
 WHERE active=1
+AND banned_at <= ?
 AND (
   lower(auth_id)=?
   OR lower(auth_index)=?
   OR lower(source)=?
-)`, alias, alias, alias)
+)`, recoveredAt, alias, alias, alias)
 		if err != nil {
 			return err
 		}
@@ -3219,8 +3260,22 @@ func sanitizeTriggerError(value any) string {
 	if text == "" || text == "{}" || text == "[]" {
 		return ""
 	}
-	for _, marker := range []string{"Bearer ", "access_token", "refresh_token", "id_token"} {
-		if strings.Contains(text, marker) {
+	lower := strings.ToLower(text)
+	if containsAuthorizationHeader(lower) {
+		return "trigger failed"
+	}
+	for _, marker := range []string{
+		"bearer ", "authorization:", "authorization=", "proxy-authorization:",
+		"access_token", "access-token", "refresh_token", "refresh-token",
+		"id_token", "id-token", "api_key", "api-key", "apikey", "x-api-key",
+	} {
+		if strings.Contains(lower, marker) {
+			return "trigger failed"
+		}
+	}
+	for _, field := range strings.Fields(text) {
+		field = strings.Trim(field, "\"'`[]{}(),;:=<>")
+		if looksLikeCredentialToken(field) {
 			return "trigger failed"
 		}
 	}
@@ -3228,6 +3283,30 @@ func sanitizeTriggerError(value any) string {
 		text = text[:220]
 	}
 	return text
+}
+
+func containsAuthorizationHeader(lower string) bool {
+	for _, name := range []string{"authorization", "proxy-authorization"} {
+		for offset := 0; offset < len(lower); {
+			relative := strings.Index(lower[offset:], name)
+			if relative < 0 {
+				break
+			}
+			start := offset + relative
+			end := start + len(name)
+			beforeBoundary := start == 0 || !isAuthorizationTokenByte(lower[start-1])
+			afterBoundary := end < len(lower) && (lower[end] == ':' || lower[end] == '=' || lower[end] == ' ' || lower[end] == '\t' || lower[end] == '\r' || lower[end] == '\n')
+			if beforeBoundary && afterBoundary {
+				return true
+			}
+			offset = start + 1
+		}
+	}
+	return false
+}
+
+func isAuthorizationTokenByte(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9' || value == '-' || value == '_'
 }
 
 func classifyCodexBan(headers map[string][]string, primaryPct *float64, primaryReset *int64, secondaryPct *float64, secondaryReset *int64, now int64) (int64, string, string) {
@@ -4344,6 +4423,25 @@ func schedulerCandidateAliases(candidate schedulerAuthCandidate) []string {
 	return aliases
 }
 
+func schedulerCandidateAuthFile(candidate schedulerAuthCandidate) string {
+	for _, value := range []string{
+		candidate.Attributes["auth_file"],
+		stringFromAny(candidate.Metadata["auth_file"]),
+		candidate.Attributes["path"],
+		candidate.Attributes["file"],
+		stringFromAny(candidate.Metadata["path"]),
+		stringFromAny(candidate.Metadata["file"]),
+		firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"])),
+		firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"])),
+		candidate.ID,
+	} {
+		if file := fileNameIfJSON(value); file != "" {
+			return file
+		}
+	}
+	return ""
+}
+
 func schedulerCandidateStrictAliases(candidate schedulerAuthCandidate) []string {
 	authID := candidate.ID
 	authIndex := firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"]))
@@ -4356,10 +4454,7 @@ func schedulerCandidateStrictAliases(candidate schedulerAuthCandidate) []string 
 		stringFromAny(candidate.Metadata["path"]),
 		stringFromAny(candidate.Metadata["file"]),
 	)
-	if file := fileNameIfJSON(authFile); file != "" {
-		return normalizeAccountAliases(file)
-	}
-	if file := fileNameIfJSON(authIndex); file != "" {
+	if file := schedulerCandidateAuthFile(candidate); file != "" {
 		return normalizeAccountAliases(file)
 	}
 	return strictAuthStateAliasesForValues(authID, authIndex, source, authFile)

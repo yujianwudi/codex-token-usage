@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -754,8 +756,23 @@ func exportLogRecords(ctx context.Context, db *sql.DB, filters logExportFilter, 
 		args = append(args, provider)
 	}
 	accountFilter := strings.TrimSpace(filters.Account)
-	maskedAccountFilter := strings.Contains(accountFilter, "****")
-	if account := normalizeAccountAlias(accountFilter); account != "" && !maskedAccountFilter {
+	if filterID, ok := normalizeKeySummaryFilterID(accountFilter); ok {
+		storedKey, found, err := resolveKeySummaryFilterID(ctx, db, filterID, where, args)
+		if err != nil {
+			return nil, nil, err
+		}
+		if found {
+			where = append(where, `api_key=?`)
+			args = append(args, storedKey)
+		} else {
+			where = append(where, `1=0`)
+		}
+	} else if strings.Contains(accountFilter, "****") {
+		// Display masks are intentionally not identifiers. Failing closed prevents
+		// two credentials with the same last four characters from being exported
+		// together by an ambiguous legacy filter.
+		where = append(where, `1=0`)
+	} else if account := normalizeAccountAlias(accountFilter); account != "" {
 		where = append(where, `(lower(api_key)=? OR lower(auth_id)=? OR lower(auth_index)=? OR lower(source)=?)`)
 		args = append(args, account, account, account, account)
 	}
@@ -849,9 +866,6 @@ LIMIT ?`
 		account := safeExportLabel(firstNonEmptyString(apiKey, authIndex, authID, source))
 		if strings.TrimSpace(apiKey) != "" {
 			account = maskAPIKeyForDisplay(apiKey)
-		}
-		if maskedAccountFilter && account != accountFilter {
-			continue
 		}
 		out = append(out, map[string]string{
 			"time":                     unixTime(ts),
@@ -1089,6 +1103,60 @@ func maskAPIKeyForDisplay(value string) string {
 		return "key-" + maskCredentialForDisplay(value, 0)
 	}
 	return maskCredentialForDisplay(value, prefixLen)
+}
+
+const keySummaryFilterIDPrefix = "keyid:v1:"
+
+func keySummaryFilterID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(value))
+	return keySummaryFilterIDPrefix + hex.EncodeToString(digest[:])
+}
+
+func normalizeKeySummaryFilterID(value string) (string, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if !strings.HasPrefix(value, keySummaryFilterIDPrefix) || len(value) != len(keySummaryFilterIDPrefix)+sha256.Size*2 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(value[len(keySummaryFilterIDPrefix):]); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func resolveKeySummaryFilterID(ctx context.Context, db *sql.DB, filterID string, where []string, args []any) (string, bool, error) {
+	query := `SELECT DISTINCT api_key FROM usage_events`
+	conditions := append([]string(nil), where...)
+	conditions = append(conditions, `api_key <> ''`)
+	if len(conditions) > 0 {
+		query += ` WHERE ` + strings.Join(conditions, " AND ")
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return "", false, err
+	}
+	defer rows.Close()
+	matched := ""
+	for rows.Next() {
+		var stored string
+		if err := rows.Scan(&stored); err != nil {
+			return "", false, err
+		}
+		if keySummaryFilterID(stored) != filterID {
+			continue
+		}
+		if matched != "" && matched != stored {
+			return "", false, fmt.Errorf("ambiguous key summary filter identifier")
+		}
+		matched = stored
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+	return matched, matched != "", nil
 }
 
 func bearerCredential(value string) (string, bool) {
