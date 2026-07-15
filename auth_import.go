@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const maxAuthImportTextBytes = 8 << 20
+const (
+	maxAuthImportTextBytes    = 8 << 20
+	maxAuthImportRequestBytes = 24 << 20
+)
 
 type authImportRequest struct {
 	Text      string `json:"text"`
@@ -20,25 +23,25 @@ type authImportRequest struct {
 }
 
 type authImportItem struct {
-	Index           int      `json:"index"`
-	SourceFormat    string   `json:"source_format"`
-	FileName        string   `json:"file_name"`
-	Email           string   `json:"email,omitempty"`
-	PlanType        string   `json:"plan_type,omitempty"`
-	ExpiresAt       string   `json:"expires_at,omitempty"`
-	HasRefreshToken bool     `json:"has_refresh_token"`
-	Existing        bool     `json:"existing,omitempty"`
-	Warnings        []string `json:"warnings,omitempty"`
+	Index           int            `json:"index"`
+	SourceFormat    string         `json:"source_format"`
+	FileName        string         `json:"file_name"`
+	Email           string         `json:"email,omitempty"`
+	PlanType        string         `json:"plan_type,omitempty"`
+	ExpiresAt       string         `json:"expires_at,omitempty"`
+	HasRefreshToken bool           `json:"has_refresh_token"`
+	Existing        bool           `json:"existing,omitempty"`
+	Warnings        []string       `json:"warnings,omitempty"`
 	AuthJSON        map[string]any `json:"-"`
 }
 
 type authImportResult struct {
-	Detected  int              `json:"detected"`
-	Imported  int              `json:"imported,omitempty"`
-	Skipped   int              `json:"skipped"`
-	Failed    int              `json:"failed,omitempty"`
-	Items     []authImportItem `json:"items"`
-	Errors    []string         `json:"errors,omitempty"`
+	Detected int              `json:"detected"`
+	Imported int              `json:"imported,omitempty"`
+	Skipped  int              `json:"skipped"`
+	Failed   int              `json:"failed,omitempty"`
+	Items    []authImportItem `json:"items"`
+	Errors   []string         `json:"errors,omitempty"`
 }
 
 func handleAuthImportPreview(raw []byte) managementResponse {
@@ -69,6 +72,10 @@ func decodeAuthImportRequest(raw []byte) (authImportRequest, *managementResponse
 	var request authImportRequest
 	if len(raw) == 0 {
 		response := jsonResponse(400, map[string]any{"error": "bad_request", "message": "text is required"})
+		return request, &response
+	}
+	if len(raw) > maxAuthImportRequestBytes {
+		response := jsonResponse(413, map[string]any{"error": "payload_too_large", "message": "import request exceeds 24 MiB"})
 		return request, &response
 	}
 	if err := json.Unmarshal(raw, &request); err != nil {

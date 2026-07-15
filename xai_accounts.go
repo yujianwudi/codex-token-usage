@@ -145,7 +145,7 @@ func recordXAIStateIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, st
 			return err
 		}
 		if changed {
-			globalSchedulerState.invalidate()
+			globalSchedulerState.invalidateProvider("xai")
 		}
 		return nil
 	}
@@ -206,8 +206,14 @@ AND (lower(state_key)=? OR lower(auth_id)=? OR lower(auth_index)=? OR lower(sour
 }
 
 func expireXAIStates(ctx context.Context, db *sql.DB, now int64) error {
-	_, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE active=1 AND reset_at>0 AND reset_at<=?`, now)
-	return err
+	result, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE active=1 AND reset_at>0 AND reset_at<=?`, now)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+		globalSchedulerState.invalidateProvider("xai")
+	}
+	return nil
 }
 
 func queryActiveXAIStates(ctx context.Context, db *sql.DB, now int64) ([]xaiAccountStateRow, error) {
@@ -289,6 +295,7 @@ func applyXAIStates(accounts []accountRow, states []xaiAccountStateRow) {
 
 func clearReplacedOrMissingXAIStates(ctx context.Context, db *sql.DB) error {
 	configured := readConfiguredXAIAccounts()
+	changed := false
 	if globalXAIAuthSource.authoritative() {
 		states, err := queryActiveXAIStates(ctx, db, time.Now().Unix())
 		if err != nil {
@@ -303,8 +310,12 @@ func clearReplacedOrMissingXAIStates(ctx context.Context, db *sql.DB) error {
 			if _, ok := keep[state.StateKey]; ok {
 				continue
 			}
-			if _, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE state_key=?`, state.StateKey); err != nil {
+			result, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE state_key=?`, state.StateKey)
+			if err != nil {
 				return err
+			}
+			if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+				changed = true
 			}
 		}
 	}
@@ -312,10 +323,16 @@ func clearReplacedOrMissingXAIStates(ctx context.Context, db *sql.DB) error {
 		if cfg.AuthFileMTime <= 0 {
 			continue
 		}
-		_, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE active=1 AND auth_file=? AND ?>observed_at`, cfg.AuthFile, cfg.AuthFileMTime)
+		result, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE active=1 AND auth_file=? AND ?>observed_at`, cfg.AuthFile, cfg.AuthFileMTime)
 		if err != nil {
 			return err
 		}
+		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+			changed = true
+		}
+	}
+	if changed {
+		globalSchedulerState.invalidateProvider("xai")
 	}
 	return nil
 }

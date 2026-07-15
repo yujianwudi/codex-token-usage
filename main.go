@@ -77,21 +77,23 @@ import (
 )
 
 const (
-	abiVersion            uint32 = 1
-	pluginID                     = "codex-token-usage"
-	codexQuotaAPIURL             = "https://chatgpt.com/backend-api/wham/usage"
-	codexResponsesAPIURL         = "https://chatgpt.com/backend-api/codex/responses/compact"
-	codexProbeModel              = "gpt-5.5"
-	dbHealthCheckInterval        = 10 * time.Minute
+	abiVersion                    uint32 = 1
+	pluginID                             = "codex-token-usage"
+	codexQuotaAPIURL                     = "https://chatgpt.com/backend-api/wham/usage"
+	codexResponsesAPIURL                 = "https://chatgpt.com/backend-api/codex/responses/compact"
+	codexProbeModel                      = "gpt-5.5"
+	dbHealthCheckInterval                = 10 * time.Minute
+	quotaTriggerStateWriteTimeout        = 5 * time.Second
 )
 
 var (
-	pluginVersion    = "0.1.33"
+	pluginVersion    = "0.1.34"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/yujianwudi/codex-token-usage"
 )
 
 var globalStore = &store{}
+var globalSchedulerStateRefresher = &schedulerStateRefreshManager{}
 var globalQuotaTrigger = &quotaTriggerManager{}
 var globalModelPriceUpdater = &modelPriceUpdateManager{}
 var globalRetentionCleaner = &retentionCleaner{}
@@ -316,6 +318,8 @@ func main() {}
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+	pluginLifecycleGate.Lock()
+	defer pluginLifecycleGate.Unlock()
 	if plugin == nil {
 		return 1
 	}
@@ -324,6 +328,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
 	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
+	pluginLifecycleStopped = false
 	return 0
 }
 
@@ -333,15 +338,29 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		response.ptr = nil
 		response.len = 0
 	}
+	methodName := ""
+	if method != nil {
+		methodName = C.GoString(method)
+	}
+	unlock, running := beginPluginInvocation(methodName)
+	defer unlock()
+	if !running {
+		writeResponse(response, errorEnvelope("plugin_stopped", "plugin is stopped; initialize it before calling methods"))
+		return 1
+	}
 	if method == nil {
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
+		return 1
+	}
+	if uint64(requestLen) > maxPluginRequestBytes {
+		writeResponse(response, errorEnvelope("request_too_large", "plugin request exceeds 64 MiB"))
 		return 1
 	}
 	var req []byte
 	if request != nil && requestLen > 0 {
 		req = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, err := handleMethod(C.GoString(method), req)
+	raw, err := handleMethod(methodName, req)
 	if err != nil {
 		writeResponse(response, errorEnvelope("plugin_error", err.Error()))
 		return 1
@@ -360,6 +379,12 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	pluginLifecycleGate.Lock()
+	defer pluginLifecycleGate.Unlock()
+	pluginLifecycleStopped = true
+	globalSchedulerStateRefresher.stop()
+	globalSchedulerState.invalidate()
+	globalAccountProtection.stop()
 	globalQuotaTrigger.stop()
 	globalModelPriceUpdater.stop()
 	globalRetentionCleaner.stop()
@@ -497,7 +522,7 @@ func pluginConfigFields() []configField {
 		{Name: "账号保护预约超时秒数", Type: "number", Description: "没有完成回调时自动释放并发名额。默认 900 秒。"},
 		{Name: "开启定时额度触发", Type: "boolean", Description: "是否开启 Codex 账号定时额度触发。默认关闭。"},
 		{Name: "触发间隔分钟", Type: "number", Description: "每轮触发间隔，单位分钟。默认 10。"},
-		{Name: "触发模式", Type: "enum", Description: "probe=真实极小模型请求，会消耗少量 token；旧 quota 配置会自动按 probe 执行。默认 probe。"},
+		{Name: "触发模式", Type: "enum", Description: "quota=只读额度 GET；probe=真实极小模型请求，会消耗少量 token。默认 probe。"},
 		{Name: "最大并发账号数", Type: "number", Description: "每轮最大并发触发账号数。默认 1。"},
 		{Name: "单账号超时秒数", Type: "number", Description: "单个账号触发请求超时时间，单位秒。默认 20。"},
 		{Name: "单账号最小冷却分钟", Type: "number", Description: "同一账号两次触发的最小冷却时间，单位分钟。默认 10。"},
@@ -524,7 +549,7 @@ func handleManagement(req managementRequest) managementResponse {
 			Headers: map[string][]string{
 				"content-type":               {"text/html; charset=utf-8"},
 				"cache-control":              {"no-store"},
-				"content-security-policy":    {"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"},
+				"content-security-policy":    {dashboardCSP},
 				"x-content-type-options":     {"nosniff"},
 				"referrer-policy":            {"no-referrer"},
 				"x-frame-options":            {"DENY"},
@@ -538,7 +563,8 @@ func handleManagement(req managementRequest) managementResponse {
 		if !ok {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "invalid_window", "message": "window must be today, 24h, 7d, 30d, or all"})
 		}
-		limit := normalizeSummaryLimit(parseInt(firstQuery(req.Query, "limit", "50"), 50, 1, 5000))
+		requestedLimit := parseInt(firstQuery(req.Query, "limit", "50"), 50, 1, 5000)
+		limit := normalizeSummaryLimit(requestedLimit)
 		forceRefresh := parseBoolString(firstQuery(req.Query, "refresh", "false"), false)
 		syncRefresh := forceRefresh && parseBoolString(firstQuery(req.Query, "sync", "false"), false)
 		var data map[string]any
@@ -556,6 +582,7 @@ func handleManagement(req managementRequest) managementResponse {
 		if err != nil {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
 		}
+		truncateSummaryResponse(data, requestedLimit)
 		return jsonResponse(http.StatusOK, data)
 	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/export") {
@@ -681,18 +708,15 @@ func configurePlugin(request []byte) error {
 		cfg = parsePluginConfigYAML(raw, cfg)
 	}
 	cfg = normalizePluginConfig(cfg)
+	globalSchedulerStateRefresher.stop()
 	globalAccountProtection.configure(cfg)
-	initCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := globalStore.refreshSchedulerState(initCtx); err != nil {
-		globalSchedulerState.invalidate()
-	}
-	cancel()
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
 	globalRetentionCleaner.configure(cfg)
 	globalDBHealth.configure(cfg)
 	globalSummaryMaintenance.configure(cfg)
 	globalSummaryPrecomputer.configure(cfg)
+	globalSchedulerStateRefresher.configure(globalStore)
 	return nil
 }
 
@@ -868,9 +892,9 @@ func normalizePluginConfig(cfg pluginConfig) pluginConfig {
 	case "探测请求", "真实请求", "真实探测", "probe模式", "probe 模式":
 		mode = "probe"
 	case "quota", "quota mode", "只查询额度", "查询额度", "额度查询", "quota模式", "quota 模式":
-		mode = "probe"
+		mode = "quota"
 	}
-	if mode != "probe" {
+	if mode != "probe" && mode != "quota" {
 		mode = "probe"
 	}
 	cfg.QuotaTriggerMode = mode
@@ -955,15 +979,24 @@ func jsonResponse(status int, v any) managementResponse {
 }
 
 type store struct {
-	mu       sync.Mutex
-	repairMu sync.Mutex
-	db       *sql.DB
-	dbPath   string
+	mu                sync.Mutex
+	repairMu          sync.Mutex
+	db                *sql.DB
+	dbPath            string
+	privacyQuarantine apiKeyPrivacyQuarantineStoreState
 }
 
 func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
-	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if err := lockMutexContext(ctx, &s.mu); err != nil {
+		return nil, "", err
+	}
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	if s.db != nil {
 		return s.db, s.dbPath, nil
 	}
@@ -979,9 +1012,35 @@ func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
 		_ = db.Close()
 		return nil, "", err
 	}
+	if err := s.refreshAPIKeyPrivacyQuarantine(ctx, db, path); err != nil {
+		_ = db.Close()
+		return nil, "", err
+	}
 	s.db = db
 	s.dbPath = path
 	return db, path, nil
+}
+
+func lockMutexContext(ctx context.Context, mu *sync.Mutex) error {
+	if mu.TryLock() {
+		return nil
+	}
+	if ctx.Done() == nil {
+		mu.Lock()
+		return nil
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if mu.TryLock() {
+				return nil
+			}
+		}
+	}
 }
 
 func usageDBPath() (string, error) {
@@ -1022,7 +1081,10 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB, path string) error {
 	if err := ensureAutobanBanColumns(ctx, db); err != nil {
 		return err
 	}
-	return migrateSQLiteStore(ctx, db, path)
+	if err := migrateSQLiteStore(ctx, db, path); err != nil {
+		return err
+	}
+	return verifyAPIKeyFingerprintSecretBinding(ctx, db, path)
 }
 
 func ensureSummaryCacheColumns(ctx context.Context, db *sql.DB) error {
@@ -1070,6 +1132,7 @@ func (s *store) close() {
 		_ = s.db.Close()
 		s.db = nil
 	}
+	s.privacyQuarantine.snapshot.Store(nil)
 }
 
 func withSQLiteAutoRepair[T any](ctx context.Context, s *store, operation string, fn func() (T, error)) (T, error) {
@@ -1215,31 +1278,35 @@ type dbHealthState struct {
 type dbHealthMonitor struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 	state  dbHealthState
 }
 
 func (m *dbHealthMonitor) configure(cfg pluginConfig) {
+	m.stop()
 	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
 	if m.state.Status == "" {
 		m.state.Status = "unknown"
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
+	m.wg.Add(1)
 	m.mu.Unlock()
-	go m.loop(ctx)
+	go func() {
+		defer m.wg.Done()
+		m.loop(ctx)
+	}()
 }
 
 func (m *dbHealthMonitor) stop() {
 	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
+	cancel := m.cancel
+	m.cancel = nil
 	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	m.wg.Wait()
 }
 
 func (m *dbHealthMonitor) status() dbHealthState {
@@ -1318,6 +1385,9 @@ func (m *dbHealthMonitor) run(ctx context.Context) {
 			}
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.state.LastCheckAt = time.Now().Format(time.RFC3339)
@@ -1354,31 +1424,35 @@ type summaryMaintenanceState struct {
 type summaryMaintenanceManager struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 	cfg    pluginConfig
 	state  summaryMaintenanceState
 }
 
 func (m *summaryMaintenanceManager) configure(cfg pluginConfig) {
 	cfg = normalizePluginConfig(cfg)
+	m.stop()
 	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
 	m.cfg = cfg
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
+	m.wg.Add(1)
 	m.mu.Unlock()
-	go m.loop(ctx, cfg)
+	go func() {
+		defer m.wg.Done()
+		m.loop(ctx, cfg)
+	}()
 }
 
 func (m *summaryMaintenanceManager) stop() {
 	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
+	cancel := m.cancel
+	m.cancel = nil
 	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	m.wg.Wait()
 }
 
 func (m *summaryMaintenanceManager) status() summaryMaintenanceState {
@@ -1388,6 +1462,9 @@ func (m *summaryMaintenanceManager) status() summaryMaintenanceState {
 }
 
 func (m *summaryMaintenanceManager) loop(ctx context.Context, cfg pluginConfig) {
+	if !waitForBackgroundStartup(ctx, summaryMaintenanceStartupGrace) {
+		return
+	}
 	m.run(ctx)
 	interval := time.Duration(maxInt(cfg.SummaryMaintenanceIntervalSeconds, 10)) * time.Second
 	ticker := time.NewTicker(interval)
@@ -1678,15 +1755,13 @@ type quotaTriggerManager struct {
 	mu     sync.Mutex
 	cfg    pluginConfig
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 	state  quotaTriggerState
 }
 
 func (m *quotaTriggerManager) configure(cfg pluginConfig) {
+	m.stop()
 	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
 	m.cfg = cfg
 	m.state.Enabled = cfg.QuotaTriggerEnabled
 	m.state.Running = false
@@ -1702,18 +1777,24 @@ func (m *quotaTriggerManager) configure(cfg pluginConfig) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.state.Running = true
+	m.wg.Add(1)
 	m.mu.Unlock()
-	go m.loop(ctx, cfg)
+	go func() {
+		defer m.wg.Done()
+		m.loop(ctx, cfg)
+	}()
 }
 
 func (m *quotaTriggerManager) stop() {
 	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
+	cancel := m.cancel
+	m.cancel = nil
 	m.state.Running = false
 	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	m.wg.Wait()
 }
 
 func (m *quotaTriggerManager) status() quotaTriggerState {
@@ -1723,6 +1804,9 @@ func (m *quotaTriggerManager) status() quotaTriggerState {
 }
 
 func (m *quotaTriggerManager) loop(ctx context.Context, cfg pluginConfig) {
+	if !waitForBackgroundStartup(ctx, quotaTriggerStartupGrace) {
+		return
+	}
 	interval := time.Duration(cfg.QuotaTriggerIntervalMinutes) * time.Minute
 	for {
 		m.runRound(ctx, cfg)
@@ -1750,14 +1834,14 @@ func (m *quotaTriggerManager) runRound(ctx context.Context, cfg pluginConfig) {
 	m.state.LastError = ""
 	m.mu.Unlock()
 
-	success, failed, skipped, candidates, err := globalStore.runQuotaTriggerRound(ctx, cfg)
+	success, failed, skipped, attempted, err := globalStore.runQuotaTriggerRound(ctx, cfg)
 
 	m.mu.Lock()
 	m.state.LastRunAt = time.Now().Format(time.RFC3339)
 	m.state.LastSuccess = success
 	m.state.LastFailed = failed
 	m.state.LastSkipped = skipped
-	m.state.LastCandidates = candidates
+	m.state.LastCandidates = attempted
 	if err != nil && !errors.Is(err, context.Canceled) {
 		m.state.LastError = sanitizeTriggerError(err)
 	}
@@ -1794,15 +1878,14 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if ttftMs > 0 && (latencyMs <= 0 || latencyMs < ttftMs) {
 		latencyMs = ttftMs
 	}
-	rawAPIKey := trim(rec.APIKey)
-	storedAPIKey := privacySafeAPIKey(dbPath, rawAPIKey)
-	storedAuthID := sanitizeStoredIdentity(rec.AuthID, rawAPIKey, storedAPIKey)
-	storedAuthIndex := sanitizeStoredIdentity(rec.AuthIndex, rawAPIKey, storedAPIKey)
-	storedSource := sanitizeStoredIdentity(rec.Source, rawAPIKey, storedAPIKey)
+	storedRec, err := privacySafeUsageRecord(dbPath, rec)
+	if err != nil {
+		return err
+	}
 	_, err = db.ExecContext(ctx, insertSQL,
 		rec.RequestedAt.Unix(),
 		trim(rec.Provider), trim(rec.ExecutorType), trim(rec.Model), trim(rec.Alias),
-		storedAPIKey, trim(storedAuthID), trim(storedAuthIndex), trim(rec.AuthType), trim(storedSource),
+		trim(storedRec.APIKey), trim(storedRec.AuthID), trim(storedRec.AuthIndex), trim(rec.AuthType), trim(storedRec.Source),
 		trim(rec.ReasoningEffort), trim(rec.ServiceTier), latencyMs, ttftMs, boolInt(rec.Failed), status,
 		rec.Detail.InputTokens, rec.Detail.OutputTokens, rec.Detail.ReasoningTokens, rec.Detail.CachedTokens,
 		rec.Detail.CacheReadTokens, rec.Detail.CacheCreationTokens, total,
@@ -1811,22 +1894,22 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err != nil {
 		return err
 	}
-	if err := releaseProtectionReservation(ctx, db, rec); err != nil {
+	if err := releaseProtectionReservation(ctx, db, storedRec); err != nil {
 		return err
 	}
-	if err := recordXAIStateIfNeeded(ctx, db, rec, status); err != nil {
+	if err := recordXAIStateIfNeeded(ctx, db, storedRec, status); err != nil {
 		return err
 	}
-	if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
+	if err := recordInvalidAuthIfNeeded(ctx, db, storedRec, status); err != nil {
 		return err
 	}
-	if err := recordRepeatedForbiddenIfNeeded(ctx, db, rec, status); err != nil {
+	if err := recordRepeatedForbiddenIfNeeded(ctx, db, storedRec, status); err != nil {
 		return err
 	}
-	if err := clearRecoveredAuthStateIfNeeded(ctx, db, rec, status); err != nil {
+	if err := clearRecoveredAuthStateIfNeeded(ctx, db, storedRec, status); err != nil {
 		return err
 	}
-	if err := recordAutobanIfNeeded(ctx, db, rec, status, primaryPct, primaryReset, secondaryPct, secondaryReset); err != nil {
+	if err := recordAutobanIfNeeded(ctx, db, storedRec, status, primaryPct, primaryReset, secondaryPct, secondaryReset); err != nil {
 		return err
 	}
 	if strings.EqualFold(trim(rec.Provider), "codex") && (status == http.StatusUnauthorized || status == http.StatusPaymentRequired || status == http.StatusForbidden || status == http.StatusTooManyRequests) {
@@ -1874,11 +1957,14 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider),
 		reason, invalidatedAt, status, authFile, authFileMTime,
 	)
+	if err == nil {
+		globalSchedulerState.invalidateProvider("codex")
+	}
 	return err
 }
 
 func invalidAuthIDForRecord(rec usageRecord, authFile string) string {
-	if authFile != "" && shouldUseStrictAuthFileIdentity(rec, authFile) {
+	if authFile != "" {
 		return authFile
 	}
 	return firstNonEmptyString(rec.AuthID, rec.AuthIndex, rec.Source)
@@ -1942,9 +2028,10 @@ func clearRecoveredAuthStateIfNeeded(ctx context.Context, db *sql.DB, rec usageR
 		return nil
 	}
 	aliases, strict := recoveryMatchAliasesForRecord(rec)
+	changed := false
 	for _, alias := range aliases {
 		if strict {
-			if _, err := db.ExecContext(ctx, `
+			result, err := db.ExecContext(ctx, `
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
@@ -1952,22 +2039,30 @@ AND (
   lower(auth_file)=?
   OR lower(auth_id)=?
   OR lower(auth_index)=?
-)`, alias, alias, alias); err != nil {
+)`, alias, alias, alias)
+			if err != nil {
 				return err
 			}
-			if _, err := db.ExecContext(ctx, `
+			if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+				changed = true
+			}
+			result, err = db.ExecContext(ctx, `
 UPDATE autoban_bans
 SET active=0
 WHERE active=1
 AND (
   lower(auth_id)=?
   OR lower(auth_index)=?
-)`, alias, alias); err != nil {
+)`, alias, alias)
+			if err != nil {
 				return err
+			}
+			if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+				changed = true
 			}
 			continue
 		}
-		if _, err := db.ExecContext(ctx, `
+		result, err := db.ExecContext(ctx, `
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
@@ -1976,10 +2071,14 @@ AND (
   OR lower(auth_index)=?
   OR lower(source)=?
   OR lower(auth_file)=?
-)`, alias, alias, alias, alias); err != nil {
+)`, alias, alias, alias, alias)
+		if err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx, `
+		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+			changed = true
+		}
+		result, err = db.ExecContext(ctx, `
 UPDATE autoban_bans
 SET active=0
 WHERE active=1
@@ -1987,9 +2086,16 @@ AND (
   lower(auth_id)=?
   OR lower(auth_index)=?
   OR lower(source)=?
-)`, alias, alias, alias); err != nil {
+)`, alias, alias, alias)
+		if err != nil {
 			return err
 		}
+		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+			changed = true
+		}
+	}
+	if changed {
+		globalSchedulerState.invalidateProvider("codex")
 	}
 	return nil
 }
@@ -2023,7 +2129,8 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 	if !rec.Failed || status != http.StatusTooManyRequests {
 		return nil
 	}
-	authID := firstNonEmptyString(rec.AuthID, rec.AuthIndex, rec.Source)
+	authFile, _ := authFileStateForRecord(rec)
+	authID := firstNonEmptyString(authFile, fileNameIfJSON(rec.AuthIndex), fileNameIfJSON(rec.AuthID), rec.AuthID, rec.AuthIndex, rec.Source)
 	if authID == "" {
 		return nil
 	}
@@ -2056,6 +2163,9 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider), window, reason, now, resetAt, status,
 		primaryPct, primaryReset, secondaryPct, secondaryReset,
 	)
+	if err == nil {
+		globalSchedulerState.invalidateProvider("codex")
+	}
 	return err
 }
 
@@ -2301,11 +2411,25 @@ WHERE active=1 AND auth_id=?`, now, strings.TrimSpace(authID))
 	if err != nil {
 		return false, err
 	}
+	if affected > 0 {
+		globalSchedulerState.invalidateProvider("codex")
+	}
 	return affected > 0, nil
 }
 
+func execCodexSchedulerStateMutation(ctx context.Context, db *sql.DB, query string, args ...any) (sql.Result, error) {
+	result, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+		globalSchedulerState.invalidateProvider("codex")
+	}
+	return result, nil
+}
+
 func (s *store) runQuotaTriggerRound(ctx context.Context, cfg pluginConfig) (int, int, int, int, error) {
-	db, _, err := s.open(ctx)
+	db, dbPath, err := s.open(ctx)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
@@ -2323,36 +2447,70 @@ func (s *store) runQuotaTriggerRound(ctx context.Context, cfg pluginConfig) (int
 	if len(candidates) == 0 {
 		return 0, 0, skipped, 0, nil
 	}
-	sem := make(chan struct{}, cfg.QuotaTriggerMaxConcurrency)
+	return runQuotaTriggerCandidates(ctx, db, dbPath, candidates, skipped, cfg, executeQuotaTrigger)
+}
+
+func runQuotaTriggerCandidates(
+	ctx context.Context,
+	db *sql.DB,
+	dbPath string,
+	candidates []triggerAuthAccount,
+	skipped int,
+	cfg pluginConfig,
+	executor func(context.Context, *sql.DB, string, triggerAuthAccount, pluginConfig) quotaTriggerRun,
+) (int, int, int, int, error) {
+	workerCount := cfg.QuotaTriggerMaxConcurrency
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > len(candidates) {
+		workerCount = len(candidates)
+	}
+	jobs := make(chan triggerAuthAccount)
 	results := make(chan quotaTriggerRun, len(candidates))
 	var wg sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for account := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				results <- executor(ctx, db, dbPath, account, cfg)
+			}
+		}()
+	}
+enqueue:
 	for _, account := range candidates {
 		select {
+		case jobs <- account:
 		case <-ctx.Done():
-			return 0, 0, skipped, len(candidates), ctx.Err()
-		default:
+			break enqueue
 		}
-		wg.Add(1)
-		go func(account triggerAuthAccount) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				results <- quotaTriggerRunFromAccount(account, cfg.QuotaTriggerMode, "failed", 0, ctx.Err().Error())
-				return
-			}
-			results <- executeQuotaTrigger(ctx, db, account, cfg)
-		}(account)
 	}
+	close(jobs)
 	wg.Wait()
 	close(results)
 
 	success := 0
 	failed := 0
+	attempted := 0
+	var roundErr error
+	writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), quotaTriggerStateWriteTimeout)
+	defer cancelWrite()
 	for run := range results {
-		if err := recordQuotaTriggerRun(ctx, db, run); err != nil {
+		attempted++
+		storedRun, err := privacySafeQuotaTriggerRun(dbPath, run)
+		if err != nil {
 			failed++
+			roundErr = errors.Join(roundErr, fmt.Errorf("sanitize quota trigger run: %w", err))
+			continue
+		}
+		run = storedRun
+		if err := recordQuotaTriggerRun(writeCtx, db, dbPath, run); err != nil {
+			failed++
+			roundErr = errors.Join(roundErr, fmt.Errorf("record quota trigger run: %w", err))
 			continue
 		}
 		if run.HTTPStatus == http.StatusForbidden {
@@ -2366,7 +2524,9 @@ func (s *store) runQuotaTriggerRound(ctx context.Context, cfg pluginConfig) (int
 				Failed:    true,
 				Failure:   usageFailure{StatusCode: run.HTTPStatus},
 			}
-			_ = recordRepeatedForbiddenIfNeeded(ctx, db, rec, run.HTTPStatus)
+			if err := recordRepeatedForbiddenIfNeeded(writeCtx, db, rec, run.HTTPStatus); err != nil {
+				roundErr = errors.Join(roundErr, fmt.Errorf("record quota forbidden state: %w", err))
+			}
 		}
 		if run.Status == "success" {
 			success++
@@ -2376,8 +2536,13 @@ func (s *store) runQuotaTriggerRound(ctx context.Context, cfg pluginConfig) (int
 			failed++
 		}
 	}
-	_ = reconcileAutobansWithQuotaSnapshots(ctx, db, time.Now().Unix())
-	return success, failed, skipped, len(candidates), nil
+	if err := reconcileAutobansWithQuotaSnapshots(writeCtx, db, time.Now().Unix()); err != nil {
+		roundErr = errors.Join(roundErr, fmt.Errorf("reconcile quota auth state: %w", err))
+	}
+	if err := ctx.Err(); err != nil && roundErr == nil {
+		roundErr = err
+	}
+	return success, failed, skipped, attempted, roundErr
 }
 
 func selectQuotaTriggerCandidates(ctx context.Context, db *sql.DB, cfg pluginConfig) ([]triggerAuthAccount, int, error) {
@@ -2431,16 +2596,30 @@ func selectQuotaTriggerCandidates(ctx context.Context, db *sql.DB, cfg pluginCon
 	return out, skipped, nil
 }
 
-func executeQuotaTrigger(ctx context.Context, db *sql.DB, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
+func executeQuotaTrigger(ctx context.Context, db *sql.DB, dbPath string, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
 	if cfg.QuotaTriggerMode == "quota" {
-		run := executeQuotaProbeRequest(ctx, db, account, cfg)
-		run.Mode = "quota"
-		return run
+		return executeQuotaUsageRequest(ctx, db, dbPath, account, cfg)
 	}
-	return executeQuotaProbeRequest(ctx, db, account, cfg)
+	return executeQuotaProbeRequest(ctx, db, dbPath, account, cfg)
 }
 
-func executeQuotaProbeRequest(ctx context.Context, db *sql.DB, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
+func newQuotaTriggerStateContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, quotaTriggerStateWriteTimeout)
+}
+
+func applyQuotaTriggerStateWriteError(run *quotaTriggerRun, err error) {
+	if err == nil {
+		return
+	}
+	run.Status = "failed"
+	message := "quota auth state write failed: " + sanitizeTriggerError(err)
+	if run.Error != "" {
+		message = run.Error + "; " + message
+	}
+	run.Error = sanitizeTriggerError(message)
+}
+
+func executeQuotaProbeRequest(ctx context.Context, db *sql.DB, dbPath string, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
 	run := quotaTriggerRunFromAccount(account, cfg.QuotaTriggerMode, "failed", 0, "")
 	started := time.Now()
 	run.StartedAt = started.Unix()
@@ -2514,30 +2693,41 @@ func executeQuotaProbeRequest(ctx context.Context, db *sql.DB, account triggerAu
 		RequestedAt:     time.Unix(run.StartedAt, 0),
 		ResponseHeaders: responseHeaders,
 	}
+	storedRec, privacyErr := privacySafeUsageRecord(dbPath, rec)
+	if privacyErr != nil {
+		run.Status = "failed"
+		run.Error = sanitizeTriggerError(privacyErr)
+		return run
+	}
+	rec = storedRec
+	stateCtx, stateCancel := newQuotaTriggerStateContext(ctx)
+	defer stateCancel()
+	var stateErr error
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		run.Status = "success"
-		_ = clearRecoveredAuthStateIfNeeded(context.Background(), db, rec, resp.StatusCode)
+		stateErr = clearRecoveredAuthStateIfNeeded(stateCtx, db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusUnauthorized:
 		run.Status = "failed"
 		run.Error = "401 unauthorized: credential is invalid"
-		_ = recordInvalidAuthIfNeeded(context.Background(), db, rec, resp.StatusCode)
+		stateErr = recordInvalidAuthIfNeeded(stateCtx, db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusPaymentRequired && codexWorkspaceDeactivatedBody(string(respBody)):
 		run.Status = "failed"
 		run.Error = "402 deactivated_workspace: team workspace is deactivated"
 		rec.Failed = true
 		rec.Failure = usageFailure{StatusCode: resp.StatusCode, Body: string(respBody)}
-		_ = recordInvalidAuthIfNeeded(context.Background(), db, rec, resp.StatusCode)
+		stateErr = recordInvalidAuthIfNeeded(stateCtx, db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusTooManyRequests:
 		run.Status = "failed"
 		run.Error = "429 rate limited"
 		rec.Failed = true
 		rec.Failure = usageFailure{StatusCode: resp.StatusCode}
-		_ = recordAutobanIfNeeded(context.Background(), db, rec, resp.StatusCode, run.PrimaryUsedPercent, run.PrimaryResetAt, run.SecondaryUsedPercent, run.SecondaryResetAt)
+		stateErr = recordAutobanIfNeeded(stateCtx, db, rec, resp.StatusCode, run.PrimaryUsedPercent, run.PrimaryResetAt, run.SecondaryUsedPercent, run.SecondaryResetAt)
 	default:
 		run.Status = "failed"
 		run.Error = "http " + strconv.Itoa(resp.StatusCode)
 	}
+	applyQuotaTriggerStateWriteError(&run, stateErr)
 	return run
 }
 
@@ -2620,7 +2810,7 @@ func doQuotaTriggerHTTPRequest(ctx context.Context, method, targetURL string, he
 	}, respBody, nil
 }
 
-func executeQuotaUsageRequest(ctx context.Context, db *sql.DB, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
+func executeQuotaUsageRequest(ctx context.Context, db *sql.DB, dbPath string, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
 	run := quotaTriggerRunFromAccount(account, cfg.QuotaTriggerMode, "failed", 0, "")
 	started := time.Now()
 	run.StartedAt = started.Unix()
@@ -2678,34 +2868,45 @@ func executeQuotaUsageRequest(ctx context.Context, db *sql.DB, account triggerAu
 		RequestedAt:     time.Unix(run.StartedAt, 0),
 		ResponseHeaders: headers,
 	}
+	storedRec, privacyErr := privacySafeUsageRecord(dbPath, rec)
+	if privacyErr != nil {
+		run.Status = "failed"
+		run.Error = sanitizeTriggerError(privacyErr)
+		return run
+	}
+	rec = storedRec
+	stateCtx, stateCancel := newQuotaTriggerStateContext(ctx)
+	defer stateCancel()
+	var stateErr error
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		run.Status = "success"
-		_ = clearRecoveredAuthStateIfNeeded(context.Background(), db, rec, resp.StatusCode)
+		stateErr = clearRecoveredAuthStateIfNeeded(stateCtx, db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusUnauthorized:
 		run.Status = "failed"
 		run.Error = "401 unauthorized: credential is invalid"
-		_ = recordInvalidAuthIfNeeded(context.Background(), db, rec, resp.StatusCode)
+		stateErr = recordInvalidAuthIfNeeded(stateCtx, db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusPaymentRequired && codexWorkspaceDeactivatedBody(string(body)):
 		run.Status = "failed"
 		run.Error = "402 deactivated_workspace: team workspace is deactivated"
 		rec.Failed = true
 		rec.Failure = usageFailure{StatusCode: resp.StatusCode, Body: string(body)}
-		_ = recordInvalidAuthIfNeeded(context.Background(), db, rec, resp.StatusCode)
+		stateErr = recordInvalidAuthIfNeeded(stateCtx, db, rec, resp.StatusCode)
 	case resp.StatusCode == http.StatusTooManyRequests:
 		run.Status = "failed"
 		run.Error = "429 rate limited"
 		rec.Failed = true
 		rec.Failure = usageFailure{StatusCode: resp.StatusCode}
-		_ = recordAutobanIfNeeded(context.Background(), db, rec, resp.StatusCode, run.PrimaryUsedPercent, run.PrimaryResetAt, run.SecondaryUsedPercent, run.SecondaryResetAt)
+		stateErr = recordAutobanIfNeeded(stateCtx, db, rec, resp.StatusCode, run.PrimaryUsedPercent, run.PrimaryResetAt, run.SecondaryUsedPercent, run.SecondaryResetAt)
 	default:
 		run.Status = "failed"
 		run.Error = "http " + strconv.Itoa(resp.StatusCode)
 	}
+	applyQuotaTriggerStateWriteError(&run, stateErr)
 	return run
 }
 
-func recordQuotaTriggerRun(ctx context.Context, db *sql.DB, run quotaTriggerRun) error {
+func recordQuotaTriggerRun(ctx context.Context, db *sql.DB, dbPath string, run quotaTriggerRun) error {
 	if run.StartedAt <= 0 {
 		run.StartedAt = time.Now().Unix()
 	}
@@ -2714,7 +2915,12 @@ func recordQuotaTriggerRun(ctx context.Context, db *sql.DB, run quotaTriggerRun)
 	}
 	normalizeInt64Ptr(run.PrimaryResetAt)
 	normalizeInt64Ptr(run.SecondaryResetAt)
-	_, err := db.ExecContext(ctx, `
+	storedRun, err := privacySafeQuotaTriggerRun(dbPath, run)
+	if err != nil {
+		return err
+	}
+	run = storedRun
+	_, err = db.ExecContext(ctx, `
 INSERT INTO quota_trigger_runs (
   auth_id, auth_index, source, provider, auth_file, mode, status, http_status, error,
   started_at, finished_at, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
@@ -3055,15 +3261,33 @@ func classifyCodexBan(headers map[string][]string, primaryPct *float64, primaryR
 
 func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
 	return withSQLiteAutoRepair(ctx, s, "pick auth", func() (schedulerPickResponse, error) {
-		return s.pickAuthOnce(ctx, req)
+		return retrySchedulerStateChange(ctx, func() (schedulerPickResponse, error) {
+			return s.pickAuthOnce(ctx, req)
+		})
 	})
 }
 
+func retrySchedulerStateChange(ctx context.Context, pick func() (schedulerPickResponse, error)) (schedulerPickResponse, error) {
+	response, err := pick()
+	if !errors.Is(err, errSchedulerStateChanged) || ctx.Err() != nil {
+		return response, err
+	}
+	// One bounded retry observes the mutation's new generation/snapshot. It
+	// avoids a user-visible transient error while retaining fail-closed behavior
+	// if state keeps changing or the refreshed database read fails.
+	return pick()
+}
+
 func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
-	if isXAISchedulerRequest(req) {
-		if s == globalStore && !globalSchedulerState.needsDatabase("xai", false) {
-			return schedulerPickResponse{Handled: false}, nil
+	if len(req.Candidates) > 0 {
+		if provider, reason, quarantined := s.schedulerRequestPrivacyQuarantine(req); quarantined {
+			return schedulerPickResponse{}, &schedulerRejectError{Code: "privacy_quarantine", Message: provider + ": " + reason + "; restore the configured API key or release the legacy restriction, then restart", HTTPStatus: http.StatusServiceUnavailable}
 		}
+	}
+	if isMixedSchedulerRequest(req) {
+		return s.pickMixedAuthOnce(ctx, req)
+	}
+	if isXAISchedulerRequest(req) {
 		return s.pickXAIAuthOnce(ctx, req)
 	}
 	if !isCodexSchedulerRequest(req) {
@@ -3073,33 +3297,53 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	protectionCfg := globalAccountProtection.config()
-	if s == globalStore && !globalSchedulerState.needsDatabase("codex", protectionCfg.AccountProtectionEnabled) {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	db, _, err := s.open(ctx)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	var codexGeneration uint64
-	if s == globalStore {
-		codexGeneration = globalSchedulerState.providerGeneration("codex")
-	}
 	now := time.Now().Unix()
-	bans, err := queryActiveAutobans(ctx, db, now)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	invalids, err := queryActiveInvalidAuths(ctx, db)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if len(bans) == 0 && len(invalids) == 0 && !protectionCfg.AccountProtectionEnabled {
-		if s == globalStore {
-			globalSchedulerState.clearRestrictedIfGeneration("codex", codexGeneration)
+	var restrictionSnapshot *codexSchedulerSnapshot
+	var snapshotReady bool
+	if s == globalStore {
+		var snapshotStale bool
+		restrictionSnapshot, snapshotStale, snapshotReady = globalSchedulerState.codexForPick(now)
+		if snapshotStale || !snapshotReady {
+			globalSchedulerStateRefresher.requestRefresh()
 		}
+	}
+	if snapshotReady && restrictionSnapshot.empty() && !protectionCfg.AccountProtectionEnabled {
 		return schedulerPickResponse{Handled: false}, nil
 	}
-	effectiveBans := mergeEffectiveAutobans(bans, invalids)
+	var db *sql.DB
+	if !snapshotReady || protectionCfg.AccountProtectionEnabled {
+		var err error
+		db, _, err = s.open(ctx)
+		if err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+	}
+	if !snapshotReady {
+		var codexGeneration uint64
+		if s == globalStore {
+			codexGeneration = globalSchedulerState.providerGeneration("codex")
+		}
+		bans, err := queryActiveAutobans(ctx, db, now)
+		if err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		invalids, err := queryActiveInvalidAuths(ctx, db)
+		if err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		restrictionSnapshot = newCodexSchedulerSnapshot(bans, invalids, now)
+		if s == globalStore {
+			var published bool
+			restrictionSnapshot, published = globalSchedulerState.publishCodexOrCurrent(codexGeneration, restrictionSnapshot, now)
+			if !published {
+				return schedulerPickResponse{Handled: false}, errSchedulerStateChanged
+			}
+		}
+	}
+	if restrictionSnapshot.empty() && !protectionCfg.AccountProtectionEnabled {
+		return schedulerPickResponse{Handled: false}, nil
+	}
+	effectiveBans := restrictionSnapshot.restrictions
 	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
 	filtered := false
 	banFilteredCandidates := 0
@@ -3109,7 +3353,7 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 			available = append(available, candidate)
 			continue
 		}
-		if matched, indexes := candidateMatchesActiveBanIndexes(candidate, effectiveBans); matched {
+		if matched, indexes := restrictionSnapshot.matchIndexes(candidate); matched {
 			filtered = true
 			banFilteredCandidates++
 			for _, index := range indexes {
@@ -3143,23 +3387,43 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 	if len(req.Candidates) == 0 {
 		return schedulerPickResponse{Handled: false}, nil
 	}
-	db, _, err := s.open(ctx)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	var xaiGeneration uint64
-	if s == globalStore {
-		xaiGeneration = globalSchedulerState.providerGeneration("xai")
-	}
 	now := time.Now().Unix()
-	states, err := queryActiveXAIStates(ctx, db, now)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if len(states) == 0 {
-		if s == globalStore {
-			globalSchedulerState.clearRestrictedIfGeneration("xai", xaiGeneration)
+	var stateSnapshot *xaiSchedulerSnapshot
+	var snapshotReady bool
+	if s == globalStore {
+		var snapshotStale bool
+		stateSnapshot, snapshotStale, snapshotReady = globalSchedulerState.xaiForPick(now)
+		if snapshotStale || !snapshotReady {
+			globalSchedulerStateRefresher.requestRefresh()
 		}
+	}
+	if snapshotReady && (stateSnapshot == nil || len(stateSnapshot.states) == 0) {
+		return schedulerPickResponse{Handled: false}, nil
+	}
+	if !snapshotReady {
+		db, _, err := s.open(ctx)
+		if err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		var xaiGeneration uint64
+		if s == globalStore {
+			xaiGeneration = globalSchedulerState.providerGeneration("xai")
+		}
+		states, err := queryActiveXAIStates(ctx, db, now)
+		if err != nil {
+			return schedulerPickResponse{Handled: false}, err
+		}
+		stateSnapshot = newXAISchedulerSnapshot(states, now)
+		if s == globalStore {
+			var published bool
+			stateSnapshot, published = globalSchedulerState.publishXAIOrCurrent(xaiGeneration, stateSnapshot, now)
+			if !published {
+				return schedulerPickResponse{Handled: false}, errSchedulerStateChanged
+			}
+		}
+	}
+	states := stateSnapshot.states
+	if len(states) == 0 {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
@@ -3169,7 +3433,7 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 			available = append(available, candidate)
 			continue
 		}
-		if candidateMatchesXAIState(candidate, states) {
+		if stateSnapshot.matches(candidate) {
 			filtered = true
 			continue
 		}
@@ -3225,8 +3489,14 @@ func isCodexSchedulerRequest(req schedulerPickRequest) bool {
 }
 
 func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
-	_, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND reset_at <= ?`, now)
-	return err
+	result, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND reset_at <= ?`, now)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+		globalSchedulerState.invalidateProvider("codex")
+	}
+	return nil
 }
 
 func reconcileAutobansWithQuotaSnapshots(ctx context.Context, db *sql.DB, now int64) error {
@@ -3262,7 +3532,7 @@ func reconcileAutobansWithQuotaSnapshots(ctx context.Context, db *sql.DB, now in
 		if !shouldRelease {
 			continue
 		}
-		_, err := db.ExecContext(ctx, `
+		_, err := execCodexSchedulerStateMutation(ctx, db, `
 UPDATE autoban_bans
 SET active=0,
   primary_used_percent=?,
@@ -3284,7 +3554,12 @@ WITH latest AS (
     auth_id, auth_index, source, provider, requested_at, status_code, failed,
     primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
     ROW_NUMBER() OVER (
-      PARTITION BY lower(COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,'')))
+      PARTITION BY lower(CASE
+        WHEN lower(auth_index) LIKE '%.json' THEN auth_index
+        WHEN lower(auth_id) LIKE '%.json' THEN auth_id
+        WHEN lower(source) LIKE '%.json' THEN source
+        ELSE COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,''))
+      END)
       ORDER BY requested_at DESC, id DESC
     ) AS rn
   FROM usage_events
@@ -3316,7 +3591,7 @@ LIMIT 1000`, now, now)
 		if err := rows.Scan(&authID, &authIndex, &source, &provider, &requestedAt, &status, &pp, &pr, &sp, &sr); err != nil {
 			return err
 		}
-		key := firstNonEmptyString(authID, authIndex, source)
+		key := firstNonEmptyString(fileNameIfJSON(authIndex), fileNameIfJSON(authID), fileNameIfJSON(source), authID, authIndex, source)
 		if key == "" {
 			continue
 		}
@@ -3378,7 +3653,12 @@ WITH latest AS (
   SELECT
     auth_id, auth_index, source, provider, requested_at, status_code, failed,
     ROW_NUMBER() OVER (
-      PARTITION BY lower(COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,'')))
+      PARTITION BY lower(CASE
+        WHEN lower(auth_index) LIKE '%.json' THEN auth_index
+        WHEN lower(auth_id) LIKE '%.json' THEN auth_id
+        WHEN lower(source) LIKE '%.json' THEN source
+        ELSE COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,''))
+      END)
       ORDER BY requested_at DESC, id DESC
     ) AS rn
   FROM usage_events
@@ -3588,7 +3868,7 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 		if !hasLaterSuccessfulUsage(ctx, db, rec, invalid.InvalidatedAt) {
 			continue
 		}
-		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
 			return err
 		}
 	}
@@ -3607,7 +3887,7 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 		if !hasLaterSuccessfulUsage(ctx, db, rec, ban.BannedAt) {
 			continue
 		}
-		if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
+		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
 			return err
 		}
 	}
@@ -3648,7 +3928,7 @@ func clearReplacedInvalidAuths(ctx context.Context, db *sql.DB) error {
 		if cfg.AuthFileMTime <= 0 {
 			continue
 		}
-		_, err := db.ExecContext(ctx, `
+		_, err := execCodexSchedulerStateMutation(ctx, db, `
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
@@ -3662,16 +3942,17 @@ AND ? > invalidated_at`, cfg.AuthFile, cfg.AuthFileMTime)
 			if alias == "" {
 				continue
 			}
-			_, err := db.ExecContext(ctx, `
+			_, err := execCodexSchedulerStateMutation(ctx, db, `
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
 AND ? > invalidated_at
+AND (auth_file='' OR lower(auth_file)=lower(?))
 AND (
   lower(auth_id)=?
   OR lower(auth_index)=?
   OR lower(source)=?
-)`, cfg.AuthFileMTime, alias, alias, alias)
+)`, cfg.AuthFileMTime, cfg.AuthFile, alias, alias, alias)
 			if err != nil {
 				return err
 			}
@@ -3749,7 +4030,7 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 			if aliasesContainAny(configuredStrictAliases, cleanupAliases...) {
 				continue
 			}
-			if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+			if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
 				return err
 			}
 			continue
@@ -3765,7 +4046,7 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 		} else if aliasesContainAny(configuredAliases, invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
 			continue
 		}
-		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
 			return err
 		}
 	}
@@ -3783,7 +4064,7 @@ func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map
 			if aliasesContainAny(configuredStrictAliases, cleanupAliases...) {
 				continue
 			}
-			if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
+			if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
 				return err
 			}
 			continue
@@ -3799,7 +4080,7 @@ func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map
 		} else if aliasesContainAny(configuredAliases, ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
 			continue
 		}
-		if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
+		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
 			return err
 		}
 	}
@@ -3822,30 +4103,16 @@ func fileBackedCleanupAliases(authID, authIndex, source, authFile string) []stri
 			values = append(values, file)
 		}
 	}
-	if fileNameIfJSON(authFile) != "" && strings.TrimSpace(authIndex) != "" {
-		values = append(values, authIndex)
-	}
 	return normalizeAccountAliases(values...)
 }
 
 func strictAuthStateAliasesForValues(authID, authIndex, source, authFile string) []string {
-	authFile = fileNameIfJSON(authFile)
-	authIDFile := fileNameIfJSON(authID)
-	sourceFile := fileNameIfJSON(source)
-	if authIDFile == "" && sourceFile == "" && (authFile == "" || normalizeAccountAlias(authID) != normalizeAccountAlias(authFile)) {
-		return nil
-	}
 	var values []string
-	if authFile != "" {
-		values = append(values, authFile)
-	}
-	for _, file := range []string{authIDFile, sourceFile} {
+	for _, value := range []string{authFile, authID, authIndex, source} {
+		file := fileNameIfJSON(value)
 		if file != "" {
 			values = append(values, file)
 		}
-	}
-	if authFile != "" && strings.TrimSpace(authIndex) != "" {
-		values = append(values, authIndex)
 	}
 	return normalizeAccountAliases(values...)
 }
@@ -4010,19 +4277,71 @@ func candidateMatchesInvalidAuth(candidate schedulerAuthCandidate, invalids []in
 }
 
 func schedulerCandidateAliases(candidate schedulerAuthCandidate) []string {
-	return accountIdentityAliases(accountIdentity{
-		AuthID:    candidate.ID,
-		AuthIndex: firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"])),
-		Source:    firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"])),
-		AuthFile:  firstNonEmptyString(candidate.Attributes["auth_file"], stringFromAny(candidate.Metadata["auth_file"])),
-		Email:     firstNonEmptyString(candidate.Attributes["email"], stringFromAny(candidate.Metadata["email"])),
-		Path: firstNonEmptyString(
+	identityValues := [...]string{
+		candidate.ID,
+		firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"])),
+		firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"])),
+		firstNonEmptyString(candidate.Attributes["auth_file"], stringFromAny(candidate.Metadata["auth_file"])),
+		firstNonEmptyString(candidate.Attributes["email"], stringFromAny(candidate.Metadata["email"])),
+		firstNonEmptyString(
 			candidate.Attributes["path"],
 			candidate.Attributes["file"],
 			stringFromAny(candidate.Metadata["path"]),
 			stringFromAny(candidate.Metadata["file"]),
 		),
-	})
+	}
+	aliases := make([]string, 0, len(identityValues)+4)
+	add := func(value string) {
+		alias := normalizeAccountAlias(value)
+		if alias == "" {
+			return
+		}
+		for _, existing := range aliases {
+			if existing == alias {
+				return
+			}
+		}
+		aliases = append(aliases, alias)
+	}
+	for _, value := range identityValues {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		add(value)
+		base := filepath.Base(value)
+		if base != value {
+			add(base)
+		}
+		for _, candidateValue := range [...]string{value, base} {
+			lower := strings.ToLower(candidateValue)
+			switch {
+			case strings.HasSuffix(lower, ".cpa.json"):
+				add(candidateValue[:len(candidateValue)-len(".cpa.json")])
+				add(candidateValue[:len(candidateValue)-len(".json")])
+			case strings.HasSuffix(lower, ".json"):
+				add(candidateValue[:len(candidateValue)-len(".json")])
+			}
+		}
+	}
+	credentialValues := [...]string{
+		candidate.ID,
+		candidate.Attributes["auth_index"],
+		candidate.Attributes["source"],
+		candidate.Attributes["api_key"],
+		stringFromAny(candidate.Metadata["auth_index"]),
+		stringFromAny(candidate.Metadata["source"]),
+		stringFromAny(candidate.Metadata["api_key"]),
+	}
+	for _, value := range credentialValues {
+		if fingerprint := storedCredentialAlias(value); fingerprint != "" {
+			add(fingerprint)
+		}
+	}
+	if explicit := normalizeRawAPIKey(schedulerCandidateExplicitAPIKey(candidate)); explicit != "" {
+		add(configuredAPIKeyStorageValue(explicit))
+	}
+	return aliases
 }
 
 func schedulerCandidateStrictAliases(candidate schedulerAuthCandidate) []string {
@@ -4038,7 +4357,10 @@ func schedulerCandidateStrictAliases(candidate schedulerAuthCandidate) []string 
 		stringFromAny(candidate.Metadata["file"]),
 	)
 	if file := fileNameIfJSON(authFile); file != "" {
-		return normalizeAccountAliases(file, authIndex)
+		return normalizeAccountAliases(file)
+	}
+	if file := fileNameIfJSON(authIndex); file != "" {
+		return normalizeAccountAliases(file)
 	}
 	return strictAuthStateAliasesForValues(authID, authIndex, source, authFile)
 }

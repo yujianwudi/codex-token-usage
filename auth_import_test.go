@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+func TestAuthImportRejectsOversizedEnvelopeBeforeJSONDecode(t *testing.T) {
+	raw := make([]byte, maxAuthImportRequestBytes+1)
+	_, response := decodeAuthImportRequest(raw)
+	if response == nil || response.StatusCode != 413 {
+		t.Fatalf("response = %#v, want HTTP 413", response)
+	}
+}
+
 func importTestJWT(payload map[string]any) string {
 	header, _ := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
 	body, _ := json.Marshal(payload)
@@ -33,8 +41,8 @@ func TestParseAuthImportCardContent(t *testing.T) {
 			"access_token":       token,
 			"chatgpt_account_id": "account-k12",
 			"chatgpt_user_id":    "user-k12",
-			"email":               "student@example.com",
-			"plan_type":           "k12",
+			"email":              "student@example.com",
+			"plan_type":          "k12",
 		},
 		"extra": map[string]any{"no_rt": true},
 	}

@@ -9,16 +9,35 @@ import (
 )
 
 type accountProtectionManager struct {
-	mu     sync.RWMutex
-	pickMu contextMutex
-	cfg    pluginConfig
+	planLifecycleMu sync.Mutex
+	mu              sync.RWMutex
+	pickMu          contextMutex
+	cfg             pluginConfig
+	plans           map[string]string
+
+	plansLoadedAt       time.Time
+	plansRefreshing     bool
+	plansGeneration     uint64
+	plansRefreshStarted uint64
+	plansCtx            context.Context
+	plansCancel         context.CancelFunc
+	plansWG             sync.WaitGroup
+	plansLoader         func(context.Context) map[string]string
+
+	reservationCleanupDB *sql.DB
+	reservationCleanupAt int64
 
 	usageMu       contextMutex
 	usageDB       *sql.DB
 	usageSince    int64
 	usageLoadedAt time.Time
-	usage         []protectionUsageSample
+	usage         *protectionUsageIndex
 }
+
+const (
+	accountProtectionPlanRefreshInterval        = 30 * time.Second
+	accountProtectionReservationCleanupInterval = 30 * time.Second
+)
 
 // contextMutex is a zero-value-ready binary semaphore. Unlike sync.Mutex, a
 // scheduler request waiting behind another protection transaction can stop as
@@ -67,9 +86,52 @@ type protectionCandidate struct {
 }
 
 func (m *accountProtectionManager) configure(cfg pluginConfig) {
+	m.planLifecycleMu.Lock()
+	defer m.planLifecycleMu.Unlock()
+	m.stopPlanRefreshLocked()
+
+	// Auth-file discovery is intentionally a lifecycle/configuration cost. The
+	// scheduler hot path only reads this immutable alias-to-plan snapshot.
+	var plans map[string]string
+	if cfg.AccountProtectionEnabled {
+		plans = configuredProtectionPlanIndex(readConfiguredAuthAccounts())
+	}
+	var plansCtx context.Context
+	var plansCancel context.CancelFunc
+	if cfg.AccountProtectionEnabled {
+		plansCtx, plansCancel = context.WithCancel(context.Background())
+	}
 	m.mu.Lock()
 	m.cfg = cfg
+	m.plans = plans
+	m.plansLoadedAt = time.Now()
+	m.plansRefreshing = false
+	m.plansGeneration++
+	m.plansCtx = plansCtx
+	m.plansCancel = plansCancel
 	m.mu.Unlock()
+}
+
+func (m *accountProtectionManager) stop() {
+	m.planLifecycleMu.Lock()
+	defer m.planLifecycleMu.Unlock()
+	m.stopPlanRefreshLocked()
+}
+
+func (m *accountProtectionManager) stopPlanRefreshLocked() {
+	m.mu.Lock()
+	cancel := m.plansCancel
+	m.plansCancel = nil
+	m.plansCtx = nil
+	m.plansRefreshing = false
+	// Invalidate any refresh that began before cancellation so it cannot publish
+	// a filesystem snapshot after reconfiguration or plugin shutdown.
+	m.plansGeneration++
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	m.plansWG.Wait()
 }
 
 func (m *accountProtectionManager) config() pluginConfig {
@@ -80,6 +142,57 @@ func (m *accountProtectionManager) config() pluginConfig {
 
 func (m *accountProtectionManager) enabled() bool {
 	return m.config().AccountProtectionEnabled
+}
+
+func (m *accountProtectionManager) configuredPlans() map[string]string {
+	m.mu.Lock()
+	plans := m.plans
+	ctx := m.plansCtx
+	if m.cfg.AccountProtectionEnabled && ctx != nil && ctx.Err() == nil && !m.plansRefreshing && time.Since(m.plansLoadedAt) >= accountProtectionPlanRefreshInterval {
+		m.plansRefreshing = true
+		m.plansRefreshStarted = m.plansGeneration
+		generation := m.plansGeneration
+		m.plansWG.Add(1)
+		go m.refreshConfiguredPlans(ctx, generation)
+	}
+	m.mu.Unlock()
+	return plans
+}
+
+func (m *accountProtectionManager) loadConfiguredPlans(ctx context.Context) map[string]string {
+	m.mu.RLock()
+	loader := m.plansLoader
+	m.mu.RUnlock()
+	if loader != nil {
+		return loader(ctx)
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	plans := configuredProtectionPlanIndex(readConfiguredAuthAccounts())
+	if ctx.Err() != nil {
+		return nil
+	}
+	return plans
+}
+
+func (m *accountProtectionManager) refreshConfiguredPlans(ctx context.Context, generation uint64) {
+	defer m.plansWG.Done()
+	if ctx.Err() != nil {
+		return
+	}
+	plans := m.loadConfiguredPlans(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ctx.Err() != nil || m.plansCtx != ctx || m.plansGeneration != generation || m.plansRefreshStarted != generation {
+		return
+	}
+	m.plans = plans
+	m.plansLoadedAt = time.Now()
+	m.plansRefreshing = false
 }
 
 func normalizedProtectionPlan(value string) string {
@@ -213,14 +326,12 @@ func protectionCandidateFor(candidate schedulerAuthCandidate, cfg pluginConfig, 
 }
 
 func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []schedulerAuthCandidate, cfg pluginConfig, rotationKey string) (schedulerAuthCandidate, error) {
-	// File discovery and alias construction do not participate in reservation
-	// consistency. Keep them outside the serialized transaction.
-	configuredPlans := configuredProtectionPlanIndex(readConfiguredAuthAccounts())
+	configuredPlans := globalAccountProtection.configuredPlans()
 	aliasSets := protectionCandidateAliasSets(candidates)
 	now := time.Now().Unix()
 	// Token accounting is a soft-demotion signal and does not need to be in the
 	// reservation critical section. This is the expensive scan on busy stores.
-	usage, err := globalAccountProtection.loadUsageSnapshot(ctx, db, now-int64(cfg.AccountProtectionTokenWindowSeconds))
+	usage, err := globalAccountProtection.loadUsageIndex(ctx, db, now-int64(cfg.AccountProtectionTokenWindowSeconds))
 	if err != nil {
 		return schedulerAuthCandidate{}, err
 	}
@@ -233,14 +344,17 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		return schedulerAuthCandidate{}, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE expires_at <= ?`, now); err != nil {
-		return schedulerAuthCandidate{}, err
+	cleanupExpired := globalAccountProtection.reservationCleanupDB != db || now-globalAccountProtection.reservationCleanupAt >= int64(accountProtectionReservationCleanupInterval/time.Second)
+	if cleanupExpired {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE expires_at <= ?`, now); err != nil {
+			return schedulerAuthCandidate{}, err
+		}
 	}
 	reservations, err := loadProtectionReservationSnapshot(ctx, tx, now)
 	if err != nil {
 		return schedulerAuthCandidate{}, err
 	}
-	snapshot := newProtectionSnapshot(reservations, usage)
+	snapshot := newProtectionSnapshotWithUsageIndex(reservations, usage)
 	states := make([]protectionCandidate, 0, len(candidates))
 	for i, candidate := range candidates {
 		state := protectionCandidateFor(candidate, cfg, configuredPlans, aliasSets[i])
@@ -248,13 +362,23 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		states = append(states, state)
 	}
 	chosen := chooseProtectedCandidate(states, rotationKey)
+	storedAuthID, storedAuthIndex, storedSource, err := privacySafeSchedulerIdentity(
+		s.privacyDatabasePath(), chosen.Candidate, chosen.AuthID, chosen.AuthIndex, chosen.Source,
+	)
+	if err != nil {
+		return schedulerAuthCandidate{}, err
+	}
 	if _, err = tx.ExecContext(ctx, `
 INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at)
-VALUES (?, ?, ?, ?, ?, ?)`, chosen.AuthID, chosen.AuthIndex, chosen.Source, chosen.PlanType, now, now+int64(cfg.AccountProtectionReservationTTLSeconds)); err != nil {
+VALUES (?, ?, ?, ?, ?, ?)`, storedAuthID, storedAuthIndex, storedSource, chosen.PlanType, now, now+int64(cfg.AccountProtectionReservationTTLSeconds)); err != nil {
 		return schedulerAuthCandidate{}, err
 	}
 	if err = tx.Commit(); err != nil {
 		return schedulerAuthCandidate{}, err
+	}
+	if cleanupExpired {
+		globalAccountProtection.reservationCleanupDB = db
+		globalAccountProtection.reservationCleanupAt = now
 	}
 	return chosen.Candidate, nil
 }
@@ -321,6 +445,17 @@ func protectionCandidateAliasSets(candidates []schedulerAuthCandidate) [][]strin
 	}
 	out := make([][]string, len(candidates))
 	for i := range candidates {
+		needsFilter := false
+		for _, alias := range raw[i] {
+			if counts[alias] > 1 {
+				needsFilter = true
+				break
+			}
+		}
+		if !needsFilter {
+			out[i] = raw[i]
+			continue
+		}
 		authFile := firstNonEmptyString(
 			candidates[i].Attributes["auth_file"],
 			stringFromAny(candidates[i].Metadata["auth_file"]),
@@ -330,10 +465,19 @@ func protectionCandidateAliasSets(candidates []schedulerAuthCandidate) [][]strin
 		aliases := strictFileIdentityAliases(fileNameIfJSON(authFile))
 		for _, alias := range raw[i] {
 			if counts[alias] == 1 {
-				aliases = append(aliases, alias)
+				seen := false
+				for _, existing := range aliases {
+					if existing == alias {
+						seen = true
+						break
+					}
+				}
+				if !seen {
+					aliases = append(aliases, alias)
+				}
 			}
 		}
-		out[i] = uniqueNonEmptyAliases(aliases)
+		out[i] = aliases
 		if len(out[i]) == 0 {
 			out[i] = raw[i]
 		}
@@ -350,7 +494,20 @@ type protectionUsageSample struct {
 	Tokens  int64
 }
 
+type protectionUsageIndex struct {
+	samples        []protectionUsageSample
+	samplesByAlias map[string][]int
+}
+
 func (m *accountProtectionManager) loadUsageSnapshot(ctx context.Context, db *sql.DB, since int64) ([]protectionUsageSample, error) {
+	index, err := m.loadUsageIndex(ctx, db, since)
+	if err != nil || index == nil {
+		return nil, err
+	}
+	return index.samples, nil
+}
+
+func (m *accountProtectionManager) loadUsageIndex(ctx context.Context, db *sql.DB, since int64) (*protectionUsageIndex, error) {
 	if err := m.usageMu.lock(ctx); err != nil {
 		return nil, err
 	}
@@ -365,8 +522,8 @@ func (m *accountProtectionManager) loadUsageSnapshot(ctx context.Context, db *sq
 	m.usageDB = db
 	m.usageSince = since
 	m.usageLoadedAt = time.Now()
-	m.usage = usage
-	return usage, nil
+	m.usage = newProtectionUsageIndex(usage)
+	return m.usage, nil
 }
 
 type protectionReservationSample struct {
@@ -397,13 +554,40 @@ func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since
 }
 
 func newProtectionSnapshot(reservations []protectionReservationSample, usage []protectionUsageSample) protectionSnapshot {
+	return newProtectionSnapshotWithUsageIndex(reservations, newProtectionUsageIndex(usage))
+}
+
+func newProtectionUsageIndex(usage []protectionUsageSample) *protectionUsageIndex {
+	index := &protectionUsageIndex{
+		samples:        usage,
+		samplesByAlias: make(map[string][]int),
+	}
+	for sampleIndex, sample := range usage {
+		seen := make(map[string]struct{}, len(sample.Aliases))
+		for _, alias := range sample.Aliases {
+			if alias = normalizeAccountAlias(alias); alias != "" {
+				if _, exists := seen[alias]; exists {
+					continue
+				}
+				seen[alias] = struct{}{}
+				index.samplesByAlias[alias] = append(index.samplesByAlias[alias], sampleIndex)
+			}
+		}
+	}
+	return index
+}
+
+func newProtectionSnapshotWithUsageIndex(reservations []protectionReservationSample, usage *protectionUsageIndex) protectionSnapshot {
+	if usage == nil {
+		usage = newProtectionUsageIndex(nil)
+	}
 	snapshot := protectionSnapshot{
 		Reservations:              reservations,
-		Usage:                     usage,
+		Usage:                     usage.samples,
 		reservationSamplesByAlias: make(map[string][]int),
-		usageSamplesByAlias:       make(map[string][]int),
+		usageSamplesByAlias:       usage.samplesByAlias,
 		reservationMarks:          make([]uint64, len(reservations)),
-		usageMarks:                make([]uint64, len(usage)),
+		usageMarks:                make([]uint64, len(usage.samples)),
 	}
 	for sampleIndex, reservation := range reservations {
 		seen := make(map[string]struct{}, len(reservation.Aliases))
@@ -414,18 +598,6 @@ func newProtectionSnapshot(reservations []protectionReservationSample, usage []p
 				}
 				seen[alias] = struct{}{}
 				snapshot.reservationSamplesByAlias[alias] = append(snapshot.reservationSamplesByAlias[alias], sampleIndex)
-			}
-		}
-	}
-	for sampleIndex, sample := range usage {
-		seen := make(map[string]struct{}, len(sample.Aliases))
-		for _, alias := range sample.Aliases {
-			if alias = normalizeAccountAlias(alias); alias != "" {
-				if _, exists := seen[alias]; exists {
-					continue
-				}
-				seen[alias] = struct{}{}
-				snapshot.usageSamplesByAlias[alias] = append(snapshot.usageSamplesByAlias[alias], sampleIndex)
 			}
 		}
 	}

@@ -172,6 +172,7 @@ ORDER BY reset_at DESC`, now)
 			return nil, err
 		}
 		r.Active = active != 0
+		r.AuthFile = firstNonEmptyString(fileNameIfJSON(r.AuthID), fileNameIfJSON(r.AuthIndex), fileNameIfJSON(r.Source))
 		r.BannedAtText = unixTime(r.BannedAt)
 		r.ResetAtText = unixTime(r.ResetAt)
 		if r.ResetAt > now {

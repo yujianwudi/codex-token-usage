@@ -4,10 +4,168 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestAccountProtectionPlansRefreshOffSchedulerHotPath(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	path := filepath.Join(authDir, "account.json")
+	if err := os.WriteFile(path, []byte(`{"provider":"codex","email":"a@example.com","plan_type":"free"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var manager accountProtectionManager
+	t.Cleanup(manager.stop)
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	manager.configure(cfg)
+	if got := manager.configuredPlans()["a@example.com"]; got != "free" {
+		t.Fatalf("initial plan = %q, want free", got)
+	}
+	if err := os.WriteFile(path, []byte(`{"provider":"codex","email":"a@example.com","plan_type":"team","name":"changed"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	manager.plansLoadedAt = time.Now().Add(-accountProtectionPlanRefreshInterval - time.Second)
+	manager.mu.Unlock()
+
+	// The expiring read returns the immutable old snapshot immediately and only
+	// schedules filesystem work in the background.
+	if got := manager.configuredPlans()["a@example.com"]; got != "free" {
+		t.Fatalf("expiring read blocked on refresh and returned %q, want old free snapshot", got)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := manager.configuredPlans()["a@example.com"]; got == "team" {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("background plan refresh did not publish the changed auth-file plan")
+}
+
+func TestAccountProtectionStopCancelsAndJoinsPlanRefresh(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
+	t.Setenv("CPA_AUTH_DIR", filepath.Join(dir, "auth"))
+	var manager accountProtectionManager
+	t.Cleanup(manager.stop)
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	manager.configure(cfg)
+
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	manager.mu.Lock()
+	manager.plans = map[string]string{"stable": "free"}
+	manager.plansLoadedAt = time.Now().Add(-accountProtectionPlanRefreshInterval - time.Second)
+	manager.plansLoader = func(ctx context.Context) map[string]string {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return map[string]string{"stale": "team"}
+	}
+	manager.mu.Unlock()
+
+	if got := manager.configuredPlans()["stable"]; got != "free" {
+		t.Fatalf("expiring read = %q, want immutable free snapshot", got)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background plan refresh did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		manager.stop()
+		close(stopped)
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("account protection stop did not cancel plan refresh")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("account protection stop did not join plan refresh")
+	}
+
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	if manager.plansCtx != nil || manager.plansCancel != nil || manager.plansRefreshing {
+		t.Fatalf("stopped manager retained plan work: ctx=%v cancel=%v refreshing=%v", manager.plansCtx, manager.plansCancel != nil, manager.plansRefreshing)
+	}
+	if _, published := manager.plans["stale"]; published {
+		t.Fatal("canceled plan refresh published after stop")
+	}
+}
+
+func TestAccountProtectionReconfigureCancelsAndJoinsPlanRefresh(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
+	t.Setenv("CPA_AUTH_DIR", filepath.Join(dir, "auth"))
+	var manager accountProtectionManager
+	t.Cleanup(manager.stop)
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	manager.configure(cfg)
+
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	manager.mu.Lock()
+	manager.plansLoadedAt = time.Now().Add(-accountProtectionPlanRefreshInterval - time.Second)
+	manager.plansLoader = func(ctx context.Context) map[string]string {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return map[string]string{"stale": "team"}
+	}
+	manager.mu.Unlock()
+	manager.configuredPlans()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background plan refresh did not start")
+	}
+
+	disabled := cfg
+	disabled.AccountProtectionEnabled = false
+	reconfigured := make(chan struct{})
+	go func() {
+		manager.configure(disabled)
+		close(reconfigured)
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("account protection reconfigure did not cancel plan refresh")
+	}
+	select {
+	case <-reconfigured:
+	case <-time.After(time.Second):
+		t.Fatal("account protection reconfigure did not join plan refresh")
+	}
+
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	if manager.cfg.AccountProtectionEnabled || manager.plansCtx != nil || manager.plansCancel != nil || manager.plansRefreshing {
+		t.Fatalf("reconfigured manager retained plan work: enabled=%v ctx=%v cancel=%v refreshing=%v", manager.cfg.AccountProtectionEnabled, manager.plansCtx, manager.plansCancel != nil, manager.plansRefreshing)
+	}
+	if _, published := manager.plans["stale"]; published {
+		t.Fatal("canceled plan refresh published after reconfigure")
+	}
+}
 
 func newProtectionTestDB(t *testing.T) *sql.DB {
 	t.Helper()

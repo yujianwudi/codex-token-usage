@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.33`
+Current version: `0.1.34`
 
 ## Features
 
@@ -21,6 +21,7 @@ Current version: `0.1.33`
 - Non-standard Codex credential import converts ChatGPT Session, sub2api/account-product, 9router, Codex auth.json, AxonHub, Codex-Manager, and generic nested token JSON through CPA `host.auth.save`, with preview, conflict detection, and no-refresh-token warnings.
 - Optional account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
 - Account-protection and error filtering preserve CPA round-robin rotation within the highest-priority candidate tier.
+- Scheduler restriction snapshots keep healthy and already-classified requests off the SQLite hot path, while state changes invalidate the cache immediately.
 
 ## Install Manually
 
@@ -48,7 +49,7 @@ plugins:
 
       开启定时额度触发: false
       触发间隔分钟: 10
-      触发模式: probe
+      触发模式: probe # quota=只读额度 GET；probe=最小真实请求
       最大并发账号数: 1
       单账号超时秒数: 20
       单账号最小冷却分钟: 10
@@ -82,7 +83,7 @@ English config keys are also accepted:
 ```yaml
 quota_trigger_enabled: false
 quota_trigger_interval_minutes: 10
-quota_trigger_mode: probe
+quota_trigger_mode: probe # quota = read-only quota GET; probe = minimal model request
 quota_trigger_max_concurrency: 1
 quota_trigger_timeout_seconds: 20
 quota_trigger_min_account_cooldown_minutes: 10
@@ -108,7 +109,9 @@ quota_trigger_retention_days: 30
 request_detail_retention_days: 30
 ```
 
-Quota trigger defaults to off. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota. The legacy `quota` value is accepted for compatibility and normalized to `probe`; scheduled triggers no longer only read cached quota state.
+Quota trigger defaults to off. `quota` mode performs a read-only GET against the Codex usage endpoint and does not send a model probe request. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota.
+
+`request_detail_retention_days` remains accepted for configuration compatibility. Request-detail data currently lives with `usage_events`, so its effective retention follows `usage_retention_days` until a separate detail store is introduced.
 
 ## Data Directory and Path Overrides
 
@@ -147,10 +150,11 @@ The file is about 1.5 MB and is not bundled into release zips, so plugin binarie
 ## Data Safety
 
 - Access tokens, refresh tokens, and id tokens are not written to summary JSON, UI, alert output, or exports.
-- Starting with `0.1.33`, API keys are persisted only as a keyed HMAC fingerprint plus a non-sensitive last-four display suffix. Existing plaintext API-key rows are migrated on first startup; back up `usage.db` before upgrading if the historical database is operationally important.
-- The local fingerprint key is stored as `.api-key-hmac` in the private plugin data directory. Keep this file together with `usage.db` when moving an installation.
+- Starting with `0.1.33`, API keys are persisted only as a keyed HMAC fingerprint plus a non-sensitive last-four display suffix. Version `0.1.34` extends that protection to derived scheduler/auth-state identities and locally re-keys legacy unkeyed fingerprints.
+- The standard `usage.db` fingerprint key remains `.api-key-hmac` for upgrade compatibility; non-standard databases receive database-scoped sidecars so two databases in one directory cannot share an identity namespace. The key identifier is also bound inside its database. Keep the database and sidecar together when backing up or moving an installation. A missing, corrupt, or mismatched bound secret fails closed instead of silently creating a new namespace.
+- During the v3 privacy migration, legacy `keyfp:v0` identities are forward-mapped to normal v1 HMAC fingerprints when the corresponding API key is still configured. Unmatched historical rows are locally re-keyed and reported as `legacy_unlinkable_rows`. If an unmatched v0 identity is the sole identity of an active restriction, only that provider enters a fail-closed privacy quarantine: its scheduler requests return 503 while Dashboard/summary management remains available. Restore the corresponding configured API key and restart to recover and re-key automatically, or explicitly release the legacy restriction and restart to clear the quarantine.
 - Exported account labels and API-key fields are masked, and CSV cells that could be interpreted as spreadsheet formulas are neutralized.
-- Dashboard-provided text is escaped before insertion into HTML.
+- Dashboard-provided text is escaped before insertion into HTML. Inline JavaScript is authorized by an exact SHA-256 CSP hash, and the plugin no longer copies the transient management key into browser Web Storage.
 - Local alert data is generated inside summary/export responses only; this version does not send webhooks.
 - Auth JSON files are read only for account identity, provider classification, quota trigger access, and replacement detection. Tokens are used in memory for trigger requests and are not written to summary/export data.
 
@@ -168,16 +172,18 @@ go test ./...
 
 Official Linux archives are built in an Ubuntu 20.04 container and gated to require no newer than glibc `2.31`. They support glibc-based distributions such as Ubuntu 20.04+ and Debian 11+. Alpine Linux uses musl and is not supported by these CGO release binaries.
 
+Official macOS archives are native single-architecture builds for Intel and Apple Silicon. Both are pinned and verified with a minimum deployment target of macOS `12.0`, so newer hosted runners cannot silently raise the required system version.
+
 Each platform zip contains the dynamic library, `LICENSE`, and `THIRD_PARTY_NOTICES.md`. Releases always publish per-platform SPDX JSON SBOMs and SHA-256 checksums. Public repositories also publish GitHub build provenance attestations; the workflow skips only that attestation step for repositories where GitHub attestations are unavailable, without blocking the remaining release assets.
 
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.33_linux_amd64.zip
-codex-token-usage_0.1.33_linux_arm64.zip
-codex-token-usage_0.1.33_windows_amd64.zip
-codex-token-usage_0.1.33_darwin_amd64.zip
-codex-token-usage_0.1.33_darwin_arm64.zip
+codex-token-usage_0.1.34_linux_amd64.zip
+codex-token-usage_0.1.34_linux_arm64.zip
+codex-token-usage_0.1.34_windows_amd64.zip
+codex-token-usage_0.1.34_darwin_amd64.zip
+codex-token-usage_0.1.34_darwin_arm64.zip
 checksums.txt
 ```
 
@@ -186,7 +192,7 @@ checksums.txt
 - Build and upload all required OS / architecture zip files.
 - Include `checksums.txt`, per-platform SPDX SBOMs, and license notices. Public repositories must also publish GitHub provenance attestations; where attestations are unavailable, only that attestation step may be skipped.
 - Add screenshots for the Codex account pool, AI provider overview, and a selected AI endpoint page.
-- Document default-off quota trigger behavior and real-probe token cost risk.
+- Document both quota-trigger modes: read-only `quota` GET behavior and the real-probe token cost risk of `probe`.
 - Confirm `go test ./...` passes before publishing.
 
 ## Common Issues

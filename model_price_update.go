@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,8 @@ const (
 	defaultModelPriceURL       = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 	modelPriceUpdateRetryDelay = 5 * time.Minute
 )
+
+var modelPriceDiagnosticURLPattern = regexp.MustCompile(`https?://[^\s"'<>]+`)
 
 type modelPriceUpdateState struct {
 	Enabled        bool   `json:"enabled"`
@@ -37,13 +40,14 @@ type modelPriceUpdateState struct {
 }
 
 type modelPriceUpdateManager struct {
-	mu       sync.Mutex
-	cfg      pluginConfig
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	updating bool
-	state    modelPriceUpdateState
+	lifecycleMu sync.Mutex
+	mu          sync.Mutex
+	cfg         pluginConfig
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	updating    bool
+	state       modelPriceUpdateState
 }
 
 func modelPriceFilePath() string {
@@ -55,11 +59,14 @@ func modelPriceFilePath() string {
 }
 
 func (m *modelPriceUpdateManager) configure(cfg pluginConfig) {
-	m.stop()
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.stopLocked()
+
 	m.mu.Lock()
 	m.cfg = cfg
 	m.state.Enabled = cfg.ModelPriceAutoUpdateEnabled
-	m.state.URL = strings.TrimSpace(cfg.ModelPriceUpdateURL)
+	m.state.URL = modelPriceURLForDiagnostics(cfg.ModelPriceUpdateURL)
 	m.state.Path = modelPriceFilePath()
 	m.state.IntervalHours = cfg.ModelPriceUpdateIntervalHours
 	m.state.TimeoutSeconds = cfg.ModelPriceUpdateTimeoutSeconds
@@ -80,6 +87,16 @@ func (m *modelPriceUpdateManager) configure(cfg pluginConfig) {
 }
 
 func (m *modelPriceUpdateManager) stop() {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.stopLocked()
+}
+
+// stopLocked cancels and joins every goroutine belonging to the active
+// configuration. Callers must hold lifecycleMu so that a concurrent
+// configure cannot install a new cancel function while the old generation is
+// being stopped.
+func (m *modelPriceUpdateManager) stopLocked() {
 	m.mu.Lock()
 	cancel := m.cancel
 	if m.cancel != nil {
@@ -222,7 +239,7 @@ func (m *modelPriceUpdateManager) recordPriceUpdateCheck(message string, entries
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.state.LastCheckedAt = now
-	m.state.LastError = sanitizeTriggerError(message)
+	m.state.LastError = sanitizeTriggerError(sanitizeModelPriceDiagnosticText(message))
 	if updated {
 		m.state.LastUpdatedAt = now
 		m.state.Entries = entries
@@ -331,7 +348,7 @@ func publicModelPriceTransport() *http.Transport {
 func validatePublicModelPriceURL(ctx context.Context, raw string) (*url.URL, error) {
 	target, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return nil, err
+		return nil, errors.New("invalid price update URL")
 	}
 	if !strings.EqualFold(target.Scheme, "https") {
 		return nil, errors.New("price update URL must use https")
@@ -350,6 +367,33 @@ func validatePublicModelPriceURL(ctx context.Context, raw string) (*url.URL, err
 		return nil, err
 	}
 	return target, nil
+}
+
+func modelPriceURLForDiagnostics(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	target, err := url.Parse(raw)
+	if err != nil {
+		if before, _, ok := strings.Cut(raw, "?"); ok {
+			raw = before
+		}
+		if before, _, ok := strings.Cut(raw, "#"); ok {
+			raw = before
+		}
+		return raw
+	}
+	target.RawQuery = ""
+	target.ForceQuery = false
+	target.Fragment = ""
+	target.RawFragment = ""
+	target.User = nil
+	return target.String()
+}
+
+func sanitizeModelPriceDiagnosticText(message string) string {
+	return modelPriceDiagnosticURLPattern.ReplaceAllStringFunc(message, modelPriceURLForDiagnostics)
 }
 
 func resolvePublicModelPriceHost(ctx context.Context, host string) ([]net.IP, error) {
