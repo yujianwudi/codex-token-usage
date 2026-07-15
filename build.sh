@@ -27,6 +27,7 @@ fi
 
 artifact="codex-token-usage.${ext}"
 CGO_ENABLED="${CGO_ENABLED:-1}" go build \
+  -buildvcs=false \
   -trimpath \
   -ldflags="${ldflags}" \
   -buildmode=c-shared \

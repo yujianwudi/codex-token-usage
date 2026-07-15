@@ -153,7 +153,7 @@ jobs:
         include:
           - goos: darwin
             goarch: amd64
-            runner: macos-15-large
+            runner: macos-15
             ext: dylib
           - goos: darwin
             goarch: arm64
