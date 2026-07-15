@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -302,15 +304,182 @@ func TestProtectionSnapshotDoesNotDoubleCountSharedAliases(t *testing.T) {
 	}
 }
 
+func TestProtectionSnapshotAggregatesFragmentedIdentitySamples(t *testing.T) {
+	snapshot := newProtectionSnapshot(
+		[]protectionReservationSample{
+			{Aliases: []string{"account-id"}, Count: 1},
+			{Aliases: []string{"account@example.com"}, Count: 2},
+		},
+		[]protectionUsageSample{
+			{Aliases: []string{"account-id"}, Tokens: 100},
+			{Aliases: []string{"account@example.com"}, Tokens: 200},
+		},
+	)
+	inFlight, tokens := snapshot.metrics([]string{"account-id", "account@example.com"})
+	if inFlight != 3 || tokens != 300 {
+		t.Fatalf("fragmented metrics = %d/%d, want 3/300", inFlight, tokens)
+	}
+}
+
+func TestProtectionSnapshotSharedAliasDoesNotCrossCandidates(t *testing.T) {
+	candidates := []schedulerAuthCandidate{
+		{ID: "shared", Attributes: map[string]string{"auth_index": "shared", "source": "a@example.com", "auth_file": "a.json"}},
+		{ID: "shared", Attributes: map[string]string{"auth_index": "shared", "source": "b@example.com", "auth_file": "b.json"}},
+	}
+	aliasSets := protectionCandidateAliasSets(candidates)
+	snapshot := newProtectionSnapshot(
+		[]protectionReservationSample{
+			{Aliases: []string{"shared", "a@example.com"}, Count: 1},
+			{Aliases: []string{"shared", "b@example.com"}, Count: 2},
+		},
+		[]protectionUsageSample{
+			{Aliases: []string{"shared", "a@example.com"}, Tokens: 100},
+			{Aliases: []string{"shared", "b@example.com"}, Tokens: 200},
+		},
+	)
+
+	inFlight, tokens := snapshot.metrics(aliasSets[0])
+	if inFlight != 1 || tokens != 100 {
+		t.Fatalf("candidate A shared-alias metrics = %d/%d, want 1/100", inFlight, tokens)
+	}
+	inFlight, tokens = snapshot.metrics(aliasSets[1])
+	if inFlight != 2 || tokens != 200 {
+		t.Fatalf("candidate B shared-alias metrics = %d/%d, want 2/200", inFlight, tokens)
+	}
+}
+
 func TestProtectionRotationHandlesDuplicateCandidateIDs(t *testing.T) {
 	globalSchedulerRotation.reset()
 	states := []protectionCandidate{
-		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "a.json"}}, AuthIndex: "a", Limit: 5},
 		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "b.json"}}, AuthIndex: "b", Limit: 5},
+		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "a.json"}}, AuthIndex: "a", Limit: 5},
 	}
 	first := chooseProtectedCandidate(states, "duplicate")
-	second := chooseProtectedCandidate(states, "duplicate")
-	if first.AuthIndex == second.AuthIndex {
-		t.Fatalf("duplicate-ID rotation chose %q twice", first.AuthIndex)
+	reordered := []protectionCandidate{states[1], states[0]}
+	second := chooseProtectedCandidate(reordered, "duplicate")
+	if first.AuthIndex != "a" || second.AuthIndex != "b" {
+		t.Fatalf("duplicate-ID rotation = %q then %q, want a then b", first.AuthIndex, second.AuthIndex)
+	}
+}
+
+func TestProtectionRotationDeduplicatesExactCandidateIdentity(t *testing.T) {
+	globalSchedulerRotation.reset()
+	duplicate := schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "same.json"}}
+	other := schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "other.json"}}
+	states := []protectionCandidate{
+		{Candidate: duplicate, AuthIndex: "first", Limit: 5},
+		{Candidate: duplicate, AuthIndex: "duplicate", Limit: 5},
+		{Candidate: other, AuthIndex: "other", Limit: 5},
+	}
+	first := chooseProtectedCandidate(states, "exact-duplicate")
+	second := chooseProtectedCandidate(states, "exact-duplicate")
+	if first.AuthIndex == "duplicate" || second.AuthIndex == "duplicate" || first.AuthIndex == second.AuthIndex {
+		t.Fatalf("exact duplicate participated in rotation: %q then %q", first.AuthIndex, second.AuthIndex)
+	}
+}
+
+func TestDeleteFirstProtectionReservationAdvancesAfterConcurrentDelete(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	for i := 0; i < 2; i++ {
+		if _, err := db.Exec(`INSERT INTO account_protection_reservations
+			(auth_id, auth_index, source, plan_type, created_at, expires_at)
+			VALUES ('shared', 'shared', '', 'plus', ?, ?)`, now, now+900); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := db.Query(`SELECT id FROM account_protection_reservations ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan bool, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			deleted, err := deleteFirstProtectionReservation(context.Background(), db, ids)
+			results <- deleted
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for deleted := range results {
+		if !deleted {
+			t.Fatal("concurrent release did not advance to an undeleted reservation")
+		}
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("reservation count = %d, want 0", count)
+	}
+}
+
+func TestProtectionPickMutexWaitHonorsContext(t *testing.T) {
+	db := newProtectionTestDB(t)
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	if err := globalAccountProtection.pickMu.lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer globalAccountProtection.pickMu.unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := (&store{}).pickProtectedAuth(ctx, db, []schedulerAuthCandidate{
+		protectionTestCandidate("a", "plus", 1),
+	}, cfg, "context-wait")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pick error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("canceled mutex wait took %v", elapsed)
+	}
+}
+
+func TestProtectionUsageMutexWaitHonorsContext(t *testing.T) {
+	db := newProtectionTestDB(t)
+	var manager accountProtectionManager
+	if err := manager.usageMu.lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.usageMu.unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := manager.loadUsageSnapshot(ctx, db, time.Now().Unix()-300)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("usage snapshot error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("canceled usage mutex wait took %v", elapsed)
 	}
 }

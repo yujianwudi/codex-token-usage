@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type databaseDiagnostics struct {
@@ -768,6 +769,9 @@ LIMIT ?`
 			errorSummary = "http " + strconv.Itoa(status)
 		}
 		account := safeExportLabel(firstNonEmptyString(apiKey, authIndex, authID, source))
+		if strings.TrimSpace(apiKey) != "" {
+			account = maskAPIKeyForDisplay(apiKey)
+		}
 		if maskedAccountFilter && account != accountFilter {
 			continue
 		}
@@ -776,7 +780,7 @@ LIMIT ?`
 			"scope":                    scope,
 			"provider":                 provider,
 			"account":                  account,
-			"api_key":                  safeExportLabel(apiKey),
+			"api_key":                  maskAPIKeyForDisplay(apiKey),
 			"auth_id":                  safeExportLabel(authID),
 			"auth_index":               safeExportLabel(authIndex),
 			"source":                   safeExportLabel(source),
@@ -821,7 +825,7 @@ func accountExportRows(rows []accountRow) []map[string]string {
 	for _, r := range rows {
 		out = append(out, map[string]string{
 			"account":                  safeExportLabel(firstNonEmptyString(r.Email, r.Source, r.Name, r.AuthID, r.AuthFile, r.AuthIndex)),
-			"auth_index":               r.AuthIndex,
+			"auth_index":               safeExportLabel(r.AuthIndex),
 			"provider":                 r.Provider,
 			"requests":                 strconv.FormatInt(r.Requests, 10),
 			"success_rate":             fmt.Sprintf("%.2f", successRateBackend(r.Requests, r.Failed)),
@@ -896,13 +900,17 @@ func recordsToCSV(headers []string, records []map[string]string) ([]byte, error)
 	var buf bytes.Buffer
 	buf.WriteString("\xEF\xBB\xBF")
 	writer := csv.NewWriter(&buf)
-	if err := writer.Write(headers); err != nil {
+	safeHeaders := make([]string, len(headers))
+	for i, header := range headers {
+		safeHeaders[i] = safeCSVCell(header)
+	}
+	if err := writer.Write(safeHeaders); err != nil {
 		return nil, err
 	}
 	for _, record := range records {
 		row := make([]string, len(headers))
 		for i, header := range headers {
-			row[i] = record[header]
+			row[i] = safeCSVCell(record[header])
 		}
 		if err := writer.Write(row); err != nil {
 			return nil, err
@@ -912,17 +920,106 @@ func recordsToCSV(headers []string, records []map[string]string) ([]byte, error)
 	return buf.Bytes(), writer.Error()
 }
 
-func safeExportLabel(value string) string {
-	value = strings.TrimSpace(value)
-	lower := strings.ToLower(value)
-	if strings.HasPrefix(lower, "sk-") || strings.HasPrefix(lower, "bearer sk-") {
-		plain := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
-		if len(plain) <= 7 {
-			return "sk-****"
+func safeCSVCell(value string) string {
+	for _, r := range value {
+		switch r {
+		case '\t', '\r', '\n':
+			return "'" + value
+		case '=', '+', '-', '@':
+			return "'" + value
 		}
-		return plain[:3] + "****" + plain[len(plain)-4:]
+		if unicode.IsSpace(r) {
+			continue
+		}
+		break
 	}
 	return value
+}
+
+func safeExportLabel(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if _, ok := storedAPIKeyFingerprintLast4(value); ok {
+		return maskAPIKeyForDisplay(value)
+	}
+	if _, ok := bearerCredential(value); ok {
+		return maskAPIKeyForDisplay(value)
+	}
+	if apiKeyPrefixLength(value) > 0 {
+		return maskAPIKeyForDisplay(value)
+	}
+	return value
+}
+
+func maskAPIKeyForDisplay(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if last4, ok := storedAPIKeyFingerprintLast4(value); ok {
+		return "key-****" + last4
+	}
+	if credential, ok := bearerCredential(value); ok {
+		return "Bearer " + maskCredentialForDisplay(credential, apiKeyPrefixLength(credential))
+	}
+	prefixLen := apiKeyPrefixLength(value)
+	if prefixLen == 0 {
+		return "key-" + maskCredentialForDisplay(value, 0)
+	}
+	return maskCredentialForDisplay(value, prefixLen)
+}
+
+func bearerCredential(value string) (string, bool) {
+	if len(value) <= len("bearer") || !strings.EqualFold(value[:len("bearer")], "bearer") {
+		return "", false
+	}
+	rest := value[len("bearer"):]
+	trimmed := strings.TrimLeftFunc(rest, unicode.IsSpace)
+	if len(trimmed) == len(rest) || strings.TrimSpace(trimmed) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(trimmed), true
+}
+
+func apiKeyPrefixLength(value string) int {
+	lower := strings.ToLower(value)
+	for _, prefix := range []string{"sk-svcacct-", "sk-proj-", "sk-ant-", "xai-", "aiza", "sk-"} {
+		if strings.HasPrefix(lower, prefix) {
+			return len(prefix)
+		}
+	}
+	return 0
+}
+
+func maskCredentialForDisplay(value string, prefixLen int) string {
+	if prefixLen < 0 || prefixLen > len(value) {
+		prefixLen = 0
+	}
+	masked := value[:prefixLen] + "****"
+	if len(value)-prefixLen > 8 {
+		masked += value[len(value)-4:]
+	}
+	return masked
+}
+
+func storedAPIKeyFingerprintLast4(value string) (string, bool) {
+	parts := strings.Split(value, ":")
+	if len(parts) != 4 || !strings.EqualFold(parts[0], "keyfp") || (parts[1] != "v0" && parts[1] != "v1") || len(parts[2]) != 32 || len(parts[3]) != 4 {
+		return "", false
+	}
+	for _, r := range parts[2] {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return "", false
+		}
+	}
+	for _, r := range parts[3] {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return "", false
+		}
+	}
+	return parts[3], true
 }
 
 func successRateBackend(requests, failed int64) float64 {

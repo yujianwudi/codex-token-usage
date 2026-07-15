@@ -84,3 +84,58 @@ func TestEnglishLocaleTranslatesDynamicPhrasesBeforeUnits(t *testing.T) {
 		}
 	}
 }
+
+func TestRecentRequestFieldsAreEscapedBeforeInnerHTML(t *testing.T) {
+	start := strings.Index(dashboardScripts, "function renderRecent(target,rows,mode){")
+	if start < 0 {
+		t.Fatal("renderRecent function not found")
+	}
+	end := strings.Index(dashboardScripts[start:], "\napplyLocale();")
+	if end < 0 {
+		t.Fatal("renderRecent function end not found")
+	}
+	renderRecent := dashboardScripts[start : start+end]
+	for _, marker := range []string{
+		"esc(r.reasoning_effort)",
+		"esc(detail)",
+		"esc(firstText(r.model,model))",
+		"esc(model)",
+		"esc(who)",
+		"esc(r.time||'-')",
+		"esc(requestStatusText(r))",
+	} {
+		if !strings.Contains(renderRecent, marker) {
+			t.Fatalf("renderRecent must HTML-escape dynamic marker %q", marker)
+		}
+	}
+	if strings.Contains(renderRecent, "'+r.reasoning_effort+'") {
+		t.Fatal("reasoning_effort must not be inserted into innerHTML without escaping")
+	}
+}
+
+func TestOAuthURLIsValidatedBeforeRenderingOrOpening(t *testing.T) {
+	for _, marker := range []string{
+		"function safeOAuthURL(value){",
+		"u.protocol!=='https:'",
+		"!u.hostname",
+		"u.username||u.password",
+		"const oauthURL=safeOAuthURL(payload.url);",
+		"href=\"'+esc(oauthURL)+'\"",
+		"data-oauth-copy=\"'+esc(oauthURL)+'\"",
+		"window.open(oauthURL,'_blank','noopener,noreferrer')",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard OAuth flow missing safety marker %q", marker)
+		}
+	}
+	if strings.Contains(dashboardScripts, "window.open(payload.url") {
+		t.Fatal("raw OAuth response URL must never be opened")
+	}
+}
+
+func TestInsightRowsEscapeAllInnerHTMLFields(t *testing.T) {
+	marker := `items.map(r=>'<div class="insight '+esc(r[3])+'"><span>'+esc(r[0])+'</span><b title="'+esc(r[1])+'">'+esc(r[1])+'</b><span>'+esc(r[2])+'</span></div>')`
+	if count := strings.Count(dashboardScripts, marker); count != 2 {
+		t.Fatalf("both insight render paths must escape every dynamic field; found %d safe renderers", count)
+	}
+}

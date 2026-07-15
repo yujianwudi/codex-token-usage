@@ -1,10 +1,41 @@
 # Third-Party Notices
 
-The non-standard Codex credential import field mapping and format-detection behavior is derived in part from:
+This project includes or derives portions from the following third-party software.
 
-- GPTSession2CPAandSub2API: https://github.com/gtxx3600/GPTSession2CPAandSub2API
+## go-sqlite3
+
+- Project: https://github.com/mattn/go-sqlite3
+- Copyright (c) 2014 Yasuhiro Matsumoto
+- License: MIT
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The bundled SQLite amalgamation is in the public domain. See
+https://www.sqlite.org/copyright.html.
+
+## GPTSession2CPAandSub2API-derived credential mapping
+
+- Project: https://github.com/gtxx3600/GPTSession2CPAandSub2API
 - Copyright (c) 2026 Dehujiaogeli
-- Licensed under the MIT License
+- License: MIT
 
 MIT License
 

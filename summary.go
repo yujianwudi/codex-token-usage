@@ -595,14 +595,43 @@ func (m *summaryPrecomputeManager) configLocked() pluginConfig {
 }
 
 func normalizeSummaryCacheKey(key summaryCacheKey) summaryCacheKey {
-	key.Window = strings.ToLower(strings.TrimSpace(key.Window))
-	if key.Window == "" {
-		key.Window = "24h"
+	window, ok := normalizeSummaryWindow(key.Window)
+	if !ok {
+		window = "24h"
 	}
-	if key.Limit <= 0 {
-		key.Limit = 50
-	}
+	key.Window = window
+	key.Limit = normalizeSummaryLimit(key.Limit)
 	return key
+}
+
+func normalizeSummaryWindow(window string) (string, bool) {
+	window = strings.ToLower(strings.TrimSpace(window))
+	if window == "" {
+		return "24h", true
+	}
+	switch window {
+	case "today", "24h", "7d", "30d", "all":
+		return window, true
+	default:
+		return "", false
+	}
+}
+
+func normalizeSummaryLimit(limit int) int {
+	switch {
+	case limit <= 0:
+		return 50
+	case limit <= 50:
+		return 50
+	case limit <= 100:
+		return 100
+	case limit <= 500:
+		return 500
+	case limit <= 2000:
+		return 2000
+	default:
+		return 5000
+	}
 }
 
 func cloneSummaryMap(data map[string]any) map[string]any {
@@ -1023,7 +1052,11 @@ func providerRecentLimit(limit int) int {
 
 func windowStart(window string) (int64, string) {
 	now := time.Now()
-	switch strings.ToLower(strings.TrimSpace(window)) {
+	window, ok := normalizeSummaryWindow(window)
+	if !ok {
+		window = "24h"
+	}
+	switch window {
 	case "today":
 		y, m, d := now.Date()
 		return time.Date(y, m, d, 0, 0, 0, 0, now.Location()).Unix(), "today"
@@ -1033,6 +1066,8 @@ func windowStart(window string) (int64, string) {
 		return now.Add(-30 * 24 * time.Hour).Unix(), "30d"
 	case "all":
 		return 0, "all"
+	case "24h":
+		return now.Add(-24 * time.Hour).Unix(), "24h"
 	default:
 		return now.Add(-24 * time.Hour).Unix(), "24h"
 	}
@@ -1713,12 +1748,15 @@ func configuredConfigPath() string {
 	if path := strings.TrimSpace(os.Getenv("CPA_CONFIG_FILE")); path != "" {
 		return path
 	}
-	for _, path := range []string{"/root/config.yaml", "/root/.cli-proxy-api/config.yaml"} {
+	for _, path := range defaultConfigCandidates() {
 		if _, err := os.Stat(path); err == nil {
 			return path
 		}
 	}
-	return "/root/config.yaml"
+	if candidates := defaultConfigCandidates(); len(candidates) > 0 {
+		return candidates[0]
+	}
+	return filepath.Join(pluginDataDirBestEffort(), "config.yaml")
 }
 
 func readConfiguredProviderNames() []string {
@@ -3444,7 +3482,7 @@ LIMIT ?`
 		); err != nil {
 			return nil, err
 		}
-		r.KeyID = safeExportLabel(r.RawKeyID)
+		r.KeyID = maskAPIKeyForDisplay(r.RawKeyID)
 		r.ProviderNames = normalizeKeyProviderNames(providers)
 		r.Provider = firstKeyProviderName(r.ProviderNames)
 		r.QuotaUsedTokens = r.TotalTokens
@@ -3509,7 +3547,7 @@ func cpaProviderSQLWithEntries(entries []providerConfigEntry) string {
 	var apiKeyCases strings.Builder
 	for _, entry := range entries {
 		provider := strings.TrimSpace(entry.Provider)
-		apiKey := strings.TrimSpace(entry.APIKey)
+		apiKey := configuredAPIKeyStorageValue(entry.APIKey)
 		name := strings.TrimSpace(entry.Name)
 		if provider == "" || apiKey == "" || name == "" {
 			continue
