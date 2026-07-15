@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
@@ -11,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +21,14 @@ import (
 	"time"
 	"unicode"
 )
+
+var diagnosticPathLabelKey = func() []byte {
+	key := make([]byte, sha256.Size)
+	if _, err := cryptorand.Read(key); err == nil {
+		return key
+	}
+	return nil
+}()
 
 type databaseDiagnostics struct {
 	Path                 string `json:"path"`
@@ -110,6 +121,7 @@ type modelPriceDiagnostics struct {
 type diagnosticsSummary struct {
 	Database      databaseDiagnostics          `json:"database"`
 	AuthFiles     authDiagnostics              `json:"auth_files"`
+	CodexAuth     xaiAuthSourceDiagnostics     `json:"codex_auth"`
 	XAIAuth       xaiAuthSourceDiagnostics     `json:"xai_auth"`
 	Scheduler     schedulerDiagnostics         `json:"scheduler"`
 	Providers     providerDiagnostics          `json:"providers"`
@@ -326,11 +338,12 @@ func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts [
 	return diagnosticsSummary{
 		Database:      queryDatabaseDiagnostics(ctx, db, dbPath),
 		AuthFiles:     buildAuthDiagnostics(accounts, invalidAuths, autobans, externalAlerts),
+		CodexAuth:     globalCodexAuthSource.status(),
 		XAIAuth:       globalXAIAuthSource.status(),
 		Scheduler:     globalSchedulerDiagnostics.status(len(autobans)),
 		Providers:     buildProviderDiagnostics(providers),
 		ModelPrices:   buildModelPriceDiagnostics(priceState),
-		APIKeyPrivacy: apiKeyFingerprintStatus(ctx, db),
+		APIKeyPrivacy: apiKeyFingerprintStatus(ctx, db, dbPath),
 		QuotaTrigger:  globalQuotaTrigger.status(),
 		Retention:     globalRetentionCleaner.status(),
 	}
@@ -339,7 +352,7 @@ func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts [
 func queryDatabaseDiagnostics(ctx context.Context, db *sql.DB, path string) databaseDiagnostics {
 	now := time.Now().Unix()
 	out := databaseDiagnostics{
-		Path:             path,
+		Path:             diagnosticPathLabel(path),
 		SizeBytes:        databaseFileSize(path),
 		UsageEvents:      queryCount(ctx, db, `SELECT COUNT(*) FROM usage_events`),
 		QuotaTriggerRuns: queryCount(ctx, db, `SELECT COUNT(*) FROM quota_trigger_runs`),
@@ -381,8 +394,10 @@ func queryMaxUnix(ctx context.Context, db *sql.DB, query string) int64 {
 
 func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, autobans []autobanRow, externalAlerts []externalUseAlert) authDiagnostics {
 	files := readConfiguredAuthFiles()
+	codexStatus := globalCodexAuthSource.status()
 	out := authDiagnostics{
 		Files:                len(files),
+		Codex:                codexStatus.Accounts,
 		XAI:                  globalXAIAuthSource.status().Accounts,
 		Invalid401:           len(invalidAuths),
 		Autoban429:           count429Autobans(autobans),
@@ -390,8 +405,6 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 	}
 	for _, file := range files {
 		switch strings.ToLower(strings.TrimSpace(file.Provider)) {
-		case "codex":
-			out.Codex++
 		case "anthropic":
 			out.Anthropic++
 		case "antigravity":
@@ -399,14 +412,20 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 		case "gemini":
 			out.Gemini++
 		}
-		if file.Disabled {
+		if !isCodexAuthProvider(file.Provider) && file.Disabled {
 			out.Disabled++
 		}
-		if file.Expired {
+		if !isCodexAuthProvider(file.Provider) && file.Expired {
 			out.Expired++
 		}
 	}
 	for _, account := range accounts {
+		if account.Configured && isCodexAuthProvider(account.Provider) && account.Disabled {
+			out.Disabled++
+		}
+		if account.Configured && isCodexAuthProvider(account.Provider) && account.Expired {
+			out.Expired++
+		}
 		if isCodexAuthProvider(account.Provider) && !account.Disabled && !account.Expired && !account.InvalidAuth && !account.ExternalUseSuspected {
 			out.QuotaTriggerAvailable++
 		}
@@ -494,7 +513,7 @@ func buildModelPriceDiagnostics(state modelPriceUpdateState) modelPriceDiagnosti
 	out := modelPriceDiagnostics{
 		Enabled:        state.Enabled,
 		URL:            modelPriceURLForDiagnostics(state.URL),
-		Path:           state.Path,
+		Path:           diagnosticPathLabel(state.Path),
 		IntervalHours:  state.IntervalHours,
 		TimeoutSeconds: state.TimeoutSeconds,
 		LastCheckedAt:  state.LastCheckedAt,
@@ -517,6 +536,60 @@ func buildModelPriceDiagnostics(state modelPriceUpdateState) modelPriceDiagnosti
 		out.Stale = true
 	}
 	return out
+}
+
+func diagnosticPathLabel(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if opaqueDiagnosticPathLabel(path) {
+		return path
+	}
+	if len(diagnosticPathLabelKey) == 0 {
+		return "path#0000000000000000"
+	}
+	clean := filepath.Clean(path)
+	if absolute, err := filepath.Abs(clean); err == nil {
+		clean = absolute
+	}
+	mac := hmac.New(sha256.New, diagnosticPathLabelKey)
+	_, _ = mac.Write([]byte(clean))
+	return "path#" + hex.EncodeToString(mac.Sum(nil)[:8])
+}
+
+func opaqueDiagnosticPathLabel(value string) bool {
+	const prefix = "path#"
+	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+16 {
+		return false
+	}
+	_, err := hex.DecodeString(value[len(prefix):])
+	return err == nil
+}
+
+func sanitizeSummaryDiagnosticPaths(data map[string]any) {
+	if data == nil {
+		return
+	}
+	if path, ok := data["db_path"].(string); ok {
+		data["db_path"] = diagnosticPathLabel(path)
+	}
+	switch diagnostics := data["diagnostics"].(type) {
+	case diagnosticsSummary:
+		diagnostics.Database.Path = diagnosticPathLabel(diagnostics.Database.Path)
+		diagnostics.ModelPrices.Path = diagnosticPathLabel(diagnostics.ModelPrices.Path)
+		data["diagnostics"] = diagnostics
+	case map[string]any:
+		for _, section := range []string{"database", "model_prices"} {
+			values, ok := diagnostics[section].(map[string]any)
+			if !ok {
+				continue
+			}
+			if path, ok := values["path"].(string); ok {
+				values["path"] = diagnosticPathLabel(path)
+			}
+		}
+	}
 }
 
 func buildAlerts(data map[string]any) []dashboardAlert {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -564,6 +566,7 @@ WHERE cache_key=?`, summaryCacheStorageKey(key)).Scan(&raw, &cachedAt, &duration
 		if err := json.Unmarshal([]byte(raw), &data); err != nil {
 			return summaryCacheLoadResult{}, err
 		}
+		sanitizeSummaryDiagnosticPaths(data)
 		return summaryCacheLoadResult{
 			entry: summaryCacheEntry{
 				data:       data,
@@ -693,6 +696,7 @@ func cloneCachedSummaryForRevision(entry summaryCacheEntry, key summaryCacheKey,
 		reason = "age_stale"
 	}
 	out := cloneSummaryMap(entry.data)
+	sanitizeSummaryDiagnosticPaths(out)
 	out["precompute"] = summaryPrecomputeInfo{
 		Enabled:      true,
 		Hit:          true,
@@ -765,15 +769,20 @@ WHERE active=1 OR released_at > 0`).Scan(&r.BanActive, &r.BanMaxChanged, &r.Next
 }
 
 func authFilesRevision() string {
-	authDir := configuredAuthDir()
-	if authDir == "" {
-		return "none"
+	_ = readConfiguredAuthAccounts()
+	filesystemRevision := "none"
+	if authDir := configuredAuthDir(); authDir != "" {
+		_, revision, err := configuredAuthDirectorySnapshot(authDir)
+		if err != nil {
+			filesystemRevision = "unreadable"
+		} else {
+			filesystemRevision = revision
+		}
 	}
-	_, revision, err := configuredAuthDirectorySnapshot(authDir)
-	if err != nil {
-		return "unreadable"
+	if status := globalCodexAuthSource.status(); status.Authoritative && status.Source == "host_callback" {
+		return "host:" + globalCodexAuthSource.currentRevision() + "|files:" + filesystemRevision
 	}
-	return revision
+	return filesystemRevision
 }
 
 func attachSummaryRuntimeInfo(data map[string]any, durationMs int64) {
@@ -832,7 +841,6 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		return nil, err
 	}
 	now := time.Now().Unix()
-	authDirReadable := configuredAuthDirectoryReadable()
 	configuredXAIAccounts := readConfiguredXAIAccounts()
 	xaiHasUsage, err := queryHasXAIUsage(ctx, db, since)
 	if err != nil {
@@ -856,8 +864,9 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		return nil, err
 	}
 	configuredAccounts := readConfiguredAuthAccounts()
+	codexAuthAuthoritative := globalCodexAuthSource.authoritative()
 	accounts = mergeConfiguredAccounts(accounts, configuredAccounts)
-	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, authDirReadable)
+	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, codexAuthAuthoritative)
 	if globalAccountProtection.enabled() {
 		applyAccountProtectionState(ctx, db, accounts)
 	}
@@ -886,7 +895,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err != nil {
 		return nil, err
 	}
-	invalidAuths = filterMissingInvalidAuthRows(invalidAuths, configuredAccounts, authDirReadable)
+	invalidAuths = filterMissingInvalidAuthRows(invalidAuths, configuredAccounts, codexAuthAuthoritative)
 	applyInvalidAuths(accounts, invalidAuths)
 	workspaceDeactivatedAuths := filterWorkspaceDeactivatedAuths(invalidAuths)
 	unauthorizedInvalidAuths := filterUnauthorizedInvalidAuths(invalidAuths)
@@ -973,7 +982,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err != nil {
 		return nil, err
 	}
-	autobans = filterMissingAutobanRows(autobans, configuredAccounts, authDirReadable)
+	autobans = filterMissingAutobanRows(autobans, configuredAccounts, codexAuthAuthoritative)
 	autobans = mergeEffectiveAutobans(autobans, invalidAuths)
 	applyAccountQuotaToAutobans(autobans, accounts)
 	diagnostics := buildDiagnostics(ctx, db, path, accounts, providers, unauthorizedInvalidAuths, autobans, externalUseAlerts)
@@ -983,7 +992,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		"generated_at":                time.Now().Format(time.RFC3339),
 		"window":                      label,
 		"since_unix":                  since,
-		"db_path":                     path,
+		"db_path":                     diagnosticPathLabel(path),
 		"totals":                      totals,
 		"provider_totals":             providerTotals,
 		"xai_totals":                  xaiTotals,
@@ -1576,6 +1585,17 @@ LIMIT ?`, since, limit)
 }
 
 func readConfiguredAuthAccounts() []configuredAccount {
+	accounts, err := globalCodexAuthSource.hostAccounts()
+	if err == nil {
+		files := readConfiguredAuthFiles()
+		metadata := make([]configuredAccount, 0, len(files))
+		for _, file := range files {
+			if isCodexAuthProvider(file.Provider) {
+				metadata = append(metadata, file)
+			}
+		}
+		return mergeConfiguredAccountMetadata(accounts, metadata)
+	}
 	files := readConfiguredAuthFiles()
 	out := make([]configuredAccount, 0, len(files))
 	for _, file := range files {
@@ -1583,7 +1603,7 @@ func readConfiguredAuthAccounts() []configuredAccount {
 			out = append(out, file)
 		}
 	}
-	return out
+	return globalCodexAuthSource.markFilesystemFallback(out, err)
 }
 
 func readConfiguredXAIAccounts() []configuredAccount {
@@ -1598,18 +1618,24 @@ func readConfiguredXAIAccounts() []configuredAccount {
 			out = append(out, file)
 		}
 	}
-	globalXAIAuthSource.markFilesystemFallback(out, err)
-	return out
+	return globalXAIAuthSource.markFilesystemFallback(out, err)
 }
 
 type configuredAuthFilesCacheState struct {
-	mu       sync.Mutex
-	dir      string
-	revision string
-	accounts []configuredAccount
+	mu            sync.Mutex
+	dir           string
+	revision      string
+	accounts      []configuredAccount
+	authoritative bool
 }
 
 var configuredAuthFilesCache configuredAuthFilesCacheState
+
+const (
+	maxConfiguredAuthFileBytes  int64 = 8 << 20
+	maxConfiguredAuthTotalBytes int64 = 64 << 20
+	maxConfiguredAuthFiles            = 4096
+)
 
 func readConfiguredAuthFiles() []configuredAccount {
 	authDir := configuredAuthDir()
@@ -1621,29 +1647,50 @@ func readConfiguredAuthFiles() []configuredAccount {
 		return nil
 	}
 	configuredAuthFilesCache.mu.Lock()
-	if configuredAuthFilesCache.dir == authDir && configuredAuthFilesCache.revision == revision {
+	if configuredAuthFilesCache.dir == authDir &&
+		configuredAuthFilesCache.revision == revision &&
+		configuredAuthFilesCache.authoritative {
 		accounts := cloneConfiguredAccounts(configuredAuthFilesCache.accounts)
 		configuredAuthFilesCache.mu.Unlock()
 		return accounts
 	}
 	configuredAuthFilesCache.mu.Unlock()
 	out := make([]configuredAccount, 0, len(entries))
+	var totalRead int64
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
 			continue
 		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
 		path := filepath.Join(authDir, entry.Name())
-		raw, err := os.ReadFile(path)
+		raw, info, err := readConfiguredAuthJSONFile(path)
 		if err != nil {
-			continue
+			configuredAuthFilesCache.mu.Lock()
+			configuredAuthFilesCache.dir = authDir
+			configuredAuthFilesCache.revision = revision
+			configuredAuthFilesCache.accounts = nil
+			configuredAuthFilesCache.authoritative = false
+			configuredAuthFilesCache.mu.Unlock()
+			return nil
+		}
+		totalRead += int64(len(raw))
+		if totalRead > maxConfiguredAuthTotalBytes {
+			configuredAuthFilesCache.mu.Lock()
+			configuredAuthFilesCache.dir = authDir
+			configuredAuthFilesCache.revision = revision
+			configuredAuthFilesCache.accounts = nil
+			configuredAuthFilesCache.authoritative = false
+			configuredAuthFilesCache.mu.Unlock()
+			return nil
 		}
 		var doc map[string]any
 		if err := json.Unmarshal(raw, &doc); err != nil {
-			continue
+			configuredAuthFilesCache.mu.Lock()
+			configuredAuthFilesCache.dir = authDir
+			configuredAuthFilesCache.revision = revision
+			configuredAuthFilesCache.accounts = nil
+			configuredAuthFilesCache.authoritative = false
+			configuredAuthFilesCache.mu.Unlock()
+			return nil
 		}
 		authType := normalizeAuthProvider(firstNonEmptyString(
 			stringFromAny(doc["provider"]),
@@ -1651,7 +1698,12 @@ func readConfiguredAuthFiles() []configuredAccount {
 			stringFromAny(doc["type"]),
 			stringFromAny(doc["auth_type"]),
 		), entry.Name())
-		email := firstNonEmptyString(stringFromAny(doc["email"]), stringFromAny(doc["account"]), stringFromAny(doc["username"]))
+		email := safeAuthAccountEmail(
+			firstNonEmptyString(stringFromAny(doc["account_type"]), stringFromAny(doc["accountType"])),
+			stringFromAny(doc["email"]),
+			stringFromAny(doc["account"]),
+			stringFromAny(doc["username"]),
+		)
 		name := stringFromAny(doc["name"])
 		authFile := entry.Name()
 		source := firstNonEmptyString(email, name, authFile)
@@ -1691,8 +1743,62 @@ func readConfiguredAuthFiles() []configuredAccount {
 	configuredAuthFilesCache.dir = authDir
 	configuredAuthFilesCache.revision = revision
 	configuredAuthFilesCache.accounts = cloneConfiguredAccounts(out)
+	configuredAuthFilesCache.authoritative = true
 	configuredAuthFilesCache.mu.Unlock()
 	return cloneConfiguredAccounts(out)
+}
+
+func readConfiguredAuthJSONFile(path string) ([]byte, os.FileInfo, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("auth JSON is not a regular file")
+	}
+	if before.Size() < 0 || before.Size() > maxConfiguredAuthFileBytes {
+		return nil, nil, fmt.Errorf("auth JSON exceeds %d bytes", maxConfiguredAuthFileBytes)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		return nil, nil, fmt.Errorf("auth JSON changed during secure open")
+	}
+	if opened.Size() < 0 || opened.Size() > maxConfiguredAuthFileBytes {
+		return nil, nil, fmt.Errorf("auth JSON exceeds %d bytes", maxConfiguredAuthFileBytes)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxConfiguredAuthFileBytes+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	if int64(len(raw)) > maxConfiguredAuthFileBytes {
+		return nil, nil, fmt.Errorf("auth JSON exceeds %d bytes", maxConfiguredAuthFileBytes)
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !configuredAuthFileSnapshotStable(opened, after, int64(len(raw))) {
+		return nil, nil, fmt.Errorf("auth JSON changed during read")
+	}
+	return raw, after, nil
+}
+
+func configuredAuthFileSnapshotStable(before, after os.FileInfo, bytesRead int64) bool {
+	if before == nil || after == nil || !before.Mode().IsRegular() || !after.Mode().IsRegular() {
+		return false
+	}
+	return os.SameFile(before, after) &&
+		before.Size() == after.Size() &&
+		before.ModTime().Equal(after.ModTime()) &&
+		bytesRead == after.Size()
 }
 
 func configuredAuthDirectorySnapshot(authDir string) ([]os.DirEntry, string, error) {
@@ -1702,15 +1808,32 @@ func configuredAuthDirectorySnapshot(authDir string) ([]os.DirEntry, string, err
 	}
 	hash := fnv.New64a()
 	count := 0
+	var totalBytes int64
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+		if !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
 			continue
+		}
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			return nil, "", fmt.Errorf("auth JSON entry %q is not a regular file", entry.Name())
 		}
 		info, err := entry.Info()
 		if err != nil {
-			continue
+			return nil, "", err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, "", fmt.Errorf("auth JSON entry %q is not a regular file", entry.Name())
+		}
+		if info.Size() < 0 || info.Size() > maxConfiguredAuthFileBytes {
+			return nil, "", fmt.Errorf("auth JSON entry %q exceeds %d bytes", entry.Name(), maxConfiguredAuthFileBytes)
 		}
 		count++
+		if count > maxConfiguredAuthFiles {
+			return nil, "", fmt.Errorf("auth directory exceeds %d JSON files", maxConfiguredAuthFiles)
+		}
+		totalBytes += info.Size()
+		if totalBytes > maxConfiguredAuthTotalBytes {
+			return nil, "", fmt.Errorf("auth directory exceeds %d bytes", maxConfiguredAuthTotalBytes)
+		}
 		_, _ = hash.Write([]byte(entry.Name()))
 		_, _ = hash.Write([]byte{0})
 		_, _ = hash.Write([]byte(strconv.FormatInt(info.Size(), 10)))
@@ -2086,8 +2209,19 @@ func configuredAuthDirectoryReadable() bool {
 	if authDir == "" {
 		return false
 	}
-	_, err := os.ReadDir(authDir)
-	return err == nil
+	// Populate the secure snapshot first so readability cannot be mistaken for
+	// authoritativeness when a JSON entry is a symlink, non-regular, oversized,
+	// or changes during open.
+	_ = readConfiguredAuthFiles()
+	_, revision, err := configuredAuthDirectorySnapshot(authDir)
+	if err != nil {
+		return false
+	}
+	configuredAuthFilesCache.mu.Lock()
+	defer configuredAuthFilesCache.mu.Unlock()
+	return configuredAuthFilesCache.dir == authDir &&
+		configuredAuthFilesCache.revision == revision &&
+		configuredAuthFilesCache.authoritative
 }
 
 func yamlScalar(raw string, keys ...string) string {

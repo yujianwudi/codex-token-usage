@@ -163,13 +163,83 @@ func TestManagementKeyIsNotCopiedIntoWebStorage(t *testing.T) {
 			t.Fatalf("stale 401 protection missing marker %q", marker)
 		}
 	}
-	if !strings.Contains(dashboardHTML, `id="key"`) || !strings.Contains(dashboardHTML, `autocomplete="off"`) {
+	if !strings.Contains(dashboardBody, `id="key" class="fallback-key" type="password" autocomplete="off"`) {
 		t.Fatal("management-key input must not opt into browser password persistence")
 	}
 	for _, legacyName := range []string{"cpa_token_usage_key", "cpa_token_usage_rejected_key", "cpa_token_usage_rejected_at"} {
 		if !strings.Contains(dashboardScripts, "safeStorageRemove(storage,'"+legacyName+"')") {
 			t.Fatalf("dashboard must scrub legacy session storage entry %q after upgrade", legacyName)
 		}
+	}
+}
+
+func TestDashboardClearsImportedTokensAndProxyCredentials(t *testing.T) {
+	for _, fragment := range []string{
+		"function wipeAuthImportSecrets(){",
+		"authImportReadGeneration++;\n  authImportTextEl.value='';",
+		"function closeAuthImportModal(){wipeAuthImportSecrets();authImportModal.hidden=true}",
+		"function clearAuthImport(){\n  wipeAuthImportSecrets();",
+		"wipeAuthImportSecrets();\n    setAuthImportStatus(",
+		"function closeBatchProxyModal(){batchProxyUrlEl.value='';batchProxyModal.hidden=true}",
+		"if(failed===0)batchProxyUrlEl.value='';",
+	} {
+		if !strings.Contains(dashboardScripts, fragment) {
+			t.Fatalf("dashboard secret cleanup missing %q", fragment)
+		}
+	}
+	if !strings.Contains(dashboardBody, `id="batch-proxy-url" autocomplete="off" autocapitalize="none" spellcheck="false"`) {
+		t.Fatal("proxy credential input must opt out of browser text persistence features")
+	}
+}
+
+func TestAuthImportAsyncReadsCannotRestoreWipedSecrets(t *testing.T) {
+	if !strings.Contains(dashboardScripts, "let authImportReadGeneration=0;") {
+		t.Fatal("auth import file reads must have a cancellation generation")
+	}
+
+	start := strings.Index(dashboardScripts, "async function readAuthImportFiles(e){")
+	if start < 0 {
+		t.Fatal("readAuthImportFiles function not found")
+	}
+	end := strings.Index(dashboardScripts[start:], "\nfunction authImportKey(){")
+	if end < 0 {
+		t.Fatal("readAuthImportFiles function end not found")
+	}
+	readFiles := dashboardScripts[start : start+end]
+
+	generationAt := strings.Index(readFiles, "const generation=++authImportReadGeneration;")
+	writeAt := strings.Index(readFiles, "authImportTextEl.value=")
+	statusAt := strings.LastIndex(readFiles, "setAuthImportStatus(")
+	if generationAt < 0 || writeAt < 0 || statusAt < 0 {
+		t.Fatalf("auth import read cancellation markers missing: %q", readFiles)
+	}
+	awaitCount := 0
+	for offset := 0; ; {
+		relativeAwait := strings.Index(readFiles[offset:], "await file.text()")
+		if relativeAwait < 0 {
+			break
+		}
+		awaitAt := offset + relativeAwait
+		nextAwait := strings.Index(readFiles[awaitAt+1:], "await file.text()")
+		segmentEnd := writeAt
+		if nextAwait >= 0 {
+			segmentEnd = awaitAt + 1 + nextAwait
+		}
+		if segmentEnd <= awaitAt {
+			t.Fatalf("file.text await occurs after the final DOM write: %q", readFiles)
+		}
+		cancelAt := strings.Index(readFiles[awaitAt:segmentEnd], "if(generation!==authImportReadGeneration)return;")
+		if cancelAt < 0 {
+			t.Fatalf("file.text await at byte %d lacks its own cancellation check before the next await or DOM write: %q", awaitAt, readFiles)
+		}
+		awaitCount++
+		offset = awaitAt + len("await file.text()")
+	}
+	if awaitCount == 0 || !(generationAt < writeAt && writeAt < statusAt) {
+		t.Fatalf("auth import read ordering is incomplete: %q", readFiles)
+	}
+	if count := strings.Count(readFiles, "if(generation!==authImportReadGeneration)return;"); count < 2 {
+		t.Fatalf("auth import reads must recheck cancellation after each file and before final DOM updates; found %d checks", count)
 	}
 }
 

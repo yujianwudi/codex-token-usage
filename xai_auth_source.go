@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,11 @@ const (
 	xaiTierHeavy         = "heavy"
 	xaiTierCacheMaxItems = 1024
 	xaiTierCacheTTL      = 30 * time.Minute
+)
+
+var (
+	errXAIHostAuthListUnavailable = errors.New("host.auth.list unavailable")
+	errXAIHostAuthListInvalid     = errors.New("host.auth.list returned an invalid response")
 )
 
 type hostCallFunc func(method string, payload any) (json.RawMessage, error)
@@ -91,31 +97,39 @@ type xaiAuthSourceDiagnostics struct {
 }
 
 type xaiAuthSourceManager struct {
-	mu          sync.Mutex
-	fetchedAt   time.Time
-	accounts    []configuredAccount
-	tierCache   map[string]cachedXAITier
-	diagnostics xaiAuthSourceDiagnostics
+	mu        sync.Mutex
+	refreshMu sync.Mutex
+
+	fetchedAt    time.Time
+	callbackErr  error
+	hostSnapshot []configuredAccount
+	accounts     []configuredAccount
+	tierCache    map[string]cachedXAITier
+	diagnostics  xaiAuthSourceDiagnostics
 }
 
 var globalXAIAuthSource = &xaiAuthSourceManager{}
 
 func (m *xaiAuthSourceManager) hostAccounts() ([]configuredAccount, error) {
-	m.mu.Lock()
-	if time.Since(m.fetchedAt) < 3*time.Second && m.diagnostics.Source == "host_callback" {
-		accounts := cloneConfiguredAccounts(m.accounts)
-		m.mu.Unlock()
-		return accounts, nil
+	if accounts, err, ok := m.cachedHostResult(time.Now()); ok {
+		return accounts, err
 	}
-	m.mu.Unlock()
+
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	if accounts, err, ok := m.cachedHostResult(time.Now()); ok {
+		return accounts, err
+	}
 
 	raw, err := hostAuthCaller("host.auth.list", map[string]any{})
 	if err != nil {
-		return nil, err
+		m.recordHostFailure(errXAIHostAuthListUnavailable)
+		return nil, errXAIHostAuthListUnavailable
 	}
 	var response hostAuthListResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return nil, fmt.Errorf("decode host.auth.list result: %w", err)
+		m.recordHostFailure(errXAIHostAuthListInvalid)
+		return nil, errXAIHostAuthListInvalid
 	}
 	accounts := make([]configuredAccount, 0, len(response.Files))
 	metadataErrors := 0
@@ -133,11 +147,15 @@ func (m *xaiAuthSourceManager) hostAccounts() ([]configuredAccount, error) {
 		if metadataErr != nil {
 			metadataErrors++
 		}
-		email := firstNonEmptyString(entry.Email, entry.Account)
+		email := safeAuthAccountEmail(entry.AccountType, entry.Email, entry.Account)
 		authFile := firstNonEmptyString(fileNameIfJSON(entry.Name), fileNameIfJSON(entry.Path), fileNameIfJSON(entry.AuthIndex))
 		authIndex := firstNonEmptyString(entry.AuthIndex, authFile, entry.ID)
 		name := firstNonEmptyString(entry.Name, filepath.Base(entry.Path))
-		source := firstNonEmptyString(entry.Source, email, name, authIndex)
+		hostSource := strings.TrimSpace(entry.Source)
+		if looksLikeCredentialToken(hostSource) {
+			hostSource = ""
+		}
+		source := firstNonEmptyString(hostSource, email, name, authIndex)
 		planType := firstNonEmptyString(entry.PlanType, entry.Plan, entry.Subscription)
 		accounts = append(accounts, configuredAccount{
 			AuthIndex:          authIndex,
@@ -162,6 +180,8 @@ func (m *xaiAuthSourceManager) hostAccounts() ([]configuredAccount, error) {
 	now := time.Now()
 	m.mu.Lock()
 	m.fetchedAt = now
+	m.callbackErr = nil
+	m.hostSnapshot = cloneConfiguredAccounts(accounts)
 	m.accounts = cloneConfiguredAccounts(accounts)
 	m.diagnostics = xaiAuthSourceDiagnostics{
 		Source:             "host_callback",
@@ -172,6 +192,40 @@ func (m *xaiAuthSourceManager) hostAccounts() ([]configuredAccount, error) {
 	}
 	m.mu.Unlock()
 	return accounts, nil
+}
+
+func (m *xaiAuthSourceManager) cachedHostResult(now time.Time) ([]configuredAccount, error, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.fetchedAt.IsZero() {
+		return nil, nil, false
+	}
+	age := now.Sub(m.fetchedAt)
+	if age < 0 || age >= 3*time.Second {
+		return nil, nil, false
+	}
+	if m.callbackErr != nil {
+		return nil, m.callbackErr, true
+	}
+	if m.diagnostics.Source != "host_callback" || !m.diagnostics.Authoritative {
+		return nil, nil, false
+	}
+	return cloneConfiguredAccounts(m.accounts), nil, true
+}
+
+func (m *xaiAuthSourceManager) recordHostFailure(failure error) {
+	now := time.Now()
+	m.mu.Lock()
+	m.fetchedAt = now
+	m.callbackErr = failure
+	m.diagnostics = xaiAuthSourceDiagnostics{
+		Source:        "host_callback_error",
+		Authoritative: false,
+		Accounts:      len(m.accounts),
+		LastSuccessAt: m.diagnostics.LastSuccessAt,
+		LastError:     failure.Error(),
+	}
+	m.mu.Unlock()
 }
 
 func (m *xaiAuthSourceManager) mergeHostRuntime(entry *hostAuthFileEntry) error {
@@ -268,14 +322,56 @@ func (m *xaiAuthSourceManager) pruneTierCacheLocked(now time.Time) {
 	}
 }
 
-func (m *xaiAuthSourceManager) markFilesystemFallback(accounts []configuredAccount, err error) {
+func (m *xaiAuthSourceManager) markFilesystemFallback(accounts []configuredAccount, err error) []configuredAccount {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.diagnostics.Source = "filesystem_fallback"
-	m.diagnostics.Authoritative = configuredAuthDirectoryReadable()
-	m.diagnostics.Accounts = len(accounts)
-	m.diagnostics.MetadataReadErrors = 0
-	m.diagnostics.LastError = sanitizeTriggerError(err)
+	if m.callbackErr == nil && m.diagnostics.Source == "host_callback" && m.diagnostics.Authoritative {
+		return cloneConfiguredAccounts(m.accounts)
+	}
+	// A readable directory is not proof that it contains every account exposed
+	// by the host. Runtime-only entries and host-managed paths can disappear from
+	// a filesystem fallback during a transient callback failure. Preserve the
+	// last successful host snapshot for continuity, but mark the merged view as
+	// non-authoritative so missing entries cannot clear active scheduler state.
+	merged := mergeXAIAccountSnapshots(m.hostSnapshot, accounts)
+	m.accounts = cloneConfiguredAccounts(merged)
+	m.diagnostics = xaiAuthSourceDiagnostics{
+		Source:             "filesystem_fallback",
+		Authoritative:      false,
+		Accounts:           len(merged),
+		MetadataReadErrors: 0,
+		LastSuccessAt:      m.diagnostics.LastSuccessAt,
+		LastError:          sanitizeTriggerError(err),
+	}
+	return cloneConfiguredAccounts(merged)
+}
+
+func mergeXAIAccountSnapshots(hostAccounts, filesystemAccounts []configuredAccount) []configuredAccount {
+	merged := cloneConfiguredAccounts(hostAccounts)
+	for _, candidate := range filesystemAccounts {
+		candidateAliases := normalizeAccountAliases(
+			candidate.AuthFile,
+			candidate.AuthIndex,
+			candidate.AuthID,
+			candidate.Email,
+		)
+		duplicate := false
+		for _, existing := range merged {
+			if aliasesOverlap(candidateAliases, normalizeAccountAliases(
+				existing.AuthFile,
+				existing.AuthIndex,
+				existing.AuthID,
+				existing.Email,
+			)) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			merged = append(merged, candidate)
+		}
+	}
+	return merged
 }
 
 func (m *xaiAuthSourceManager) authoritative() bool {

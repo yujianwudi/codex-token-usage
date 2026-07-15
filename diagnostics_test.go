@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,6 +35,37 @@ func TestMaskAPIKeyForDisplay(t *testing.T) {
 				t.Fatalf("maskAPIKeyForDisplay(%q) = %q, want %q", tt.value, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDiagnosticPathsUseOpaqueLabels(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sensitive-user-name", "private")
+	dbPath := filepath.Join(dir, "usage.db")
+	pricePath := filepath.Join(dir, "model_prices.json")
+	for name, label := range map[string]string{
+		"database": diagnosticPathLabel(dbPath),
+		"prices":   buildModelPriceDiagnostics(modelPriceUpdateState{Path: pricePath}).Path,
+	} {
+		if label == "" || strings.Contains(label, dir) || strings.Contains(label, "sensitive-user-name") || strings.Contains(label, filepath.Base(dbPath)) || strings.Contains(label, filepath.Base(pricePath)) {
+			t.Fatalf("%s diagnostic path leaked filesystem layout: %q", name, label)
+		}
+		if !opaqueDiagnosticPathLabel(label) {
+			t.Fatalf("%s diagnostic path is not a strict opaque label: %q", name, label)
+		}
+	}
+	if opaqueDiagnosticPathLabel("secret-name#deadbeef") {
+		t.Fatal("legacy basename labels must not bypass path sanitization")
+	}
+}
+
+func TestDiagnosticPathLabelsFailClosedWithoutRandomKey(t *testing.T) {
+	oldKey := diagnosticPathLabelKey
+	diagnosticPathLabelKey = nil
+	t.Cleanup(func() { diagnosticPathLabelKey = oldKey })
+	first := diagnosticPathLabel(filepath.Join(t.TempDir(), "first-secret.db"))
+	second := diagnosticPathLabel(filepath.Join(t.TempDir(), "second-secret.db"))
+	if first != "path#0000000000000000" || second != first || !opaqueDiagnosticPathLabel(first) {
+		t.Fatalf("randomness failure did not produce a constant opaque label: %q / %q", first, second)
 	}
 }
 

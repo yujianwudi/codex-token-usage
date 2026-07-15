@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -53,8 +54,8 @@ type apiKeyFingerprintDiagnostics struct {
 
 var apiKeyFingerprintHealth = struct {
 	sync.Mutex
-	state apiKeyFingerprintDiagnostics
-}{}
+	byDB map[string]apiKeyFingerprintDiagnostics
+}{byDB: map[string]apiKeyFingerprintDiagnostics{}}
 
 type apiKeyPrivacyQuarantineSnapshot struct {
 	dbKey     string
@@ -78,9 +79,6 @@ func privacySafeAPIKeyWithError(dbPath, raw string) (string, error) {
 	if raw == "" {
 		return "", nil
 	}
-	if version, _, _, ok := parseAPIKeyFingerprint(raw); ok && version == "v1" {
-		return raw, nil
-	}
 	secret, err := loadOrCreateAPIKeySecret(dbPath)
 	if err != nil || len(secret) == 0 {
 		if err == nil {
@@ -89,7 +87,6 @@ func privacySafeAPIKeyWithError(dbPath, raw string) (string, error) {
 		recordAPIKeyFingerprintError(dbPath, err)
 		return "", fmt.Errorf("API key fingerprint secret unavailable: %w", err)
 	}
-	recordAPIKeyFingerprintSuccess()
 	if version, _, suffix, ok := parseAPIKeyFingerprint(raw); ok && version == "v0" {
 		return fingerprintLegacyV0WithSecret(secret, raw, suffix), nil
 	}
@@ -197,6 +194,33 @@ func normalizeRawAPIKey(value string) string {
 		value = strings.TrimSpace(value[len("bearer "):])
 	}
 	return value
+}
+
+func safeAuthAccountEmail(accountType string, values ...string) string {
+	normalizedType := strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(accountType)))
+	for i, value := range values {
+		// The first value is the explicit email field. The second value, when
+		// present, is the generic account field used by CPA. For api_key entries
+		// that field contains the literal credential and must never become an
+		// identity shown in summaries or cached dashboard responses.
+		if i == 1 && normalizedType == "apikey" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" || strings.ContainsAny(value, "\x00\r\n") || looksLikeCredentialToken(value) {
+			continue
+		}
+		address, err := mail.ParseAddress(value)
+		if err != nil || address.Address != value {
+			continue
+		}
+		at := strings.LastIndexByte(value, '@')
+		if at <= 0 || at >= len(value)-1 {
+			continue
+		}
+		return value
+	}
+	return ""
 }
 
 func isAPIKeyFingerprint(value string) bool {
@@ -404,23 +428,18 @@ func scanPersistentIdentityRows(ctx context.Context, store apiKeySecretStateStor
 	}
 	var lastRowID int64
 	for {
-		rows, err := store.QueryContext(ctx, `SELECT rowid, `+strings.Join(spec.columns, ", ")+` FROM `+spec.table+` WHERE rowid>? ORDER BY rowid LIMIT ?`, lastRowID, identityMigrationBatchSize)
+		rows, err := store.QueryContext(ctx, `SELECT rowid FROM `+spec.table+` WHERE rowid>? ORDER BY rowid LIMIT ?`, lastRowID, identityMigrationBatchSize)
 		if err != nil {
 			return err
 		}
-		batch := make([]storedIdentityRow, 0, identityMigrationBatchSize)
+		batch := make([]int64, 0, identityMigrationBatchSize)
 		for rows.Next() {
-			row := storedIdentityRow{values: make([]string, len(spec.columns))}
-			dest := make([]any, 0, len(spec.columns)+1)
-			dest = append(dest, &row.rowID)
-			for i := range row.values {
-				dest = append(dest, &row.values[i])
-			}
-			if err := rows.Scan(dest...); err != nil {
+			var rowID int64
+			if err := rows.Scan(&rowID); err != nil {
 				_ = rows.Close()
 				return err
 			}
-			batch = append(batch, row)
+			batch = append(batch, rowID)
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -432,8 +451,23 @@ func scanPersistentIdentityRows(ctx context.Context, store apiKeySecretStateStor
 		if len(batch) == 0 {
 			return nil
 		}
-		for _, row := range batch {
-			lastRowID = row.rowID
+		for _, rowID := range batch {
+			lastRowID = rowID
+			// A visitor may merge or delete another row from the same batch.
+			// Reload each row immediately before visiting it so a stale batch
+			// snapshot cannot resurrect or overwrite the collision winner.
+			row := storedIdentityRow{rowID: rowID, values: make([]string, len(spec.columns))}
+			dest := make([]any, 0, len(spec.columns))
+			for i := range row.values {
+				dest = append(dest, &row.values[i])
+			}
+			err := store.QueryRowContext(ctx, `SELECT `+strings.Join(spec.columns, ", ")+` FROM `+spec.table+` WHERE rowid=?`, rowID).Scan(dest...)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
 			if err := visit(row); err != nil {
 				return err
 			}
@@ -1101,7 +1135,7 @@ func bindAPIKeyFingerprintSecret(ctx context.Context, store apiKeySecretStateSto
 			return err
 		}
 	}
-	recordAPIKeyFingerprintSuccess()
+	recordAPIKeyFingerprintSuccess(dbPath)
 	return nil
 }
 
@@ -1130,7 +1164,7 @@ func verifyAPIKeyFingerprintSecretBinding(ctx context.Context, db *sql.DB, dbPat
 		recordAPIKeyFingerprintError(dbPath, err)
 		return fmt.Errorf("API key privacy quarantine reconciliation failed: %w", err)
 	}
-	recordAPIKeyFingerprintSuccess()
+	recordAPIKeyFingerprintSuccess(dbPath)
 	return nil
 }
 
@@ -1151,11 +1185,14 @@ func logAPIKeyFingerprintFallback(dbPath string, err error) {
 
 func recordAPIKeyFingerprintError(dbPath string, err error) {
 	logAPIKeyFingerprintFallback(dbPath, err)
+	key := apiKeySecretCacheKey(dbPath)
 	apiKeyFingerprintHealth.Lock()
-	apiKeyFingerprintHealth.state.Checked = true
-	apiKeyFingerprintHealth.state.Available = false
-	apiKeyFingerprintHealth.state.LastError = privacySecretDiagnosticError(err)
-	apiKeyFingerprintHealth.state.LastErrorAt = time.Now().Format(time.RFC3339)
+	state := apiKeyFingerprintHealth.byDB[key]
+	state.Checked = true
+	state.Available = false
+	state.LastError = privacySecretDiagnosticError(err)
+	state.LastErrorAt = time.Now().Format(time.RFC3339)
+	apiKeyFingerprintHealth.byDB[key] = state
 	apiKeyFingerprintHealth.Unlock()
 }
 
@@ -1187,18 +1224,29 @@ func privacySecretDiagnosticError(err error) string {
 	return text
 }
 
-func recordAPIKeyFingerprintSuccess() {
+func recordAPIKeyFingerprintSuccess(dbPath string) {
+	key := apiKeySecretCacheKey(dbPath)
 	apiKeyFingerprintHealth.Lock()
-	apiKeyFingerprintHealth.state.Checked = true
-	apiKeyFingerprintHealth.state.Available = true
-	apiKeyFingerprintHealth.state.LastError = ""
-	apiKeyFingerprintHealth.state.LastErrorAt = ""
+	state := apiKeyFingerprintHealth.byDB[key]
+	state.Checked = true
+	state.Available = true
+	state.LastError = ""
+	state.LastErrorAt = ""
+	apiKeyFingerprintHealth.byDB[key] = state
 	apiKeyFingerprintHealth.Unlock()
 }
 
-func apiKeyFingerprintStatus(ctx context.Context, db *sql.DB) apiKeyFingerprintDiagnostics {
+func apiKeyFingerprintStatus(ctx context.Context, db *sql.DB, dbPaths ...string) apiKeyFingerprintDiagnostics {
+	dbPath := ""
+	if len(dbPaths) > 0 {
+		dbPath = dbPaths[0]
+	}
+	if strings.TrimSpace(dbPath) == "" && db != nil {
+		dbPath = sqliteMainDatabasePath(ctx, db)
+	}
+	key := apiKeySecretCacheKey(dbPath)
 	apiKeyFingerprintHealth.Lock()
-	out := apiKeyFingerprintHealth.state
+	out := apiKeyFingerprintHealth.byDB[key]
 	apiKeyFingerprintHealth.Unlock()
 	if db == nil {
 		return out
@@ -1247,6 +1295,28 @@ func apiKeyFingerprintStatus(ctx context.Context, db *sql.DB) apiKeyFingerprintD
 	}
 	out.Compatibility = strings.Join(compatibility, "; ")
 	return out
+}
+
+func sqliteMainDatabasePath(ctx context.Context, db *sql.DB) string {
+	if db == nil {
+		return ""
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA database_list`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sequence int
+		var name, path string
+		if err := rows.Scan(&sequence, &name, &path); err != nil {
+			return ""
+		}
+		if name == "main" {
+			return path
+		}
+	}
+	return ""
 }
 
 func readAPIKeySecret(path string) ([]byte, error) {

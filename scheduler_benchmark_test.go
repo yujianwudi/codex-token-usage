@@ -193,6 +193,10 @@ func BenchmarkProtectedPick100Accounts50kEvents(b *testing.B) {
 	}
 	cfg := defaultPluginConfig()
 	cfg.AccountProtectionEnabled = true
+	// Reservations are part of the measured write path, but this benchmark is
+	// intended to run indefinitely without turning its own samples into an
+	// artificial hard-limit saturation test.
+	cfg.AccountProtectionReservationTTLSeconds = 0
 	globalAccountProtection.configure(cfg)
 	b.ReportAllocs()
 	b.ResetTimer()

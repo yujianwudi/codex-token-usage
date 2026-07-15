@@ -1,0 +1,417 @@
+package pluginhost
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+func TestExternalCodexTokenUsageCompatibility(t *testing.T) {
+	if pluginabi.ABIVersion != 1 || pluginabi.SchemaVersion != 1 {
+		t.Fatalf("CPA contract versions = ABI %d schema %d, want 1/1", pluginabi.ABIVersion, pluginabi.SchemaVersion)
+	}
+	expectedMethods := map[string]string{
+		"register":          pluginabi.MethodPluginRegister,
+		"reconfigure":       pluginabi.MethodPluginReconfigure,
+		"scheduler":         pluginabi.MethodSchedulerPick,
+		"usage":             pluginabi.MethodUsageHandle,
+		"management_list":   pluginabi.MethodManagementRegister,
+		"management_call":   pluginabi.MethodManagementHandle,
+		"host_auth_list":    pluginabi.MethodHostAuthList,
+		"host_auth_get":     pluginabi.MethodHostAuthGet,
+		"host_auth_runtime": pluginabi.MethodHostAuthGetRuntime,
+		"host_auth_save":    pluginabi.MethodHostAuthSave,
+	}
+	for name, method := range expectedMethods {
+		if strings.TrimSpace(method) == "" {
+			t.Fatalf("CPA method %s is empty", name)
+		}
+	}
+
+	library := strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_PLUGIN_LIBRARY"))
+	if library == "" {
+		t.Fatal("CODEX_TOKEN_USAGE_PLUGIN_LIBRARY is required")
+	}
+	if info, err := os.Stat(library); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("plugin library %q is unavailable: %v", library, err)
+	}
+
+	usageDir := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_DIR"))
+	authDir := strings.TrimSpace(os.Getenv("CPA_AUTH_DIR"))
+	if usageDir == "" || authDir == "" {
+		t.Fatal("CPA_TOKEN_USAGE_DIR and CPA_AUTH_DIR must be set before the CPA test process starts")
+	}
+	for _, dir := range []string{usageDir, authDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("create compatibility directory %q: %v", dir, err)
+		}
+	}
+
+	xaiPath := filepath.Join(authDir, "xai-compat.json")
+	xaiJSON := []byte(`{"type":"xai","email":"compat-xai@example.com","account_tier":"heavy"}`)
+	if err := os.WriteFile(xaiPath, xaiJSON, 0o600); err != nil {
+		t.Fatalf("write xAI auth: %v", err)
+	}
+
+	host := New()
+	host.runtimeConfig = &config.Config{AuthDir: authDir}
+	host.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+	xaiAuth := &coreauth.Auth{
+		ID:       "xai-compat.json",
+		Provider: "xai",
+		FileName: "xai-compat.json",
+		Label:    "compat-xai@example.com",
+		Attributes: map[string]string{
+			"path":   xaiPath,
+			"source": xaiPath,
+		},
+		Metadata: map[string]any{
+			"type":         "xai",
+			"email":        "compat-xai@example.com",
+			"account_tier": "heavy",
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	xaiAuth.EnsureIndex()
+	if _, err := host.currentAuthManager().Register(context.Background(), xaiAuth); err != nil {
+		t.Fatalf("register xAI auth: %v", err)
+	}
+	codexRuntimeAuth := &coreauth.Auth{
+		ID:       "codex-runtime-compat",
+		Provider: "codex",
+		Label:    "compat-codex@example.com",
+		Attributes: map[string]string{
+			"runtime_only": "true",
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "compat-codex@example.com",
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	codexRuntimeAuth.EnsureIndex()
+	if _, err := host.currentAuthManager().Register(context.Background(), codexRuntimeAuth); err != nil {
+		t.Fatalf("register runtime Codex auth: %v", err)
+	}
+
+	client, err := (dynamicLibraryLoader{}).Open(pluginFile{
+		ID:      "codex-token-usage",
+		Path:    library,
+		Version: strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_EXPECTED_VERSION")),
+	}, host)
+	if err != nil {
+		t.Fatalf("latest CPA loader rejected plugin: %v", err)
+	}
+	defer client.Shutdown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	configYAML := []byte(strings.Join([]string{
+		"account_protection_enabled: false",
+		"quota_trigger_enabled: false",
+		"model_price_auto_update_enabled: false",
+		"summary_precompute_enabled: false",
+	}, "\n"))
+
+	registered, err := registerRPCPlugin(ctx, host, "codex-token-usage", client, pluginabi.MethodPluginRegister, configYAML)
+	if err != nil {
+		t.Fatalf("plugin.register through latest CPA: %v", err)
+	}
+	assertCodexTokenUsageRegistration(t, registered)
+
+	reconfigured, err := registerRPCPlugin(ctx, host, "codex-token-usage", client, pluginabi.MethodPluginReconfigure, configYAML)
+	if err != nil {
+		t.Fatalf("plugin.reconfigure through latest CPA: %v", err)
+	}
+	assertCodexTokenUsageRegistration(t, reconfigured)
+
+	pick, err := reconfigured.Capabilities.Scheduler.Pick(ctx, pluginapi.SchedulerPickRequest{
+		Plugin:    reconfigured.Metadata,
+		Provider:  "codex",
+		Providers: []string{"codex"},
+		Model:     "gpt-5.5",
+		Stream:    true,
+		Options: pluginapi.SchedulerOptions{
+			Headers:  map[string][]string{"x-compat": {"latest-cpa"}},
+			Metadata: map[string]any{"cpa_commit": os.Getenv("CODEX_TOKEN_USAGE_CPA_COMMIT")},
+		},
+		Candidates: []pluginapi.SchedulerAuthCandidate{{
+			ID:       "codex-compat.json",
+			Provider: "codex",
+			Priority: 10,
+			Status:   "active",
+			Attributes: map[string]string{
+				"auth_index": "compat-index",
+				"source":     "codex-compat.json",
+				"path":       filepath.Join(authDir, "codex-compat.json"),
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("scheduler.pick through latest CPA: %v", err)
+	}
+	if pick.Handled || pick.AuthID != "" || pick.DelegateBuiltin != "" {
+		t.Fatalf("healthy scheduler response = %#v, want unhandled", pick)
+	}
+
+	protectedConfigYAML := []byte(strings.Join([]string{
+		"account_protection_enabled: true",
+		"account_protection_free_concurrency: 2",
+		"quota_trigger_enabled: false",
+		"model_price_auto_update_enabled: false",
+		"summary_precompute_enabled: false",
+	}, "\n"))
+	protected, err := registerRPCPlugin(ctx, host, "codex-token-usage", client, pluginabi.MethodPluginReconfigure, protectedConfigYAML)
+	if err != nil {
+		t.Fatalf("enable account protection through latest CPA: %v", err)
+	}
+	assertCodexTokenUsageRegistration(t, protected)
+	assertProtectedSchedulerCompatibility(t, ctx, protected)
+
+	reconfigured, err = registerRPCPlugin(ctx, host, "codex-token-usage", client, pluginabi.MethodPluginReconfigure, configYAML)
+	if err != nil {
+		t.Fatalf("restore compatibility config through latest CPA: %v", err)
+	}
+	assertCodexTokenUsageRegistration(t, reconfigured)
+
+	reconfigured.Capabilities.UsagePlugin.HandleUsage(ctx, pluginapi.UsageRecord{
+		Provider:     "codex",
+		ExecutorType: "compat",
+		Model:        "gpt-5.5",
+		AuthID:       "codex-compat.json",
+		AuthIndex:    "compat-index",
+		AuthType:     "oauth",
+		Source:       "codex-compat.json",
+		Generate:     true,
+		RequestedAt:  time.Now().UTC(),
+		Latency:      250 * time.Millisecond,
+		TTFT:         75 * time.Millisecond,
+		Detail: pluginapi.UsageDetail{
+			InputTokens:  12,
+			OutputTokens: 5,
+			TotalTokens:  17,
+		},
+		ResponseHeaders: http.Header{"x-codex-primary-used-percent": {"1"}},
+	})
+
+	registration, err := reconfigured.Capabilities.ManagementAPI.RegisterManagement(ctx, pluginapi.ManagementRegistrationRequest{
+		Plugin:           reconfigured.Metadata,
+		BasePath:         "/v0/management",
+		ResourceBasePath: "/v0/resource/plugins/codex-token-usage",
+	})
+	if err != nil {
+		t.Fatalf("management.register through latest CPA: %v", err)
+	}
+	if len(registration.Routes) != 5 || len(registration.Resources) != 1 {
+		t.Fatalf("management registration = %d routes/%d resources, want 5/1", len(registration.Routes), len(registration.Resources))
+	}
+
+	summaryRoute := findManagementRoute(t, registration.Routes, http.MethodGet, "/summary")
+	summaryResp, err := summaryRoute.Handler.HandleManagement(ctx, pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/management/plugins/codex-token-usage/summary",
+		Query:  url.Values{"window": {"24h"}, "limit": {"50"}},
+	})
+	if err != nil {
+		t.Fatalf("management.handle summary through latest CPA: %v", err)
+	}
+	if summaryResp.StatusCode != http.StatusOK {
+		t.Fatalf("summary status = %d, body=%s", summaryResp.StatusCode, summaryResp.Body)
+	}
+	assertSummaryCompatibility(t, summaryResp.Body)
+
+	resource := registration.Resources[0]
+	if resource.Handler == nil {
+		t.Fatal("dashboard resource handler is nil")
+	}
+	dashboardResp, err := resource.Handler.HandleManagement(ctx, pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/resource/plugins/codex-token-usage/dashboard",
+	})
+	if err != nil {
+		t.Fatalf("dashboard resource through latest CPA: %v", err)
+	}
+	if dashboardResp.StatusCode != http.StatusOK || !strings.Contains(string(dashboardResp.Body), "CPA Token Usage") {
+		t.Fatalf("dashboard response status=%d body_prefix=%q", dashboardResp.StatusCode, truncateCompat(string(dashboardResp.Body), 120))
+	}
+
+	commitRoute := findManagementRoute(t, registration.Routes, http.MethodPost, "/auth-import/commit")
+	importText := `[{"email":"compat-import@example.com","account_id":"compat-account","access_token":"compat-token"}]`
+	requestBody, err := json.Marshal(map[string]any{"text": importText, "overwrite": true})
+	if err != nil {
+		t.Fatalf("marshal import request: %v", err)
+	}
+	importResp, err := commitRoute.Handler.HandleManagement(ctx, pluginapi.ManagementRequest{
+		Method:  http.MethodPost,
+		Path:    "/v0/management/plugins/codex-token-usage/auth-import/commit",
+		Headers: http.Header{"content-type": {"application/json"}},
+		Body:    requestBody,
+	})
+	if err != nil {
+		t.Fatalf("auth import host callbacks through latest CPA: %v", err)
+	}
+	if importResp.StatusCode != http.StatusOK {
+		t.Fatalf("auth import status = %d, body=%s", importResp.StatusCode, importResp.Body)
+	}
+	var importResult struct {
+		Imported int `json:"imported"`
+	}
+	if err := json.Unmarshal(importResp.Body, &importResult); err != nil || importResult.Imported != 1 {
+		t.Fatalf("auth import result = %+v err=%v body=%s", importResult, err, importResp.Body)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(authDir, "codex-compat-import@example.com*.json")); len(matches) != 1 {
+		t.Fatalf("host.auth.save output = %v, want one imported auth file", matches)
+	}
+}
+
+func assertCodexTokenUsageRegistration(t *testing.T, plugin pluginapi.Plugin) {
+	t.Helper()
+	if plugin.Metadata.Name != "CPA Token Usage" {
+		t.Fatalf("plugin name = %q", plugin.Metadata.Name)
+	}
+	expectedVersion := strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_EXPECTED_VERSION"))
+	if expectedVersion == "" || plugin.Metadata.Version != expectedVersion {
+		t.Fatalf("plugin version = %q, want %q", plugin.Metadata.Version, expectedVersion)
+	}
+	if strings.TrimSpace(plugin.Metadata.Author) == "" {
+		t.Fatal("plugin author is empty")
+	}
+	if plugin.Metadata.GitHubRepository != "https://github.com/yujianwudi/codex-token-usage" {
+		t.Fatalf("plugin repository = %q", plugin.Metadata.GitHubRepository)
+	}
+	if len(plugin.Metadata.ConfigFields) == 0 {
+		t.Fatal("plugin config fields are empty")
+	}
+	if plugin.Capabilities.Scheduler == nil || plugin.Capabilities.UsagePlugin == nil || plugin.Capabilities.ManagementAPI == nil {
+		t.Fatalf("plugin capabilities = %#v, want scheduler/usage/management", plugin.Capabilities)
+	}
+}
+
+func assertProtectedSchedulerCompatibility(t *testing.T, ctx context.Context, plugin pluginapi.Plugin) {
+	t.Helper()
+	request := pluginapi.SchedulerPickRequest{
+		Plugin:    plugin.Metadata,
+		Provider:  "codex",
+		Providers: []string{"codex"},
+		Model:     "gpt-5.5",
+		Stream:    true,
+		Options: pluginapi.SchedulerOptions{
+			Headers: map[string][]string{"Session-Id": {"latest-cpa-affinity-session"}},
+		},
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{
+				ID:       "codex-affinity-a",
+				Provider: "codex",
+				Priority: 1,
+				Status:   "active",
+				Attributes: map[string]string{
+					"auth_index": "codex-affinity-a",
+					"plan_type":  "free",
+				},
+			},
+			{
+				ID:       "codex-affinity-b",
+				Provider: "codex",
+				Priority: 1,
+				Status:   "active",
+				Attributes: map[string]string{
+					"auth_index": "codex-affinity-b",
+					"plan_type":  "free",
+				},
+			},
+		},
+	}
+	for _, want := range []string{"codex-affinity-a", "codex-affinity-a", "codex-affinity-b", "codex-affinity-b"} {
+		got, err := plugin.Capabilities.Scheduler.Pick(ctx, request)
+		if err != nil {
+			t.Fatalf("protected scheduler affinity before expected %q through latest CPA: %v", want, err)
+		}
+		if !got.Handled || got.AuthID != want {
+			t.Fatalf("protected scheduler pick = %#v, want %q", got, want)
+		}
+	}
+	if _, err := plugin.Capabilities.Scheduler.Pick(ctx, request); err == nil {
+		t.Fatal("saturated protected scheduler returned no error")
+	} else {
+		var statusError interface{ StatusCode() int }
+		if !errors.As(err, &statusError) || statusError.StatusCode() != http.StatusServiceUnavailable {
+			t.Fatalf("saturated scheduler error = %T %v, want HTTP 503", err, err)
+		}
+	}
+}
+
+func findManagementRoute(t *testing.T, routes []pluginapi.ManagementRoute, method, suffix string) pluginapi.ManagementRoute {
+	t.Helper()
+	for _, route := range routes {
+		if strings.EqualFold(route.Method, method) && strings.HasSuffix(route.Path, suffix) {
+			if route.Handler == nil {
+				t.Fatalf("route %s %s has nil handler", method, route.Path)
+			}
+			return route
+		}
+	}
+	t.Fatalf("management route %s *%s not found", method, suffix)
+	return pluginapi.ManagementRoute{}
+}
+
+func assertSummaryCompatibility(t *testing.T, body []byte) {
+	t.Helper()
+	var summary struct {
+		Totals struct {
+			Requests    int64 `json:"requests"`
+			TotalTokens int64 `json:"total_tokens"`
+		} `json:"totals"`
+		XAIAccounts []struct {
+			Email   string `json:"email"`
+			XAITier string `json:"xai_tier"`
+		} `json:"xai_accounts"`
+		Accounts []struct {
+			AuthID     string `json:"auth_id"`
+			AuthIndex  string `json:"auth_index"`
+			Email      string `json:"email"`
+			Configured bool   `json:"configured"`
+			Requests   int64  `json:"requests"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(body, &summary); err != nil {
+		t.Fatalf("decode summary: %v body=%s", err, body)
+	}
+	if summary.Totals.Requests < 1 || summary.Totals.TotalTokens < 17 {
+		t.Fatalf("usage.handle was not reflected in summary: %+v", summary.Totals)
+	}
+	for _, account := range summary.XAIAccounts {
+		if account.Email == "compat-xai@example.com" && account.XAITier == "heavy" {
+			goto codexRuntime
+		}
+	}
+	t.Fatalf("host.auth.list/get result missing from xAI accounts: %+v", summary.XAIAccounts)
+
+codexRuntime:
+	for _, account := range summary.Accounts {
+		if account.AuthID == "codex-runtime-compat" && account.Email == "compat-codex@example.com" && account.Configured && account.Requests == 0 {
+			return
+		}
+	}
+	t.Fatalf("host.auth.list runtime Codex auth missing from accounts: %+v", summary.Accounts)
+}
+
+func truncateCompat(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit]
+}

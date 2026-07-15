@@ -181,7 +181,9 @@ func (s *store) pickMixedAuthOnce(ctx context.Context, req schedulerPickRequest)
 	}
 
 	eligible := highestPrioritySchedulerCandidates(available)
-	chosen := globalSchedulerRotation.pick(schedulerRotationKey(req, "mixed"), eligible)
+	rotationKey := schedulerRotationKey(req, "mixed")
+	affinityKey := schedulerAffinityKey(req, "mixed")
+	chosen := pickSchedulerCandidate(rotationKey, affinityKey, eligible)
 	if protectCodex && strings.EqualFold(strings.TrimSpace(chosen.Provider), "codex") {
 		codexEligible := make([]schedulerAuthCandidate, 0, len(eligible))
 		for _, candidate := range eligible {
@@ -193,7 +195,7 @@ func (s *store) pickMixedAuthOnce(ctx context.Context, req schedulerPickRequest)
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
-		chosen, err = s.pickProtectedAuth(ctx, opened, codexEligible, protectionCfg, schedulerRotationKey(req, "mixed")+"\x00codex")
+		chosen, err = s.pickProtectedAuth(ctx, opened, codexEligible, protectionCfg, rotationKey+"\x00codex", affinityKey)
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
