@@ -150,9 +150,40 @@ jobs:
       - name: Install Linux build dependencies
         shell: bash
         run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils ca-certificates curl file gcc git libc6-dev python3 tar unzip zip
+          packages=(binutils ca-certificates curl file gcc git libc6-dev python3 tar unzip zip)
+          apt_options=(
+            -o Acquire::Retries=2
+            -o Acquire::ForceIPv4=true
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+
+          rm -rf /var/lib/apt/lists/*
+          for attempt in 1 2 3; do
+            if apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update; then
+              break
+            fi
+            if [[ "${attempt}" -eq 3 ]]; then
+              echo "Linux package index update failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            delay=$((attempt * 15))
+            echo "Linux package index update failed; retrying in ${delay}s (${attempt}/3)" >&2
+            sleep "${delay}"
+          done
+
+          for attempt in 1 2 3; do
+            if DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y --no-install-recommends "${packages[@]}"; then
+              break
+            fi
+            if [[ "${attempt}" -eq 3 ]]; then
+              echo "Linux dependency installation failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            delay=$((attempt * 15))
+            echo "Linux dependency installation failed; retrying in ${delay}s (${attempt}/3)" >&2
+            sleep "${delay}"
+          done
           rm -rf /var/lib/apt/lists/*
 
       - name: Check out release source
