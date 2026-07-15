@@ -21,6 +21,8 @@ type schedulerStateCache struct {
 	xaiSnapshot      *xaiSchedulerSnapshot
 	codexGeneration  uint64
 	xaiGeneration    uint64
+	codexPending     int
+	xaiPending       int
 }
 
 type schedulerStateGeneration struct {
@@ -343,7 +345,7 @@ func (c *schedulerStateCache) providerGeneration(provider string) uint64 {
 func (c *schedulerStateCache) publishCodexIfGeneration(generation uint64, snapshot *codexSchedulerSnapshot) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.codexGeneration != generation {
+	if c.codexGeneration != generation || c.codexPending > 0 {
 		return false
 	}
 	c.codexGeneration++
@@ -355,7 +357,7 @@ func (c *schedulerStateCache) publishCodexIfGeneration(generation uint64, snapsh
 func (c *schedulerStateCache) publishXAIIfGeneration(generation uint64, snapshot *xaiSchedulerSnapshot) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.xaiGeneration != generation {
+	if c.xaiGeneration != generation || c.xaiPending > 0 {
 		return false
 	}
 	c.xaiGeneration++
@@ -407,11 +409,11 @@ func (c *schedulerStateCache) applySnapshotRefresh(
 	// Restriction writes and invalidation are authoritative. Providers are
 	// committed independently so activity on one provider cannot suppress the
 	// other provider's fresh database snapshot.
-	if c.codexGeneration == generation.codex {
+	if c.codexGeneration == generation.codex && c.codexPending == 0 {
 		c.codexInitialized = true
 		c.codexSnapshot = codex
 	}
-	if c.xaiGeneration == generation.xai {
+	if c.xaiGeneration == generation.xai && c.xaiPending == 0 {
 		c.xaiInitialized = true
 		c.xaiSnapshot = xai
 	}
@@ -431,7 +433,7 @@ func (c *schedulerStateCache) applyRefresh(
 	now := time.Now().Unix()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.codexGeneration == generation.codex {
+	if c.codexGeneration == generation.codex && c.codexPending == 0 {
 		if codexRestricted {
 			c.codexInitialized = false
 			c.codexSnapshot = nil
@@ -440,7 +442,7 @@ func (c *schedulerStateCache) applyRefresh(
 			c.codexSnapshot = newCodexSchedulerSnapshot(nil, nil, now)
 		}
 	}
-	if c.xaiGeneration == generation.xai {
+	if c.xaiGeneration == generation.xai && c.xaiPending == 0 {
 		if xaiRestricted {
 			c.xaiInitialized = false
 			c.xaiSnapshot = nil
@@ -488,13 +490,71 @@ func (c *schedulerStateCache) setRestricted(provider string, restricted bool) {
 	defer c.mu.Unlock()
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "codex":
+		if c.codexPending > 0 {
+			return
+		}
 		c.codexGeneration++
 		c.codexInitialized = true
 		c.codexSnapshot = newCodexSchedulerSnapshot(nil, nil, now)
 	case "xai":
+		if c.xaiPending > 0 {
+			return
+		}
 		c.xaiGeneration++
 		c.xaiInitialized = true
 		c.xaiSnapshot = newXAISchedulerSnapshot(nil, now)
+	}
+}
+
+// beginRestrictionWrite makes a provider fail closed before a durable
+// restriction row is written. Without the pending marker, a concurrent
+// scheduler refresh can publish an empty snapshot between the SQL commit and
+// the writer's post-commit invalidation.
+func (c *schedulerStateCache) beginRestrictionWrite(provider string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		c.codexGeneration++
+		c.codexPending++
+		c.codexInitialized = false
+		c.codexSnapshot = nil
+	case "xai":
+		c.xaiGeneration++
+		c.xaiPending++
+		c.xaiInitialized = false
+		c.xaiSnapshot = nil
+	}
+}
+
+// finishRestrictionWrite keeps the provider unknown until a fresh immutable
+// snapshot has observed the committed row (or confirmed that a failed write
+// changed nothing). Each completion advances the generation so a query that
+// raced the write can never publish its older result.
+func (c *schedulerStateCache) finishRestrictionWrite(provider string) {
+	c.mu.Lock()
+	changed := false
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		if c.codexPending > 0 {
+			c.codexPending--
+		}
+		c.codexGeneration++
+		c.codexInitialized = false
+		c.codexSnapshot = nil
+		changed = true
+	case "xai":
+		if c.xaiPending > 0 {
+			c.xaiPending--
+		}
+		c.xaiGeneration++
+		c.xaiInitialized = false
+		c.xaiSnapshot = nil
+		changed = true
+	}
+	c.mu.Unlock()
+	if changed && c == &globalSchedulerState {
+		globalSchedulerStateRefresher.requestRefresh()
 	}
 }
 

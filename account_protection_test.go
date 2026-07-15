@@ -385,7 +385,7 @@ func TestProtectionTokenDemotionPrefersLowerUsageCandidate(t *testing.T) {
 	}
 }
 
-func TestProtectionSaturationUsesLeastInFlightCandidate(t *testing.T) {
+func TestProtectionSaturationRejectsWithoutCreatingReservation(t *testing.T) {
 	globalSchedulerRotation.reset()
 	db := newProtectionTestDB(t)
 	cfg := defaultPluginConfig()
@@ -400,18 +400,71 @@ func TestProtectionSaturationUsesLeastInFlightCandidate(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at) VALUES ('b', 'b', '', 'free', ?, ?)`, now, now+900); err != nil {
 		t.Fatal(err)
 	}
-	got, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
+	_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
 		protectionTestCandidate("a", "free", 10), protectionTestCandidate("b", "free", 1),
 	}, cfg, "codex\x00test")
-	if err != nil {
+	var reject *schedulerRejectError
+	if !errors.As(err, &reject) || reject.Code != "account_protection_saturated" || reject.HTTPStatus != 503 {
+		t.Fatalf("error = %#v / %v, want account_protection_saturated 503", reject, err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "b" {
-		t.Fatalf("picked %q, want least-in-flight candidate b", got.ID)
+	if count != 3 {
+		t.Fatalf("reservation count = %d, want unchanged count 3", count)
 	}
 }
 
-func TestProtectionSaturationUsesPriorityBeforeTokenDemotion(t *testing.T) {
+func TestProtectionConcurrentPicksNeverExceedHardLimit(t *testing.T) {
+	globalSchedulerRotation.reset()
+	db := newProtectionTestDB(t)
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	cfg.AccountProtectionFreeConcurrency = 1
+	candidate := protectionTestCandidate("only", "free", 1)
+	const workers = 12
+	start := make(chan struct{})
+	results := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{candidate}, cfg, "codex\x00hard-limit")
+			results <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	successes := 0
+	rejections := 0
+	for err := range results {
+		if err == nil {
+			successes++
+			continue
+		}
+		var reject *schedulerRejectError
+		if !errors.As(err, &reject) || reject.Code != "account_protection_saturated" {
+			t.Fatalf("unexpected pick error: %#v / %v", reject, err)
+		}
+		rejections++
+	}
+	if successes != 1 || rejections != workers-1 {
+		t.Fatalf("successes=%d rejections=%d, want 1 and %d", successes, rejections, workers-1)
+	}
+	var reservations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations`).Scan(&reservations); err != nil {
+		t.Fatal(err)
+	}
+	if reservations != 1 {
+		t.Fatalf("reservations=%d, want hard limit 1", reservations)
+	}
+}
+
+func TestProtectionCandidateSelectionRejectsWhenEveryLimitIsReached(t *testing.T) {
 	globalSchedulerRotation.reset()
 	states := []protectionCandidate{
 		{
@@ -429,8 +482,10 @@ func TestProtectionSaturationUsesPriorityBeforeTokenDemotion(t *testing.T) {
 			Threshold: 100,
 		},
 	}
-	if got := chooseProtectedCandidate(states, "test"); got.Candidate.ID != "high" {
-		t.Fatalf("picked %q, want higher-priority saturated candidate", got.Candidate.ID)
+	_, err := chooseProtectedCandidate(states, "test")
+	var reject *schedulerRejectError
+	if !errors.As(err, &reject) || reject.Code != "account_protection_saturated" {
+		t.Fatalf("error = %#v / %v, want account_protection_saturated", reject, err)
 	}
 }
 
@@ -440,10 +495,18 @@ func TestProtectionRoundRobinsWithinSamePriority(t *testing.T) {
 		{Candidate: schedulerAuthCandidate{ID: "z-account", Priority: 1}, Limit: 5},
 		{Candidate: schedulerAuthCandidate{ID: "a-account", Priority: 1}, Limit: 5},
 	}
-	if got := chooseProtectedCandidate(states, "test"); got.Candidate.ID != "a-account" {
+	got, err := chooseProtectedCandidate(states, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Candidate.ID != "a-account" {
 		t.Fatalf("first pick = %q, want a-account", got.Candidate.ID)
 	}
-	if got := chooseProtectedCandidate(states, "test"); got.Candidate.ID != "z-account" {
+	got, err = chooseProtectedCandidate(states, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Candidate.ID != "z-account" {
 		t.Fatalf("second pick = %q, want z-account", got.Candidate.ID)
 	}
 }
@@ -770,9 +833,15 @@ func TestProtectionRotationHandlesDuplicateCandidateIDs(t *testing.T) {
 		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "b.json"}}, AuthIndex: "b", Limit: 5},
 		{Candidate: schedulerAuthCandidate{ID: "shared", Priority: 1, Attributes: map[string]string{"auth_file": "a.json"}}, AuthIndex: "a", Limit: 5},
 	}
-	first := chooseProtectedCandidate(states, "duplicate")
+	first, err := chooseProtectedCandidate(states, "duplicate")
+	if err != nil {
+		t.Fatal(err)
+	}
 	reordered := []protectionCandidate{states[1], states[0]}
-	second := chooseProtectedCandidate(reordered, "duplicate")
+	second, err := chooseProtectedCandidate(reordered, "duplicate")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if first.AuthIndex != "a" || second.AuthIndex != "b" {
 		t.Fatalf("duplicate-ID rotation = %q then %q, want a then b", first.AuthIndex, second.AuthIndex)
 	}
@@ -787,8 +856,14 @@ func TestProtectionRotationDeduplicatesExactCandidateIdentity(t *testing.T) {
 		{Candidate: duplicate, AuthIndex: "duplicate", Limit: 5},
 		{Candidate: other, AuthIndex: "other", Limit: 5},
 	}
-	first := chooseProtectedCandidate(states, "exact-duplicate")
-	second := chooseProtectedCandidate(states, "exact-duplicate")
+	first, err := chooseProtectedCandidate(states, "exact-duplicate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := chooseProtectedCandidate(states, "exact-duplicate")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if first.AuthIndex == "duplicate" || second.AuthIndex == "duplicate" || first.AuthIndex == second.AuthIndex {
 		t.Fatalf("exact duplicate participated in rotation: %q then %q", first.AuthIndex, second.AuthIndex)
 	}
@@ -898,4 +973,54 @@ func TestProtectionUsageMutexWaitHonorsContext(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("canceled usage mutex wait took %v", elapsed)
 	}
+}
+
+func TestProtectionUsageIndexServesStaleWhileRefreshing(t *testing.T) {
+	db := newProtectionTestDB(t)
+	var manager accountProtectionManager
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	manager.configure(cfg)
+	t.Cleanup(manager.stop)
+	now := time.Now().Unix()
+	since := now - 300
+	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, total_tokens) VALUES (?, 'codex', 'a', 'a', 100)`, now); err != nil {
+		t.Fatal(err)
+	}
+	index, err := manager.loadUsageIndex(context.Background(), db, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := newProtectionSnapshotWithUsageIndex(nil, index); got.Usage[0].Tokens != 100 {
+		t.Fatalf("initial tokens = %d, want 100", got.Usage[0].Tokens)
+	}
+	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, total_tokens) VALUES (?, 'codex', 'a', 'a', 200)`, now); err != nil {
+		t.Fatal(err)
+	}
+	manager.usageCacheMu.Lock()
+	manager.usageLoadedAt = time.Now().Add(-accountProtectionUsageRefreshInterval - time.Millisecond)
+	manager.usageCacheMu.Unlock()
+	started := time.Now()
+	stale, err := manager.loadUsageIndex(context.Background(), db, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("stale usage read blocked for %v", elapsed)
+	}
+	if got := stale.samples[0].Tokens; got != 100 {
+		t.Fatalf("stale tokens = %d, want cached 100", got)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.usageCacheMu.RLock()
+		current := manager.usage
+		refreshing := manager.usageRefreshing
+		manager.usageCacheMu.RUnlock()
+		if current != nil && len(current.samples) == 1 && current.samples[0].Tokens == 300 && !refreshing {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("background usage refresh did not publish the updated index")
 }

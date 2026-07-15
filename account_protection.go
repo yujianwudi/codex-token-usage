@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -27,17 +28,27 @@ type accountProtectionManager struct {
 	reservationCleanupDB *sql.DB
 	reservationCleanupAt int64
 
-	usageMu       contextMutex
-	usageDB       *sql.DB
-	usageSince    int64
-	usageLoadedAt time.Time
-	usage         *protectionUsageIndex
+	usageMu          contextMutex
+	usageCacheMu     sync.RWMutex
+	usageDB          *sql.DB
+	usageSince       int64
+	usageLoadedAt    time.Time
+	usage            *protectionUsageIndex
+	usageRefreshing  bool
+	usageGeneration  uint64
+	usageCtx         context.Context
+	usageCancel      context.CancelFunc
+	usageRefreshDone <-chan struct{}
 }
 
 const (
 	accountProtectionPlanRefreshInterval        = 30 * time.Second
 	accountProtectionPlanRefreshStopTimeout     = 100 * time.Millisecond
 	accountProtectionReservationCleanupInterval = 30 * time.Second
+	accountProtectionUsageRefreshInterval       = 500 * time.Millisecond
+	accountProtectionUsageMaxStaleness          = 5 * time.Second
+	accountProtectionUsageRefreshTimeout        = 2 * time.Second
+	accountProtectionUsageRefreshStopTimeout    = 100 * time.Millisecond
 )
 
 // contextMutex is a zero-value-ready binary semaphore. Unlike sync.Mutex, a
@@ -90,6 +101,7 @@ func (m *accountProtectionManager) configure(cfg pluginConfig) {
 	m.planLifecycleMu.Lock()
 	defer m.planLifecycleMu.Unlock()
 	m.stopPlanRefreshLocked()
+	m.stopUsageRefreshLocked()
 
 	// Auth-file discovery is intentionally a lifecycle/configuration cost. The
 	// scheduler hot path only reads this immutable alias-to-plan snapshot.
@@ -99,8 +111,11 @@ func (m *accountProtectionManager) configure(cfg pluginConfig) {
 	}
 	var plansCtx context.Context
 	var plansCancel context.CancelFunc
+	var usageCtx context.Context
+	var usageCancel context.CancelFunc
 	if cfg.AccountProtectionEnabled {
 		plansCtx, plansCancel = context.WithCancel(context.Background())
+		usageCtx, usageCancel = context.WithCancel(context.Background())
 	}
 	m.mu.Lock()
 	m.cfg = cfg
@@ -111,12 +126,24 @@ func (m *accountProtectionManager) configure(cfg pluginConfig) {
 	m.plansCtx = plansCtx
 	m.plansCancel = plansCancel
 	m.mu.Unlock()
+	m.usageCacheMu.Lock()
+	m.usageDB = nil
+	m.usageSince = 0
+	m.usageLoadedAt = time.Time{}
+	m.usage = nil
+	m.usageRefreshing = false
+	m.usageGeneration++
+	m.usageCtx = usageCtx
+	m.usageCancel = usageCancel
+	m.usageRefreshDone = nil
+	m.usageCacheMu.Unlock()
 }
 
 func (m *accountProtectionManager) stop() {
 	m.planLifecycleMu.Lock()
 	defer m.planLifecycleMu.Unlock()
 	m.stopPlanRefreshLocked()
+	m.stopUsageRefreshLocked()
 }
 
 func (m *accountProtectionManager) stopPlanRefreshLocked() {
@@ -344,7 +371,7 @@ func protectionCandidateFor(candidate schedulerAuthCandidate, cfg pluginConfig, 
 	}
 }
 
-func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []schedulerAuthCandidate, cfg pluginConfig, rotationKey string) (schedulerAuthCandidate, error) {
+func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []schedulerAuthCandidate, cfg pluginConfig, rotationKey string, affinityKeys ...string) (schedulerAuthCandidate, error) {
 	configuredPlans := globalAccountProtection.configuredPlans()
 	aliasSets := protectionCandidateAliasSets(candidates)
 	now := time.Now().Unix()
@@ -380,7 +407,10 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		state.InFlight, state.Tokens = snapshot.metrics(state.Aliases)
 		states = append(states, state)
 	}
-	chosen := chooseProtectedCandidate(states, rotationKey)
+	chosen, err := chooseProtectedCandidate(states, rotationKey, affinityKeys...)
+	if err != nil {
+		return schedulerAuthCandidate{}, err
+	}
 	chosenIdentity := schedulerCandidateIdentity(chosen.Candidate)
 	storedAuthID, storedAuthIndex, storedSource, storedAuthFile, err := privacySafeSchedulerIdentity(
 		s.privacyDatabasePath(), chosen.Candidate, chosen.AuthID, chosen.AuthIndex, chosen.Source, chosenIdentity.AuthFile,
@@ -403,7 +433,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`, storedAuthID, storedAuthIndex, storedSource, stor
 	return chosen.Candidate, nil
 }
 
-func chooseProtectedCandidate(states []protectionCandidate, rotationKey string) protectionCandidate {
+func chooseProtectedCandidate(states []protectionCandidate, rotationKey string, affinityKeys ...string) (protectionCandidate, error) {
+	affinityKey := firstNonEmptyString(affinityKeys...)
+	if bound, ok := boundProtectedCandidate(states, affinityKey); ok && bound.InFlight < bound.Limit {
+		return bound, nil
+	}
 	eligible := make([]protectionCandidate, 0, len(states))
 	for _, state := range states {
 		demoted := state.Threshold > 0 && state.Tokens >= state.Threshold
@@ -412,7 +446,7 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey string) 
 		}
 	}
 	if len(eligible) > 0 {
-		return rotateProtectedCandidate(eligible, rotationKey+"\x00normal")
+		return rotateProtectedCandidate(eligible, rotationKey+"\x00normal", affinityKey), nil
 	}
 	for _, state := range states {
 		if state.InFlight < state.Limit {
@@ -420,23 +454,60 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey string) 
 		}
 	}
 	if len(eligible) > 0 {
-		return rotateProtectedCandidate(eligible, rotationKey+"\x00demoted")
+		return rotateProtectedCandidate(eligible, rotationKey+"\x00demoted", affinityKey), nil
 	}
-	minInFlight := states[0].InFlight
-	for _, state := range states[1:] {
-		if state.InFlight < minInFlight {
-			minInFlight = state.InFlight
-		}
+	return protectionCandidate{}, &schedulerRejectError{
+		Code:       "account_protection_saturated",
+		Message:    "all Codex auth candidates are at their configured concurrency limit; retry after an in-flight request completes",
+		HTTPStatus: http.StatusServiceUnavailable,
 	}
-	for _, state := range states {
-		if state.InFlight == minInFlight {
-			eligible = append(eligible, state)
-		}
-	}
-	return rotateProtectedCandidate(eligible, rotationKey+"\x00saturated")
 }
 
-func rotateProtectedCandidate(states []protectionCandidate, rotationKey string) protectionCandidate {
+func (m *accountProtectionManager) stopUsageRefreshLocked() {
+	m.usageCacheMu.Lock()
+	cancel := m.usageCancel
+	done := m.usageRefreshDone
+	m.usageCancel = nil
+	m.usageCtx = nil
+	m.usageRefreshDone = nil
+	m.usageRefreshing = false
+	m.usageGeneration++
+	m.usageDB = nil
+	m.usageSince = 0
+	m.usageLoadedAt = time.Time{}
+	m.usage = nil
+	m.usageCacheMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done == nil {
+		return
+	}
+	timer := time.NewTimer(accountProtectionUsageRefreshStopTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+}
+
+func boundProtectedCandidate(states []protectionCandidate, affinityKey string) (protectionCandidate, bool) {
+	candidates, byIdentity := protectionSelectionCandidates(states)
+	chosen, ok := globalSchedulerAffinity.pick(affinityKey, candidates)
+	if !ok {
+		return protectionCandidate{}, false
+	}
+	state, ok := byIdentity[schedulerCandidateRotationIdentity(chosen)]
+	return state, ok
+}
+
+func rotateProtectedCandidate(states []protectionCandidate, rotationKey string, affinityKeys ...string) protectionCandidate {
+	candidates, byIdentity := protectionSelectionCandidates(states)
+	chosen := pickSchedulerCandidate(rotationKey, firstNonEmptyString(affinityKeys...), candidates)
+	return byIdentity[schedulerCandidateRotationIdentity(chosen)]
+}
+
+func protectionSelectionCandidates(states []protectionCandidate) ([]schedulerAuthCandidate, map[string]protectionCandidate) {
 	candidates := make([]schedulerAuthCandidate, 0, len(states))
 	byIdentity := make(map[string]protectionCandidate, len(states))
 	for _, state := range states {
@@ -450,8 +521,7 @@ func rotateProtectedCandidate(states []protectionCandidate, rotationKey string) 
 		byIdentity[identity] = state
 		candidates = append(candidates, candidate)
 	}
-	chosen := globalSchedulerRotation.pick(rotationKey, candidates)
-	return byIdentity[schedulerCandidateRotationIdentity(chosen)]
+	return candidates, byIdentity
 }
 
 func protectionCandidateAliasSets(candidates []schedulerAuthCandidate) [][]string {
@@ -522,22 +592,127 @@ func (m *accountProtectionManager) loadUsageSnapshot(ctx context.Context, db *sq
 }
 
 func (m *accountProtectionManager) loadUsageIndex(ctx context.Context, db *sql.DB, since int64) (*protectionUsageIndex, error) {
+	now := time.Now()
+	if usage, fresh, stale := m.cachedUsageIndex(db, since, now); fresh {
+		return usage, nil
+	} else if stale && m.startUsageRefresh(db, since, now) {
+		return usage, nil
+	}
+	return m.loadUsageIndexSync(ctx, db, since)
+}
+
+func (m *accountProtectionManager) cachedUsageIndex(db *sql.DB, since int64, now time.Time) (*protectionUsageIndex, bool, bool) {
+	m.usageCacheMu.RLock()
+	defer m.usageCacheMu.RUnlock()
+	if m.usageDB != db || m.usage == nil || since < m.usageSince {
+		return nil, false, false
+	}
+	maxAdvance := int64(accountProtectionUsageMaxStaleness/time.Second) + 1
+	if since-m.usageSince > maxAdvance {
+		return nil, false, false
+	}
+	age := now.Sub(m.usageLoadedAt)
+	if age < 0 {
+		age = 0
+	}
+	return m.usage, age < accountProtectionUsageRefreshInterval, age < accountProtectionUsageMaxStaleness
+}
+
+func (m *accountProtectionManager) startUsageRefresh(db *sql.DB, since int64, now time.Time) bool {
+	m.usageCacheMu.Lock()
+	defer m.usageCacheMu.Unlock()
+	if m.usageDB != db || m.usage == nil || since < m.usageSince {
+		return false
+	}
+	maxAdvance := int64(accountProtectionUsageMaxStaleness/time.Second) + 1
+	if since-m.usageSince > maxAdvance {
+		return false
+	}
+	if now.Sub(m.usageLoadedAt) < accountProtectionUsageRefreshInterval {
+		return true
+	}
+	if m.usageRefreshing {
+		return true
+	}
+	ctx := m.usageCtx
+	if ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	done := make(chan struct{})
+	generation := m.usageGeneration
+	m.usageRefreshing = true
+	m.usageRefreshDone = done
+	go m.refreshUsageIndex(ctx, generation, db, since, done)
+	return true
+}
+
+func (m *accountProtectionManager) refreshUsageIndex(ctx context.Context, generation uint64, db *sql.DB, since int64, done chan struct{}) {
+	defer close(done)
+	defer m.finishUsageRefresh(ctx, generation, done)
+	refreshCtx, cancel := context.WithTimeout(ctx, accountProtectionUsageRefreshTimeout)
+	defer cancel()
+	if err := m.usageMu.lock(refreshCtx); err != nil {
+		return
+	}
+	defer m.usageMu.unlock()
+	if refreshCtx.Err() != nil || !m.usageRefreshCurrent(ctx, generation, done) {
+		return
+	}
+	usage, err := loadProtectionUsageSnapshot(refreshCtx, db, since)
+	if err != nil || refreshCtx.Err() != nil {
+		return
+	}
+	index := newProtectionUsageIndex(usage)
+	m.usageCacheMu.Lock()
+	if m.usageCtx == ctx && m.usageGeneration == generation && m.usageRefreshDone == done && ctx.Err() == nil {
+		m.usageDB = db
+		m.usageSince = since
+		m.usageLoadedAt = time.Now()
+		m.usage = index
+	}
+	m.usageCacheMu.Unlock()
+}
+
+func (m *accountProtectionManager) usageRefreshCurrent(ctx context.Context, generation uint64, done <-chan struct{}) bool {
+	m.usageCacheMu.RLock()
+	defer m.usageCacheMu.RUnlock()
+	return m.usageCtx == ctx && m.usageGeneration == generation && m.usageRefreshDone == done && ctx.Err() == nil
+}
+
+func (m *accountProtectionManager) finishUsageRefresh(ctx context.Context, generation uint64, done <-chan struct{}) {
+	m.usageCacheMu.Lock()
+	defer m.usageCacheMu.Unlock()
+	if m.usageCtx == ctx && m.usageGeneration == generation && m.usageRefreshDone == done {
+		m.usageRefreshing = false
+		m.usageRefreshDone = nil
+	}
+}
+
+func (m *accountProtectionManager) loadUsageIndexSync(ctx context.Context, db *sql.DB, since int64) (*protectionUsageIndex, error) {
 	if err := m.usageMu.lock(ctx); err != nil {
 		return nil, err
 	}
 	defer m.usageMu.unlock()
-	if m.usageDB == db && m.usageSince == since && time.Since(m.usageLoadedAt) < 250*time.Millisecond {
-		return m.usage, nil
+	if usage, fresh, _ := m.cachedUsageIndex(db, since, time.Now()); fresh {
+		return usage, nil
 	}
+	m.usageCacheMu.RLock()
+	generation := m.usageGeneration
+	m.usageCacheMu.RUnlock()
 	usage, err := loadProtectionUsageSnapshot(ctx, db, since)
 	if err != nil {
 		return nil, err
 	}
-	m.usageDB = db
-	m.usageSince = since
-	m.usageLoadedAt = time.Now()
-	m.usage = newProtectionUsageIndex(usage)
-	return m.usage, nil
+	index := newProtectionUsageIndex(usage)
+	m.usageCacheMu.Lock()
+	if m.usageGeneration == generation {
+		m.usageDB = db
+		m.usageSince = since
+		m.usageLoadedAt = time.Now()
+		m.usage = index
+	}
+	m.usageCacheMu.Unlock()
+	return index, nil
 }
 
 type protectionReservationSample struct {

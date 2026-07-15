@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.36"
+	pluginVersion    = "0.1.37"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/yujianwudi/codex-token-usage"
 )
@@ -415,6 +415,7 @@ func cliproxyPluginShutdown() {
 	// maintenance pass that was already in flight can republish a snapshot after
 	// the earlier invalidation while shutdown is still joining other workers.
 	globalSchedulerState.invalidate()
+	globalSchedulerAffinity.reset()
 	globalStore.close()
 }
 
@@ -741,6 +742,7 @@ func configurePlugin(request []byte) error {
 	}
 	cfg = normalizePluginConfig(cfg)
 	globalSchedulerStateRefresher.stop()
+	globalSchedulerAffinity.reset()
 	globalAccountProtection.configure(cfg)
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
@@ -1663,7 +1665,7 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 			return struct{}{}, err
 		}
 		configuredAccounts := readConfiguredAuthAccounts()
-		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, configuredAuthDirectoryReadable()); err != nil {
+		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, globalCodexAuthSource.authoritative()); err != nil {
 			return struct{}{}, err
 		}
 		if err := globalSchedulerState.refresh(ctx, db); err != nil {
@@ -1972,6 +1974,8 @@ func recordInvalidAuthIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord,
 }
 
 func upsertInvalidAuth(ctx context.Context, db *sql.DB, rec usageRecord, status int, reason, authID, authFile string, authFileMTime int64, invalidatedAt int64) error {
+	globalSchedulerState.beginRestrictionWrite("codex")
+	defer globalSchedulerState.finishRestrictionWrite("codex")
 	_, err := db.ExecContext(ctx, `
 INSERT INTO invalid_auths (
   auth_id, auth_index, source, provider, reason, invalidated_at, active,
@@ -1990,9 +1994,6 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider),
 		reason, invalidatedAt, status, authFile, authFileMTime,
 	)
-	if err == nil {
-		globalSchedulerState.invalidateProvider("codex")
-	}
 	return err
 }
 
@@ -2179,6 +2180,8 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 	normalizeInt64Ptr(primaryReset)
 	normalizeInt64Ptr(secondaryReset)
 	resetAt, window, reason := classifyCodexBan(rec.ResponseHeaders, primaryPct, primaryReset, secondaryPct, secondaryReset, now)
+	globalSchedulerState.beginRestrictionWrite("codex")
+	defer globalSchedulerState.finishRestrictionWrite("codex")
 	_, err := db.ExecContext(ctx, `
 INSERT INTO autoban_bans (
   auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
@@ -2204,9 +2207,6 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider), window, reason, now, resetAt, status,
 		primaryPct, primaryReset, secondaryPct, secondaryReset,
 	)
-	if err == nil {
-		globalSchedulerState.invalidateProvider("codex")
-	}
 	return err
 }
 
@@ -2779,6 +2779,22 @@ type quotaTriggerHTTPResponse struct {
 	Body       []byte              `json:"body"`
 }
 
+var quotaTriggerHTTPClient = newQuotaTriggerHTTPClient()
+
+func newQuotaTriggerHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Quota endpoints are fixed first-party APIs and are not expected to
+			// redirect. Refusing every redirect prevents custom account headers
+			// from being forwarded to another origin and keeps Authorization from
+			// being trusted merely because the target is a subdomain.
+			return errors.New("quota trigger redirects are not allowed")
+		},
+	}
+}
+
 func codexProbeRequestBody(model string) ([]byte, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -2837,7 +2853,7 @@ func doQuotaTriggerHTTPRequest(ctx context.Context, method, targetURL string, he
 			req.Header.Add(key, value)
 		}
 	}
-	httpResp, err := http.DefaultClient.Do(req)
+	httpResp, err := quotaTriggerHTTPClient.Do(req)
 	if err != nil {
 		return quotaTriggerHTTPResponse{}, nil, err
 	}
@@ -2872,7 +2888,7 @@ func executeQuotaUsageRequest(ctx context.Context, db *sql.DB, dbPath string, ac
 	if account.ChatGPTAccountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", account.ChatGPTAccountID)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := quotaTriggerHTTPClient.Do(req)
 	if err != nil {
 		run.Error = sanitizeTriggerError(err)
 		run.FinishedAt = time.Now().Unix()
@@ -3451,14 +3467,16 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if len(available) == 0 {
 		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now)
 	}
+	rotationKey := schedulerRotationKey(req, "codex")
+	affinityKey := schedulerAffinityKey(req, "codex")
 	if protectionCfg.AccountProtectionEnabled {
-		chosen, err := s.pickProtectedAuth(ctx, db, available, protectionCfg, schedulerRotationKey(req, "codex"))
+		chosen, err := s.pickProtectedAuth(ctx, db, available, protectionCfg, rotationKey, affinityKey)
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
 		return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
 	}
-	chosen := globalSchedulerRotation.pick(schedulerRotationKey(req, "codex"), available)
+	chosen := pickSchedulerCandidate(rotationKey, affinityKey, available)
 	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
 }
 
@@ -3661,6 +3679,12 @@ LIMIT 1000`, now, now)
 		return err
 	}
 	defer rows.Close()
+	restrictionWritePending := false
+	defer func() {
+		if restrictionWritePending {
+			globalSchedulerState.finishRestrictionWrite("codex")
+		}
+	}()
 	for rows.Next() {
 		var authID, authIndex, source, provider string
 		var requestedAt int64
@@ -3686,6 +3710,10 @@ LIMIT 1000`, now, now)
 		}
 		if hasLaterSuccessfulUsage(ctx, db, rec, requestedAt) {
 			continue
+		}
+		if !restrictionWritePending {
+			globalSchedulerState.beginRestrictionWrite("codex")
+			restrictionWritePending = true
 		}
 		_, err := db.ExecContext(ctx, `
 INSERT INTO autoban_bans (
@@ -3726,7 +3754,7 @@ WHERE (autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at)
 
 func backfillWorkspaceDeactivatedAuthsFromUsage(ctx context.Context, db *sql.DB) error {
 	configured := readConfiguredAuthAccounts()
-	authDirReadable := configuredAuthDirectoryReadable()
+	authDirReadable := globalCodexAuthSource.authoritative()
 	rows, err := db.QueryContext(ctx, `
 WITH latest AS (
   SELECT
@@ -3784,7 +3812,7 @@ LIMIT 1000`)
 
 func backfillWorkspaceDeactivatedAuthsFromQuotaTriggerRuns(ctx context.Context, db *sql.DB) error {
 	configured := readConfiguredAuthAccounts()
-	authDirReadable := configuredAuthDirectoryReadable()
+	authDirReadable := globalCodexAuthSource.authoritative()
 	rows, err := db.QueryContext(ctx, `
 WITH latest AS (
   SELECT

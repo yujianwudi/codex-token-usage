@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -239,6 +240,86 @@ func TestConfiguredAuthFilesCacheInvalidatesOnFileChange(t *testing.T) {
 	if len(third) != 1 || third[0].PlanType != "team" {
 		t.Fatalf("cache did not invalidate: %+v", third)
 	}
+}
+
+func TestConfiguredAuthFilesRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", dir)
+	target := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(target, []byte(`{"provider":"xai","token":"must-not-be-read"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "linked.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if accounts := readConfiguredAuthFiles(); len(accounts) != 0 {
+		t.Fatalf("symlinked auth JSON was read: %+v", accounts)
+	}
+	if configuredAuthDirectoryReadable() {
+		t.Fatal("directory containing symlinked auth JSON was treated as authoritative")
+	}
+}
+
+func TestConfiguredAuthFilesRejectsMalformedJSONAuthoritatively(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "broken.json"), []byte(`{"provider":"codex"`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if accounts := readConfiguredAuthFiles(); len(accounts) != 0 {
+		t.Fatalf("malformed auth JSON was read: %+v", accounts)
+	}
+	if configuredAuthDirectoryReadable() {
+		t.Fatal("directory containing malformed auth JSON was treated as authoritative")
+	}
+}
+
+func TestConfiguredAuthFilesRejectsOversizedFileAndTotal(t *testing.T) {
+	t.Run("single file", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("CPA_AUTH_DIR", dir)
+		path := filepath.Join(dir, "oversized.json")
+		file, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Truncate(maxConfiguredAuthFileBytes + 1); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if accounts := readConfiguredAuthFiles(); len(accounts) != 0 {
+			t.Fatalf("oversized auth JSON was read: %+v", accounts)
+		}
+		if configuredAuthDirectoryReadable() {
+			t.Fatal("directory containing oversized auth JSON was treated as authoritative")
+		}
+	})
+
+	t.Run("aggregate", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("CPA_AUTH_DIR", dir)
+		for i := 0; i < int(maxConfiguredAuthTotalBytes/maxConfiguredAuthFileBytes)+1; i++ {
+			path := filepath.Join(dir, "account-"+strconv.Itoa(i)+".json")
+			file, err := os.Create(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Truncate(maxConfiguredAuthFileBytes); err != nil {
+				_ = file.Close()
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, _, err := configuredAuthDirectorySnapshot(dir); err == nil {
+			t.Fatal("aggregate auth JSON size limit was not enforced")
+		}
+	})
 }
 
 func TestExternalUseScanIsCappedAt24Hours(t *testing.T) {

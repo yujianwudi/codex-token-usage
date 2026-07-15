@@ -18,7 +18,10 @@ make_mock() {
 
 make_mock uname 'echo Darwin'
 make_mock file 'echo "Mach-O 64-bit dynamically linked shared library x86_64"'
+# These snippets are written into mock executables and expand when the mocks run.
+# shellcheck disable=SC2016
 make_mock lipo 'echo "${MOCK_MACHO_ARCH:-x86_64}"'
+# shellcheck disable=SC2016
 make_mock otool 'printf "      cmd LC_BUILD_VERSION\\n    minos %s\\n" "${MOCK_MACOS_MIN:-12.0}"'
 
 PATH="${mock_bin}:${PATH}" MOCK_MACHO_ARCH=x86_64 MOCK_MACOS_MIN=12.0 \

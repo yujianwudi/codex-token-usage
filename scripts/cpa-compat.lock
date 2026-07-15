@@ -1,0 +1,4 @@
+CPA_REPOSITORY=https://github.com/router-for-me/CLIProxyAPI.git
+CPA_COMMIT=b6ce0beecd31dff389d3190f7db6d7a1d4ce0e7e
+CPA_ABI_VERSION=1
+CPA_SCHEMA_VERSION=1

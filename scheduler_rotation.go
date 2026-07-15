@@ -39,10 +39,18 @@ func schedulerRotationKey(req schedulerPickRequest, provider string) string {
 	if provider == "" {
 		provider = strings.ToLower(strings.TrimSpace(req.Provider))
 	}
-	return provider + "\x00" + strings.ToLower(strings.TrimSpace(req.Model))
+	rotationKey := provider + "\x00" + strings.ToLower(strings.TrimSpace(req.Model))
+	return schedulerSelectionKey(rotationKey, schedulerAffinityKey(req, provider))
 }
 
 func (m *schedulerRotationManager) pick(key string, candidates []schedulerAuthCandidate) schedulerAuthCandidate {
+	rotationKey, affinityKey := splitSchedulerSelectionKey(key)
+	return globalSchedulerAffinity.pickOrBind(affinityKey, candidates, func() schedulerAuthCandidate {
+		return m.pickRotated(rotationKey, candidates)
+	})
+}
+
+func (m *schedulerRotationManager) pickRotated(key string, candidates []schedulerAuthCandidate) schedulerAuthCandidate {
 	ordered := highestPrioritySchedulerChoices(candidates)
 	if len(ordered) == 0 {
 		return schedulerAuthCandidate{}

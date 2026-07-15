@@ -60,6 +60,12 @@ jobs:
               exit 1
             fi
             release_ref="${GITHUB_REF_NAME}"
+
+            git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+            if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+              echo "Stable release tags must point to a commit contained in origin/main" >&2
+              exit 1
+            fi
           else
             requested="${REQUESTED_VERSION#v}"
             if [[ -z "${requested}" ]]; then
@@ -94,10 +100,12 @@ jobs:
             publish=true
           fi
 
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "publish=${publish}" >> "${GITHUB_OUTPUT}"
-          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "publish=${publish}"
+            echo "prerelease=${prerelease}"
+          } >> "${GITHUB_OUTPUT}"
 
   source-security:
     name: Source security gate
@@ -116,12 +124,22 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Verify module
-        run: go mod verify
+      - name: Verify module and release compliance
+        shell: bash
+        run: |
+          go mod download
+          go mod verify
+          go mod tidy -diff
+          bash scripts/check-third-party-notices.sh
+          bash scripts/check-version-consistency.sh
 
       - name: Source vulnerability scan
         shell: bash
         run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" -mode=source ./...
+
+      - name: Verify pinned latest CLIProxyAPI compatibility
+        shell: bash
+        run: bash scripts/check-cpa-compat.sh
 
   build-linux:
     name: Build linux ${{ matrix.goarch }}
@@ -391,6 +409,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Check out release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
       - name: Download verified release bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -466,6 +489,35 @@ jobs:
             fi
           fi
 
+      - name: Resolve previous published release
+        id: previous-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_IS_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        run: |
+          previous_tag="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+              jq -s 'add' |
+              bash scripts/select-previous-release-tag.sh \
+                "${RELEASE_TAG}" \
+                "${RELEASE_IS_PRERELEASE}"
+          )"
+          if [[ -n "${previous_tag}" ]]; then
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${previous_tag}" >/dev/null
+            git fetch --force --no-tags origin "refs/tags/${previous_tag}:refs/tags/${previous_tag}"
+            previous_commit="$(git rev-list -n 1 "${previous_tag}")"
+            if [[ -z "${previous_commit}" ]] || ! git merge-base --is-ancestor "${previous_commit}" "${GITHUB_SHA}"; then
+              echo "Previous published release ${previous_tag} is not an ancestor of ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+            echo "Generating release notes from previous published release ${previous_tag}"
+          else
+            echo "No previous published release found; GitHub will generate initial release notes"
+          fi
+          echo "tag=${previous_tag}" >> "${GITHUB_OUTPUT}"
+
       - name: Attest release provenance
         if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -481,6 +533,7 @@ jobs:
           files: release-assets/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+          previous_tag: ${{ steps.previous-release.outputs.tag }}
           tag_name: ${{ needs.validate.outputs.tag }}
           target_commitish: ${{ github.sha }}
           prerelease: ${{ needs.validate.outputs.prerelease }}

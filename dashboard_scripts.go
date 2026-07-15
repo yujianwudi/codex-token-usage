@@ -57,6 +57,7 @@ let loading=false;
 let summaryAbortController=null;
 let summaryStaleRefreshTimer=null;
 const summaryWindowCache=new Map();
+let authImportReadGeneration=0;
 let transientManagementKey='';
 let rejectedManagementKey='';
 let rejectedManagementKeyAt=0;
@@ -303,14 +304,19 @@ function openAuthImportModal(){
   authImportModal.hidden=false;
   setTimeout(()=>authImportTextEl.focus(),0);
 }
-function closeAuthImportModal(){authImportModal.hidden=true}
-function clearAuthImport(){
+function wipeAuthImportSecrets(){
+  authImportReadGeneration++;
   authImportTextEl.value='';
   document.getElementById('auth-import-files').value='';
+  document.getElementById('auth-import-overwrite').checked=false;
+}
+function closeAuthImportModal(){wipeAuthImportSecrets();authImportModal.hidden=true}
+function clearAuthImport(){
+  wipeAuthImportSecrets();
   authImportResultsEl.innerHTML='';
   setAuthImportStatus('已清空，等待新的账号内容。','ok');
 }
-function closeBatchProxyModal(){batchProxyModal.hidden=true}
+function closeBatchProxyModal(){batchProxyUrlEl.value='';batchProxyModal.hidden=true}
 function openInvalidAuthModal(){
   if(isXAIPool())return;
   invalidAuthPage=1;
@@ -1069,13 +1075,18 @@ function setAuthImportStatus(text,tone){
   if(tone)authImportStatusEl.classList.add(tone);
 }
 async function readAuthImportFiles(e){
+  const generation=++authImportReadGeneration;
   const files=Array.from((e.target&&e.target.files)||[]);
   if(!files.length)return;
   setAuthImportStatus('正在读取 '+files.length+' 个文件...','');
   const parts=[];
   for(const file of files){
-    try{parts.push('=== '+file.name+' ===\n'+await file.text())}catch(err){parts.push('=== '+file.name+' 读取失败 ===')}
+    let content='';
+    try{content=await file.text()}catch(err){content=null}
+    if(generation!==authImportReadGeneration)return;
+    parts.push(content===null?'=== '+file.name+' 读取失败 ===':'=== '+file.name+' ===\n'+content);
   }
+  if(generation!==authImportReadGeneration)return;
   authImportTextEl.value=[authImportTextEl.value.trim(),parts.join('\n')].filter(Boolean).join('\n');
   setAuthImportStatus('已读取 '+files.length+' 个文件，可以识别预览。','ok');
 }
@@ -1112,6 +1123,7 @@ async function commitAuthImport(){
     const result=await requestAuthImport(managementAuthImportCommitApi);if(!result)return;
     renderAuthImportResults(result);
     const tone=(result.failed||0)?'warn':'ok';
+    wipeAuthImportSecrets();
     setAuthImportStatus('导入完成：成功 '+fmt(result.imported||0)+'，跳过 '+fmt(result.skipped||0)+'，失败 '+fmt(result.failed||0)+'。',tone);
     await load(true,true);
   }catch(e){setAuthImportStatus('导入失败：'+e.message,'bad')}
@@ -1208,6 +1220,7 @@ async function writeBatchProxy(proxy,donePrefix,failPrefix,progressPrefix){
       setBatchProxyStatus(progressPrefix+ok+' / 失败 '+failed+' / 总计 '+files.length,'');
     }
     setBatchProxyStatus(donePrefix+ok+' 个，失败 '+failed+' 个。',failed?'warn':'ok');
+    if(failed===0)batchProxyUrlEl.value='';
   }catch(e){
     setBatchProxyStatus(failPrefix+e.message,'bad');
   }finally{

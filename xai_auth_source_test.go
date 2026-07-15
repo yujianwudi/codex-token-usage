@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -107,6 +109,38 @@ func TestXAIHostAuthSourceIsAuthoritativeAndFiltersProvider(t *testing.T) {
 	}
 }
 
+func TestXAIHostAuthSourceDoesNotExposeAPIKeyAccount(t *testing.T) {
+	oldCaller := hostAuthCaller
+	t.Cleanup(func() { hostAuthCaller = oldCaller })
+	secret := "xai-secret-account-value-1234567890"
+	m := &xaiAuthSourceManager{}
+	hostAuthCaller = func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case "host.auth.list":
+			return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{
+				AuthIndex: "xai-key", Provider: "xai", AccountType: "api_key", Account: secret, Source: secret,
+			}}})
+		case "host.auth.get_runtime":
+			return json.Marshal(hostAuthRuntimeResponse{Auth: hostAuthFileEntry{AuthIndex: "xai-key", Status: "ready"}})
+		case "host.auth.get":
+			return json.Marshal(hostAuthGetResponse{AuthIndex: "xai-key", JSON: json.RawMessage(`{}`)})
+		default:
+			return nil, os.ErrNotExist
+		}
+	}
+	accounts, err := m.hostAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(accounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("xAI host auth identity exposed an API key account: %s", encoded)
+	}
+}
+
 func TestXAIHostAuthSourceFallsBackToFiles(t *testing.T) {
 	oldCaller := hostAuthCaller
 	oldSource := globalXAIAuthSource
@@ -123,8 +157,122 @@ func TestXAIHostAuthSourceFallsBackToFiles(t *testing.T) {
 		t.Fatalf("accounts=%+v, want filesystem fallback Free account", accounts)
 	}
 	status := globalXAIAuthSource.status()
-	if status.Source != "filesystem_fallback" || !status.Authoritative {
-		t.Fatalf("source status=%+v, want authoritative filesystem fallback", status)
+	if status.Source != "filesystem_fallback" || status.Authoritative {
+		t.Fatalf("source status=%+v, want non-authoritative filesystem fallback", status)
+	}
+}
+
+func TestXAIHostAuthSourceCachesInvalidResponseClassification(t *testing.T) {
+	oldCaller := hostAuthCaller
+	t.Cleanup(func() { hostAuthCaller = oldCaller })
+	var calls int
+	m := &xaiAuthSourceManager{}
+	hostAuthCaller = func(string, any) (json.RawMessage, error) {
+		calls++
+		return json.RawMessage(`{"files":`), nil
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := m.hostAccounts(); !errors.Is(err, errXAIHostAuthListInvalid) {
+			t.Fatalf("call %d error = %v, want invalid response", i+1, err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("host callback calls = %d, want cached invalid result", calls)
+	}
+}
+
+func TestXAIHostAuthSourceFallbackPreservesLastHostSnapshot(t *testing.T) {
+	oldCaller := hostAuthCaller
+	oldSource := globalXAIAuthSource
+	t.Cleanup(func() { hostAuthCaller = oldCaller; globalXAIAuthSource = oldSource })
+	dir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "xai-file.json"), []byte(`{"provider":"xai","email":"file@example.com","note":"free"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	globalXAIAuthSource = &xaiAuthSourceManager{}
+	hostAuthCaller = func(method string, payload any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{
+			AuthIndex: "runtime-only",
+			Provider:  "xai",
+			Email:     "runtime@example.com",
+			Note:      "heavy",
+		}}})
+	}
+	accounts, err := globalXAIAuthSource.hostAccounts()
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("initial host accounts=%+v err=%v", accounts, err)
+	}
+	initialStatus := globalXAIAuthSource.status()
+	if initialStatus.LastSuccessAt == "" {
+		t.Fatal("initial host success did not publish a success timestamp")
+	}
+	globalXAIAuthSource.mu.Lock()
+	globalXAIAuthSource.fetchedAt = time.Now().Add(-4 * time.Second)
+	globalXAIAuthSource.mu.Unlock()
+	hostAuthCaller = func(string, any) (json.RawMessage, error) { return nil, os.ErrNotExist }
+
+	accounts = readConfiguredXAIAccounts()
+	if len(accounts) != 2 {
+		t.Fatalf("fallback accounts=%+v, want retained host account plus filesystem account", accounts)
+	}
+	seen := map[string]bool{}
+	for _, account := range accounts {
+		seen[account.Email] = true
+	}
+	if !seen["runtime@example.com"] || !seen["file@example.com"] {
+		t.Fatalf("fallback accounts=%+v, want both host and filesystem identities", accounts)
+	}
+	status := globalXAIAuthSource.status()
+	if status.Authoritative || status.Source != "filesystem_fallback" || status.LastSuccessAt != initialStatus.LastSuccessAt {
+		t.Fatalf("fallback status=%+v, want non-authoritative view retaining last host success", status)
+	}
+}
+
+func TestXAIHostAuthSourceStaleFallbackCannotOverrideNewHostSuccess(t *testing.T) {
+	oldCaller := hostAuthCaller
+	t.Cleanup(func() { hostAuthCaller = oldCaller })
+	m := &xaiAuthSourceManager{}
+	hostAuthCaller = func(method string, payload any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{
+			ID: "fresh", AuthIndex: "fresh", Provider: "xai", Email: "fresh@example.com", Note: "heavy",
+		}}})
+	}
+	if _, err := m.hostAccounts(); err != nil {
+		t.Fatal(err)
+	}
+	merged := m.markFilesystemFallback([]configuredAccount{{
+		AuthID: "stale", AuthIndex: "stale.json", AuthFile: "stale.json", Provider: "xai",
+	}}, errXAIHostAuthListUnavailable)
+	if !m.authoritative() || m.status().Source != "host_callback" {
+		t.Fatalf("stale fallback downgraded a newer host success: %+v", m.status())
+	}
+	if len(merged) != 1 || merged[0].AuthID != "fresh" {
+		t.Fatalf("stale fallback reintroduced file-only rows: %+v", merged)
+	}
+}
+
+func TestMergeXAIAccountSnapshotsUsesOnlyStableIdentityAliases(t *testing.T) {
+	host := configuredAccount{
+		AuthID: "host-id", AuthIndex: "host-index", AuthFile: "host.json", Email: "host@example.com",
+		Name: "shared-display", Source: "shared-source", Provider: "xai",
+	}
+	filesystem := configuredAccount{
+		AuthID: "file-id", AuthIndex: "file-index", AuthFile: "file.json", Email: "file@example.com",
+		Name: "shared-display", Source: "shared-source", Provider: "xai",
+	}
+	if merged := mergeXAIAccountSnapshots([]configuredAccount{host}, []configuredAccount{filesystem}); len(merged) != 2 {
+		t.Fatalf("display metadata incorrectly deduplicated distinct accounts: %+v", merged)
+	}
+	filesystem.AuthIndex = host.AuthIndex
+	if merged := mergeXAIAccountSnapshots([]configuredAccount{host}, []configuredAccount{filesystem}); len(merged) != 1 {
+		t.Fatalf("stable auth index did not deduplicate the same account: %+v", merged)
 	}
 }
 

@@ -2,7 +2,9 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.36`
+Current version: `0.1.37`
+
+See the [changelog](CHANGELOG.md) for published and superseded versions. Report vulnerabilities through the private process in [SECURITY.md](SECURITY.md).
 
 ## Features
 
@@ -170,6 +172,14 @@ go test ./...
 
 `package-release.sh` validates that `PLUGIN_VERSION` matches `pluginVersion` in `main.go`. Tagged releases additionally require the `vX.Y.Z` tag, injected binary version, source version, and asset filenames to agree.
 
+CI and release publishing also build and dynamically load the plugin against the pinned latest audited CLIProxyAPI source in `scripts/cpa-compat.lock`. To run the same ABI, callback, scheduler, usage, and management compatibility gate locally on Linux or macOS:
+
+```bash
+bash scripts/check-cpa-compat.sh
+```
+
+Set `CPA_SOURCE_DIR` to an existing CLIProxyAPI checkout containing the pinned commit to avoid a network fetch.
+
 Official Linux archives are built in an Ubuntu 20.04 container and gated to require no newer than glibc `2.31`. They support glibc-based distributions such as Ubuntu 20.04+ and Debian 11+. Alpine Linux uses musl and is not supported by these CGO release binaries.
 
 Official macOS archives are native single-architecture builds for Intel and Apple Silicon. Both are pinned and verified with a minimum deployment target of macOS `12.0`, so newer hosted runners cannot silently raise the required system version.
@@ -179,13 +189,38 @@ Each platform zip contains the dynamic library, `LICENSE`, and `THIRD_PARTY_NOTI
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.36_linux_amd64.zip
-codex-token-usage_0.1.36_linux_arm64.zip
-codex-token-usage_0.1.36_windows_amd64.zip
-codex-token-usage_0.1.36_darwin_amd64.zip
-codex-token-usage_0.1.36_darwin_arm64.zip
+codex-token-usage_0.1.37_linux_amd64.zip
+codex-token-usage_0.1.37_linux_arm64.zip
+codex-token-usage_0.1.37_windows_amd64.zip
+codex-token-usage_0.1.37_darwin_amd64.zip
+codex-token-usage_0.1.37_darwin_arm64.zip
 checksums.txt
 ```
+
+### Verify a Release
+
+Download `checksums.txt` together with all five platform archives and all five SPDX JSON files into the same directory. The checksum manifest intentionally covers all ten assets, so verify the complete set before installing the plugin:
+
+```bash
+sha256sum -c checksums.txt
+```
+
+Public releases also carry GitHub build provenance. Set `SOURCE_DIGEST` to the 40-character commit reached by the release tag, as shown on the GitHub Release page, then verify each downloaded asset against the expected repository, workflow, tag, commit, and GitHub-hosted runner:
+
+```bash
+VERSION=0.1.37
+ASSET="codex-token-usage_${VERSION}_linux_amd64.zip"
+SOURCE_DIGEST="<40-character release commit SHA>"
+
+gh attestation verify "${ASSET}" \
+  --repo yujianwudi/codex-token-usage \
+  --signer-workflow yujianwudi/codex-token-usage/.github/workflows/release.yml \
+  --source-ref "refs/tags/v${VERSION}" \
+  --source-digest "${SOURCE_DIGEST}" \
+  --deny-self-hosted-runners
+```
+
+Repeat the attestation command for the SPDX JSON file and `checksums.txt`. The commit SHA is the commit referenced by the tag, not the annotated tag-object SHA.
 
 ## Plugin Store Checklist
 

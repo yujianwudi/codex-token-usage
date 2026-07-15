@@ -35,6 +35,33 @@ func TestNormalizePluginConfigPreservesQuotaMode(t *testing.T) {
 	}
 }
 
+func TestQuotaTriggerHTTPClientRefusesRedirectsBeforeForwardingHeaders(t *testing.T) {
+	var redirected atomic.Int64
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirected.Add(1)
+		if r.Header.Get("Authorization") != "" || r.Header.Get("Chatgpt-Account-Id") != "" {
+			t.Errorf("sensitive quota headers reached redirect target: %v", r.Header)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer sink.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, sink.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	_, _, err := doQuotaTriggerHTTPRequest(context.Background(), http.MethodGet, redirector.URL, map[string][]string{
+		"Authorization":      {"Bearer secret"},
+		"Chatgpt-Account-Id": {"account-secret"},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "redirects are not allowed") {
+		t.Fatalf("redirect error=%v, want strict redirect rejection", err)
+	}
+	if redirected.Load() != 0 {
+		t.Fatalf("redirect target received %d requests", redirected.Load())
+	}
+}
+
 func TestExecuteQuotaTriggerUsesQuotaEndpoint(t *testing.T) {
 	s := newTestStore(t)
 	db, dbPath, err := s.open(context.Background())

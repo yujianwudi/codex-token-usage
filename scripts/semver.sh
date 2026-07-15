@@ -2,7 +2,7 @@
 
 is_semver() {
   local version="${1:-}"
-  local core prerelease identifier
+  local prerelease identifier
   [[ "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || return 1
   prerelease="${BASH_REMATCH[5]:-}"
   [[ -z "${prerelease}" ]] && return 0

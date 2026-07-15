@@ -24,6 +24,93 @@ func resetAPIKeySecretCacheForTest(dir string) {
 	apiKeyFallbackWarnings.Lock()
 	delete(apiKeyFallbackWarnings.byDB, key)
 	apiKeyFallbackWarnings.Unlock()
+	apiKeyFingerprintHealth.Lock()
+	delete(apiKeyFingerprintHealth.byDB, key)
+	apiKeyFingerprintHealth.Unlock()
+}
+
+func TestRuntimeFingerprintLikeCredentialIsReboundToLocalSecret(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "usage.db")
+	external := "keyfp:v1:0123456789abcdef0123456789abcdef:ABCD"
+	got, err := privacySafeAPIKeyWithError(dbPath, external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == external || !strings.HasPrefix(got, "keyfp:v1:") {
+		t.Fatalf("external fingerprint-like credential was trusted: %q", got)
+	}
+	if again := privacySafeAPIKey(dbPath, external); again != got {
+		t.Fatalf("locally rebound fingerprint is unstable: %q != %q", again, got)
+	}
+}
+
+func TestAPIKeyFingerprintHealthIsIsolatedByDatabase(t *testing.T) {
+	firstPath := filepath.Join(t.TempDir(), "first.db")
+	secondPath := filepath.Join(t.TempDir(), "second.db")
+	recordAPIKeyFingerprintError(firstPath, &os.PathError{Op: "open", Path: apiKeySecretPath(firstPath), Err: os.ErrPermission})
+	recordAPIKeyFingerprintSuccess(secondPath)
+	first := apiKeyFingerprintStatus(context.Background(), nil, firstPath)
+	second := apiKeyFingerprintStatus(context.Background(), nil, secondPath)
+	if !first.Checked || first.Available || first.LastError == "" {
+		t.Fatalf("first database health=%+v, want isolated failure", first)
+	}
+	if !second.Checked || !second.Available || second.LastError != "" {
+		t.Fatalf("second database health=%+v, want isolated success", second)
+	}
+}
+
+func TestFingerprintingDoesNotClearUnverifiedBindingFailure(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "usage.db")
+	if _, err := privacySafeAPIKeyWithError(dbPath, "sk-initial-secret-1234567890"); err != nil {
+		t.Fatal(err)
+	}
+	recordAPIKeyFingerprintError(dbPath, errors.New("binding verification failed"))
+	if _, err := privacySafeAPIKeyWithError(dbPath, "sk-next-secret-1234567890"); err != nil {
+		t.Fatal(err)
+	}
+	status := apiKeyFingerprintStatus(context.Background(), nil, dbPath)
+	if !status.Checked || status.Available || status.LastError == "" {
+		t.Fatalf("fingerprinting cleared an unverified binding failure: %+v", status)
+	}
+}
+
+func TestPersistentIdentityScannerReloadsRowsMutatedWithinBatch(t *testing.T) {
+	db := newProtectionTestDB(t)
+	firstResult, err := db.Exec(`INSERT INTO usage_events(requested_at,auth_id) VALUES(1,'first')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID, err := firstResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResult, err := db.Exec(`INSERT INTO usage_events(requested_at,auth_id) VALUES(2,'stale')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := secondResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenSecond := ""
+	err = scanPersistentIdentityRows(context.Background(), db, persistentIdentitySpec{
+		table: "usage_events", columns: []string{"api_key", "auth_id", "auth_index", "source"},
+	}, func(row storedIdentityRow) error {
+		switch row.rowID {
+		case firstID:
+			_, err := db.Exec(`UPDATE usage_events SET auth_id='fresh' WHERE id=?`, secondID)
+			return err
+		case secondID:
+			seenSecond = row.values[1]
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seenSecond != "fresh" {
+		t.Fatalf("scanner visited stale batch snapshot %q, want fresh", seenSecond)
+	}
 }
 
 func isolateAPIKeyPrivacyQuarantineForTest(t *testing.T) {
@@ -1430,7 +1517,7 @@ func TestFingerprintDiagnosticsAndLogsDoNotExposeDatabasePath(t *testing.T) {
 	log.SetOutput(&output)
 	t.Cleanup(func() { log.SetOutput(previous) })
 	recordAPIKeyFingerprintError(path, &os.PathError{Op: "open", Path: filepath.Join(dir, apiKeyFingerprintSecretFile), Err: os.ErrPermission})
-	status := apiKeyFingerprintStatus(context.Background(), nil)
+	status := apiKeyFingerprintStatus(context.Background(), nil, path)
 	for name, value := range map[string]string{"log": output.String(), "diagnostic": status.LastError} {
 		if strings.Contains(value, dir) || strings.Contains(value, "sensitive-user-name") {
 			t.Fatalf("%s leaked database path: %q", name, value)
@@ -1441,16 +1528,18 @@ func TestFingerprintDiagnosticsAndLogsDoNotExposeDatabasePath(t *testing.T) {
 func TestModelPriceDiagnosticsStripQueryFragmentAndErrorURLs(t *testing.T) {
 	cfg := defaultPluginConfig()
 	cfg.ModelPriceAutoUpdateEnabled = false
-	cfg.ModelPriceUpdateURL = "https://prices.example.com/table.json?sig=top-secret#private"
+	cfg.ModelPriceUpdateURL = "HTTPS://Prices.Example.com/private-tenant/table.json?sig=top-secret#private"
 	manager := modelPriceUpdateManager{}
 	manager.configure(cfg)
-	manager.recordPriceUpdateCheck("request https://prices.example.com/table.json?sig=top-secret#private failed", 0, 0, false)
+	manager.recordPriceUpdateCheck("request HTTPS://Prices.Example.com/private-tenant/table.json?sig=top-secret#private failed", 0, 0, false)
 	state := manager.status()
-	if strings.Contains(state.URL, "top-secret") || strings.Contains(state.URL, "?") || strings.Contains(state.URL, "#") {
-		t.Fatalf("diagnostic URL leaked query/fragment: %q", state.URL)
+	if state.URL != "https://prices.example.com" {
+		t.Fatalf("diagnostic URL = %q, want origin-only lowercase URL", state.URL)
 	}
-	if strings.Contains(state.LastError, "top-secret") || strings.Contains(state.LastError, "?") || strings.Contains(state.LastError, "#") {
-		t.Fatalf("diagnostic error leaked query/fragment: %q", state.LastError)
+	for _, secret := range []string{"private-tenant", "table.json", "top-secret", "?", "#"} {
+		if strings.Contains(state.LastError, secret) {
+			t.Fatalf("diagnostic error leaked %q: %q", secret, state.LastError)
+		}
 	}
 }
 

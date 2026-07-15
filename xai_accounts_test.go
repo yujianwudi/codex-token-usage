@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,6 +33,31 @@ func TestXAIStateClassification(t *testing.T) {
 				t.Fatalf("state=%q resetAt=%d, want %q %d", state, resetAt, test.state, test.resetAt)
 			}
 		})
+	}
+}
+
+func TestXAIFilesystemFallbackCannotClearMissingHostState(t *testing.T) {
+	oldCaller := hostAuthCaller
+	oldSource := globalXAIAuthSource
+	t.Cleanup(func() { hostAuthCaller = oldCaller; globalXAIAuthSource = oldSource })
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	globalXAIAuthSource = &xaiAuthSourceManager{}
+	hostAuthCaller = func(string, any) (json.RawMessage, error) { return nil, os.ErrNotExist }
+	db := newProtectionTestDB(t)
+	if _, err := db.Exec(`
+INSERT INTO xai_account_states(state_key,auth_id,auth_index,provider,state,reason,observed_at,active,last_status_code)
+VALUES('runtime-only','runtime-only','runtime-only','xai','unauthorized','test',1,1,401)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearReplacedOrMissingXAIStates(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	var active int
+	if err := db.QueryRow(`SELECT active FROM xai_account_states WHERE state_key='runtime-only'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 || globalXAIAuthSource.authoritative() {
+		t.Fatalf("filesystem fallback cleared host-only state: active=%d status=%+v", active, globalXAIAuthSource.status())
 	}
 }
 

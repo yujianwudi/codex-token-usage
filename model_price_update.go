@@ -23,7 +23,7 @@ const (
 	modelPriceUpdateRetryDelay = 5 * time.Minute
 )
 
-var modelPriceDiagnosticURLPattern = regexp.MustCompile(`https?://[^\s"'<>]+`)
+var modelPriceDiagnosticURLPattern = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
 
 type modelPriceUpdateState struct {
 	Enabled        bool   `json:"enabled"`
@@ -378,6 +378,19 @@ func modelPriceURLForDiagnostics(raw string) string {
 	if err != nil {
 		return "<invalid URL>"
 	}
+	if !strings.EqualFold(target.Scheme, "http") && !strings.EqualFold(target.Scheme, "https") {
+		return "<invalid URL>"
+	}
+	if target.Hostname() == "" {
+		return "<invalid URL>"
+	}
+	target.Scheme = strings.ToLower(target.Scheme)
+	target.Host = strings.ToLower(target.Host)
+	// Paths can contain tenant identifiers, signed object names, or embedded
+	// credentials just as readily as query strings. Diagnostics only need the
+	// destination origin, never the requested object path.
+	target.Path = ""
+	target.RawPath = ""
 	target.RawQuery = ""
 	target.ForceQuery = false
 	target.Fragment = ""

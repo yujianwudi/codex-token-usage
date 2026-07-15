@@ -751,6 +751,53 @@ func TestSchedulerStateConditionalClearIsProviderSpecific(t *testing.T) {
 	}
 }
 
+func TestSchedulerStatePendingWriteRejectsEmptySnapshotPublish(t *testing.T) {
+	for _, provider := range []string{"codex", "xai"} {
+		t.Run(provider, func(t *testing.T) {
+			var state schedulerStateCache
+			state.setRestricted(provider, false)
+			state.beginRestrictionWrite(provider)
+			generation := state.providerGeneration(provider)
+			if state.clearRestrictedIfGeneration(provider, generation) {
+				t.Fatal("pending restriction write accepted an empty snapshot")
+			}
+			state.setRestricted(provider, false)
+			if !state.needsDatabase(provider, false) {
+				t.Fatal("pending restriction write was cleared by a healthy event")
+			}
+			state.finishRestrictionWrite(provider)
+			if !state.needsDatabase(provider, false) {
+				t.Fatal("finished restriction write was trusted before a fresh database snapshot")
+			}
+			generation = state.providerGeneration(provider)
+			if !state.clearRestrictedIfGeneration(provider, generation) {
+				t.Fatal("post-write database snapshot was not published")
+			}
+			if state.needsDatabase(provider, false) {
+				t.Fatal("post-write empty snapshot did not restore the healthy fast path")
+			}
+		})
+	}
+}
+
+func TestSchedulerStateRefreshCannotPublishAcrossPendingWrite(t *testing.T) {
+	var state schedulerStateCache
+	generation := state.beginRefresh()
+	state.beginRestrictionWrite("codex")
+	state.applySnapshotRefresh(
+		generation,
+		newCodexSchedulerSnapshot(nil, nil, time.Now().Unix()),
+		newXAISchedulerSnapshot(nil, time.Now().Unix()),
+	)
+	if !state.needsDatabase("codex", false) {
+		t.Fatal("refresh published Codex state across a pending write")
+	}
+	if state.needsDatabase("xai", false) {
+		t.Fatal("uncontended xAI refresh was not published")
+	}
+	state.finishRestrictionWrite("codex")
+}
+
 func TestQueryActiveAutobansDoesNotRewriteUsageHistory(t *testing.T) {
 	s := newTestStore(t)
 	db, _, err := s.open(context.Background())
