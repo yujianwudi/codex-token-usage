@@ -86,9 +86,9 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.31"
+	pluginVersion    = "0.1.32"
 	pluginAuthor     = "Codex Token Usage Contributors"
-	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
+	pluginRepository = "https://github.com/yujianwudi/codex-token-usage"
 )
 
 var globalStore = &store{}

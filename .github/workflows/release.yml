@@ -36,7 +36,7 @@ jobs:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
       CGO_ENABLED: "1"
-      PLUGIN_REPOSITORY: https://github.com/zhumengling/codex-token-usage
+      PLUGIN_REPOSITORY: https://github.com/yujianwudi/codex-token-usage
     steps:
       - uses: actions/checkout@v4
 
