@@ -308,6 +308,10 @@ func loadOrCreateAPIKeySecret(dbPath string) ([]byte, error) {
 	if err := file.Close(); err != nil {
 		return nil, err
 	}
+	if err := enforcePrivatePath(path, false); err != nil {
+		_ = os.Remove(path)
+		return nil, err
+	}
 	apiKeySecrets.byDB[key] = append([]byte(nil), secret...)
 	return append([]byte(nil), secret...), nil
 }
@@ -365,7 +369,7 @@ func persistentIdentitySpecs() []persistentIdentitySpec {
 		{table: "invalid_auths", columns: []string{"auth_id", "auth_index", "source", "auth_file"}},
 		{table: "autoban_bans", columns: []string{"auth_id", "auth_index", "source"}},
 		{table: "xai_account_states", columns: []string{"state_key", "auth_id", "auth_index", "source", "auth_file"}},
-		{table: "account_protection_reservations", columns: []string{"auth_id", "auth_index", "source"}},
+		{table: "account_protection_reservations", columns: []string{"auth_id", "auth_index", "source", "auth_file"}},
 		{table: "quota_trigger_runs", columns: []string{"auth_id", "auth_index", "source", "auth_file"}},
 	}
 }
@@ -1259,10 +1263,8 @@ func readAPIKeySecret(path string) ([]byte, error) {
 	if len(decoded) != 32 {
 		return nil, errors.New("invalid API key fingerprint secret")
 	}
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(path, 0o600); err != nil {
-			return nil, err
-		}
+	if err := enforcePrivatePath(path, false); err != nil {
+		return nil, err
 	}
 	return decoded, nil
 }
@@ -1294,6 +1296,9 @@ func privacySafeUsageRecord(dbPath string, rec usageRecord) (usageRecord, error)
 	if rec.Source, err = privacySafeStoredIdentity(dbPath, rec.Source, rawAPIKey, fingerprint, nil); err != nil {
 		return usageRecord{}, err
 	}
+	if rec.AuthFile, err = privacySafeStoredIdentity(dbPath, rec.AuthFile, rawAPIKey, fingerprint, nil); err != nil {
+		return usageRecord{}, err
+	}
 	return rec, nil
 }
 
@@ -1319,9 +1324,28 @@ func storedCredentialAlias(value string) string {
 	if value == "" || isAPIKeyFingerprint(value) {
 		return value
 	}
+	credential, ok := credentialShapedValue(value)
+	if !ok {
+		return ""
+	}
+	return configuredAPIKeyStorageValue(credential)
+}
+
+// credentialShapedValue is deliberately pure: callers that decide whether a
+// diagnostic must be redacted cannot depend on the HMAC sidecar being
+// readable. Persisting the returned credential still goes through the
+// fail-closed fingerprint path in storedCredentialAlias.
+func credentialShapedValue(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	if isAPIKeyFingerprint(value) {
+		return value, true
+	}
 	bearer := false
-	if len(value) > len("bearer") && strings.EqualFold(value[:len("bearer")], "bearer") {
-		if rest := strings.TrimSpace(value[len("bearer"):]); rest != "" {
+	if len(value) >= len("bearer ") && strings.EqualFold(value[:len("bearer ")], "bearer ") {
+		if rest := strings.TrimSpace(value[len("bearer "):]); rest != "" {
 			value = rest
 			bearer = true
 		}
@@ -1332,16 +1356,21 @@ func storedCredentialAlias(value string) string {
 		lower = strings.ToLower(value)
 	}
 	credentialLike := bearer || looksLikeOpaqueCredential(value)
-	for _, prefix := range []string{"sk-svcacct-", "sk-proj-", "sk-ant-", "xai-", "aiza", "sk-"} {
+	for _, prefix := range []string{"sk-svcacct-", "sk-proj-", "sk-ant-", "xai-", "aiza", "ark-", "sk-"} {
 		if strings.HasPrefix(lower, prefix) {
 			credentialLike = true
 			break
 		}
 	}
 	if !credentialLike {
-		return ""
+		return "", false
 	}
-	return configuredAPIKeyStorageValue(value)
+	return value, true
+}
+
+func looksLikeCredentialToken(value string) bool {
+	_, ok := credentialShapedValue(value)
+	return ok
 }
 
 func schedulerCandidateExplicitAPIKey(candidate schedulerAuthCandidate) string {
@@ -1355,22 +1384,25 @@ func schedulerCandidateExplicitAPIKey(candidate schedulerAuthCandidate) string {
 	)
 }
 
-func privacySafeSchedulerIdentity(dbPath string, candidate schedulerAuthCandidate, authID, authIndex, source string) (string, string, string, error) {
+func privacySafeSchedulerIdentity(dbPath string, candidate schedulerAuthCandidate, authID, authIndex, source, authFile string) (string, string, string, string, error) {
 	rawAPIKey := schedulerCandidateExplicitAPIKey(candidate)
 	fingerprint, err := privacySafeAPIKeyWithError(dbPath, rawAPIKey)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	if authID, err = privacySafeStoredIdentity(dbPath, authID, rawAPIKey, fingerprint, nil); err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	if authIndex, err = privacySafeStoredIdentity(dbPath, authIndex, rawAPIKey, fingerprint, nil); err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	if source, err = privacySafeStoredIdentity(dbPath, source, rawAPIKey, fingerprint, nil); err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
-	return authID, authIndex, source, nil
+	if authFile, err = privacySafeStoredIdentity(dbPath, authFile, rawAPIKey, fingerprint, nil); err != nil {
+		return "", "", "", "", err
+	}
+	return authID, authIndex, source, authFile, nil
 }
 
 type legacyFingerprintResolver struct {
@@ -1482,10 +1514,12 @@ func normalizedConfiguredCredentials(configuredKeys []string) []string {
 
 func configuredCredentialWholeValue(value string) string {
 	value = strings.TrimSpace(value)
-	for _, prefix := range []string{"bearer", "codex:apikey:"} {
-		if len(value) > len(prefix) && strings.EqualFold(value[:len(prefix)], prefix) {
-			return strings.TrimSpace(value[len(prefix):])
-		}
+	if len(value) >= len("bearer ") && strings.EqualFold(value[:len("bearer ")], "bearer ") {
+		return strings.TrimSpace(value[len("bearer "):])
+	}
+	const codexPrefix = "codex:apikey:"
+	if len(value) > len(codexPrefix) && strings.EqualFold(value[:len(codexPrefix)], codexPrefix) {
+		return strings.TrimSpace(value[len(codexPrefix):])
 	}
 	return value
 }
@@ -1599,8 +1633,8 @@ func credentialFromStoredIdentity(value string, configuredKeys []string) (string
 		}
 		return "", false
 	}
-	if len(value) > len("bearer") && strings.EqualFold(value[:len("bearer")], "bearer") {
-		if credential := strings.TrimSpace(value[len("bearer"):]); credential != "" {
+	if len(value) >= len("bearer ") && strings.EqualFold(value[:len("bearer ")], "bearer ") {
+		if credential := strings.TrimSpace(value[len("bearer "):]); credential != "" {
 			return credential, true
 		}
 	}
@@ -1816,7 +1850,7 @@ func migrateAuthStateIdentitiesV3(ctx context.Context, tx *sql.Tx, dbPath string
 		}
 	}
 	for _, spec := range []persistentIdentitySpec{
-		{table: "account_protection_reservations", columns: []string{"auth_id", "auth_index", "source"}},
+		{table: "account_protection_reservations", columns: []string{"auth_id", "auth_index", "source", "auth_file"}},
 		{table: "quota_trigger_runs", columns: []string{"auth_id", "auth_index", "source", "auth_file"}},
 	} {
 		if err := migrateNonUniqueIdentityTableV3(ctx, tx, dbPath, spec, configuredKeys, resolver); err != nil {

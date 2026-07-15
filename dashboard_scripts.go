@@ -140,9 +140,18 @@ function setLogExportStatus(text,tone){logExportStatusEl.classList.remove('ok','
 function populateSelect(id,values,allLabel){
   const el=document.getElementById(id);
   const current=el.value;
-  const opts=['<option value="">'+esc(tr(allLabel))+'</option>'].concat([...new Set(values.filter(Boolean))].sort((a,b)=>a.localeCompare(b)).map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>'));
+  const entries=[];
+  const seen=new Set();
+  (values||[]).forEach(item=>{
+    const value=firstText(item&&typeof item==='object'?item.value:item);
+    if(!value||seen.has(value))return;
+    seen.add(value);
+    entries.push({value:value,label:firstText(item&&typeof item==='object'?item.label:'',value)});
+  });
+  entries.sort((a,b)=>a.label.localeCompare(b.label));
+  const opts=['<option value="">'+esc(tr(allLabel))+'</option>'].concat(entries.map(item=>'<option value="'+esc(item.value)+'">'+esc(item.label)+'</option>'));
   el.innerHTML=opts.join('');
-  if(values.includes(current))el.value=current;
+  if(entries.some(item=>item.value===current))el.value=current;
 }
 function logExportContextRows(){
   const data=lastData||{};
@@ -162,7 +171,7 @@ function logExportContextRows(){
 }
 function populateLogExportFilters(){
   const rows=logExportContextRows();
-  populateSelect('log-export-account',rows.accounts.map(r=>firstText(r.key_id,r.auth_file,r.auth_index,r.email,r.source,r.auth_id,r.name)), '全部账号');
+  populateSelect('log-export-account',rows.accounts.map(r=>{const fallback=firstText(r.auth_file,r.auth_index,r.email,r.source,r.auth_id,r.name);return {value:firstText(r.key_id,fallback),label:firstText(r.key_display,r.key_id,fallback)}}), '全部账号');
   populateSelect('log-export-provider',rows.providers.map(r=>r.provider).concat(rows.recent.map(r=>r.provider)), '全部接入点');
   populateSelect('log-export-model',rows.models.map(r=>r.model).concat(rows.recent.map(r=>firstText(r.alias,r.model))), '全部模型');
   const ctx=currentLogExportScope();
@@ -2256,7 +2265,7 @@ function renderKeySummaries(rows){
     const ok=(r.requests||0)-(r.failed||0);
     const providers=firstText(r.provider_names,r.provider,'-');
     return '<tr>'+
-      td('<span class="pill">'+esc(r.key_id||'-')+'</span>')+
+      td('<span class="pill" title="'+esc(r.key_id||'')+'">'+esc(r.key_display||r.key_id||'-')+'</span>')+
       td('<span class="pill">'+esc(r.protocol||'-')+'</span>')+
       td('<span class="metric-stack"><b title="'+esc(providers)+'">'+esc(providers)+'</b><span>'+fmt(r.providers||0)+' 个接入点</span></span>')+
       td(fmt(r.requests),'num')+

@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS account_protection_reservations (
   auth_id TEXT NOT NULL DEFAULT '',
   auth_index TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL DEFAULT '',
+  auth_file TEXT NOT NULL DEFAULT '',
   plan_type TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL

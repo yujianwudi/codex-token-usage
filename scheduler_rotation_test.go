@@ -41,9 +41,12 @@ func TestSchedulerRotationCursorMapIsBounded(t *testing.T) {
 	candidates := []schedulerAuthCandidate{{ID: "only", Provider: "codex"}}
 	for i := 0; i < schedulerRotationMaxCursors+200; i++ {
 		rotation.pick(fmt.Sprintf("codex\x00model-%d", i), candidates)
+		if got := len(rotation.cursors); got > schedulerRotationMaxCursors {
+			t.Fatalf("cursor count after insert %d = %d, max = %d", i, got, schedulerRotationMaxCursors)
+		}
 	}
-	if got := len(rotation.cursors); got > schedulerRotationMaxCursors {
-		t.Fatalf("cursor count = %d, max = %d", got, schedulerRotationMaxCursors)
+	if got := len(rotation.cursors); got != schedulerRotationMaxCursors {
+		t.Fatalf("cursor count = %d, want exact bound %d", got, schedulerRotationMaxCursors)
 	}
 }
 

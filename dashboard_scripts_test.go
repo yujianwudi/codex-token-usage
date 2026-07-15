@@ -172,3 +172,15 @@ func TestManagementKeyIsNotCopiedIntoWebStorage(t *testing.T) {
 		}
 	}
 }
+
+func TestKeySummaryUsesFilterIDSeparateFromDisplayMask(t *testing.T) {
+	for _, marker := range []string{
+		"value:firstText(r.key_id,fallback)",
+		"label:firstText(r.key_display,r.key_id,fallback)",
+		"esc(r.key_display||r.key_id||'-')",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard key filtering missing marker %q", marker)
+		}
+	}
+}

@@ -69,7 +69,10 @@ func BenchmarkSchedulerPrivacyQuarantineEmpty100Accounts(b *testing.B) {
 }
 
 func BenchmarkSchedulerHealthyFastPath100Accounts(b *testing.B) {
+	previousStore := globalStore
+	previousCfg := globalAccountProtection.config()
 	resetSchedulerStateForTest()
+	globalSchedulerRotation.reset()
 	globalSchedulerState.setRestricted("codex", false)
 	cfg := defaultPluginConfig()
 	cfg.AccountProtectionEnabled = false
@@ -78,7 +81,9 @@ func BenchmarkSchedulerHealthyFastPath100Accounts(b *testing.B) {
 	globalStore = s
 	b.Cleanup(func() {
 		s.close()
-		globalStore = &store{}
+		globalStore = previousStore
+		globalAccountProtection.configure(previousCfg)
+		globalSchedulerRotation.reset()
 		resetSchedulerStateForTest()
 	})
 	req := schedulerPickRequest{Provider: "codex", Model: "gpt-5.5", Candidates: benchmarkSchedulerCandidates(100)}
@@ -95,7 +100,9 @@ func BenchmarkSchedulerRestrictedSnapshot100Accounts(b *testing.B) {
 	dir := b.TempDir()
 	b.Setenv("CPA_TOKEN_USAGE_DIR", dir)
 	b.Setenv("CPA_AUTH_DIR", filepath.Join(dir, "auth"))
+	previousStore := globalStore
 	resetSchedulerStateForTest()
+	globalSchedulerRotation.reset()
 	previousCfg := globalAccountProtection.config()
 	cfg := defaultPluginConfig()
 	cfg.AccountProtectionEnabled = false
@@ -104,8 +111,9 @@ func BenchmarkSchedulerRestrictedSnapshot100Accounts(b *testing.B) {
 	globalStore = s
 	b.Cleanup(func() {
 		s.close()
-		globalStore = &store{}
+		globalStore = previousStore
 		globalAccountProtection.configure(previousCfg)
+		globalSchedulerRotation.reset()
 		resetSchedulerStateForTest()
 	})
 	db, _, err := s.open(context.Background())
@@ -148,7 +156,13 @@ func BenchmarkProtectedPick100Accounts50kEvents(b *testing.B) {
 	b.Setenv("CPA_TOKEN_USAGE_DIR", dir)
 	b.Setenv("CPA_AUTH_DIR", authDir)
 	s := &store{}
-	b.Cleanup(s.close)
+	previousCfg := globalAccountProtection.config()
+	globalSchedulerRotation.reset()
+	b.Cleanup(func() {
+		s.close()
+		globalAccountProtection.configure(previousCfg)
+		globalSchedulerRotation.reset()
+	})
 	db, _, err := s.open(context.Background())
 	if err != nil {
 		b.Fatal(err)

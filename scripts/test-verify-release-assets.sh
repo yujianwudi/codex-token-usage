@@ -3,24 +3,27 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-for tool in jq python3 sha256sum unzip zip; do
+for tool in jq ln python3 sha256sum unzip zip; do
   if ! command -v "${tool}" >/dev/null 2>&1; then
     echo "${tool} is required for release-asset verification tests" >&2
     exit 2
   fi
 done
 
-version="0.1.34"
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "${tmp_dir}"' EXIT
+version="0.1.35"
+tmp_root="$(mktemp -d)"
+assets_dir="${tmp_root}/assets"
+backups_dir="${tmp_root}/backups"
+mkdir -p "${assets_dir}" "${backups_dir}"
+trap 'rm -rf "${tmp_root}"' EXIT
 
 make_fixture() {
   local platform="$1"
   local ext="$2"
   local binary_name="codex-token-usage.${ext}"
-  local work_dir="${tmp_dir}/work-${platform}"
-  local archive="${tmp_dir}/codex-token-usage_${version}_${platform}.zip"
-  local sbom="${tmp_dir}/codex-token-usage_${version}_${platform}.spdx.json"
+  local work_dir="${tmp_root}/work-${platform}"
+  local archive="${assets_dir}/codex-token-usage_${version}_${platform}.zip"
+  local sbom="${assets_dir}/codex-token-usage_${version}_${platform}.spdx.json"
   mkdir -p "${work_dir}"
   printf 'ZIP_PAYLOAD_%s' "${platform}" > "${work_dir}/${binary_name}"
   printf 'test license\n' > "${work_dir}/LICENSE"
@@ -57,20 +60,69 @@ make_fixture() {
     }' > "${sbom}"
 }
 
+expect_rejected() {
+  local description="$1"
+  if bash scripts/verify-release-assets.sh "${version}" "${assets_dir}" >/dev/null 2>&1; then
+    echo "release verification accepted ${description}" >&2
+    exit 1
+  fi
+}
+
 make_fixture linux_amd64 so
 make_fixture linux_arm64 so
 make_fixture darwin_amd64 dylib
 make_fixture darwin_arm64 dylib
 make_fixture windows_amd64 dll
 
-bash scripts/verify-release-assets.sh "${version}" "${tmp_dir}" >/dev/null
-if [[ "$(wc -l < "${tmp_dir}/checksums.txt" | tr -d ' ')" != "10" ]]; then
-  echo "release verification did not checksum all ten release assets" >&2
+bash scripts/verify-release-assets.sh "${version}" "${assets_dir}" >/dev/null
+if [[ "$(wc -l < "${assets_dir}/checksums.txt" | tr -d ' ')" != "10" ]]; then
+  echo "release verification did not generate exactly ten checksum entries" >&2
   exit 1
 fi
+if ! (cd "${assets_dir}" && sha256sum -c checksums.txt >/dev/null); then
+  echo "generated release checksums did not verify" >&2
+  exit 1
+fi
+shopt -s nullglob dotglob
+final_entries=("${assets_dir}"/*)
+shopt -u nullglob dotglob
+if (( ${#final_entries[@]} != 11 )); then
+  echo "verified release bundle has ${#final_entries[@]} entries, want 11" >&2
+  exit 1
+fi
+for entry in "${final_entries[@]}"; do
+  if [[ -L "${entry}" || ! -f "${entry}" ]]; then
+    echo "verified release bundle retained a non-regular entry: ${entry}" >&2
+    exit 1
+  fi
+done
+rm -f "${assets_dir}/checksums.txt"
 
-archive="${tmp_dir}/codex-token-usage_${version}_linux_amd64.zip"
-cp "${archive}" "${archive}.bak"
+printf 'unexpected\n' > "${assets_dir}/unexpected.bin"
+expect_rejected "an extra file extension"
+rm -f "${assets_dir}/unexpected.bin"
+
+mkdir "${assets_dir}/unexpected-directory"
+expect_rejected "an extra directory"
+rmdir "${assets_dir}/unexpected-directory"
+
+archive="${assets_dir}/codex-token-usage_${version}_linux_amd64.zip"
+archive_backup="${backups_dir}/linux_amd64.zip"
+mv "${archive}" "${archive_backup}"
+ln -s "${archive_backup}" "${archive}"
+expect_rejected "a symlink in place of an expected archive"
+rm -f "${archive}"
+mv "${archive_backup}" "${archive}"
+
+printf 'stale checksums\n' > "${assets_dir}/checksums.txt"
+expect_rejected "a pre-existing checksums.txt"
+rm -f "${assets_dir}/checksums.txt"
+
+mv "${archive}" "${archive_backup}"
+expect_rejected "a missing expected archive"
+mv "${archive_backup}" "${archive}"
+
+cp "${archive}" "${archive_backup}"
 python3 - "${archive}" <<'PY'
 import pathlib
 import sys
@@ -83,29 +135,27 @@ if payload.count(old) != 1 or len(old) != len(new):
     raise SystemExit("cannot locate the stored ZIP payload sentinel")
 path.write_bytes(payload.replace(old, new, 1))
 PY
-if bash scripts/verify-release-assets.sh "${version}" "${tmp_dir}" >/dev/null 2>&1; then
-  echo "release verification accepted an archive with a bad CRC" >&2
-  exit 1
-fi
-mv "${archive}.bak" "${archive}"
+expect_rejected "an archive with a bad CRC"
+mv "${archive_backup}" "${archive}"
 
-sbom="${tmp_dir}/codex-token-usage_${version}_linux_amd64.spdx.json"
-cp "${sbom}" "${sbom}.bak"
+sbom="${assets_dir}/codex-token-usage_${version}_linux_amd64.spdx.json"
+sbom_backup="${backups_dir}/linux_amd64.spdx.json"
+cp "${sbom}" "${sbom_backup}"
 printf '{}\n' > "${sbom}"
-if bash scripts/verify-release-assets.sh "${version}" "${tmp_dir}" >/dev/null 2>&1; then
-  echo "release verification accepted an incomplete SPDX document" >&2
-  exit 1
-fi
-mv "${sbom}.bak" "${sbom}"
+expect_rejected "an incomplete SPDX document"
+mv "${sbom_backup}" "${sbom}"
 
-cp "${sbom}" "${sbom}.bak"
+cp "${sbom}" "${sbom_backup}"
 jq '(.packages[0].checksums[0].checksumValue) =
   "0000000000000000000000000000000000000000000000000000000000000000"' \
-  "${sbom}.bak" > "${sbom}"
-if bash scripts/verify-release-assets.sh "${version}" "${tmp_dir}" >/dev/null 2>&1; then
-  echo "release verification accepted an SPDX checksum mismatch" >&2
+  "${sbom_backup}" > "${sbom}"
+expect_rejected "an SPDX checksum mismatch"
+mv "${sbom_backup}" "${sbom}"
+
+bash scripts/verify-release-assets.sh "${version}" "${assets_dir}" >/dev/null
+if [[ "$(wc -l < "${assets_dir}/checksums.txt" | tr -d ' ')" != "10" ]]; then
+  echo "restored release bundle did not regenerate ten checksums" >&2
   exit 1
 fi
-mv "${sbom}.bak" "${sbom}"
 
 echo "Release asset verification tests passed"

@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestMaskAPIKeyForDisplay(t *testing.T) {
@@ -62,6 +65,80 @@ func TestAccountExportMasksFingerprintFields(t *testing.T) {
 	}
 	if got := rows[0]["auth_index"]; got != "key-****wxyz" {
 		t.Fatalf("auth_index = %q, want fingerprint display mask", got)
+	}
+}
+
+func TestKeySummaryFilterIDSeparatesMatchingDisplaySuffixes(t *testing.T) {
+	first := "keyfp:v1:0123456789abcdef0123456789abcdef:same"
+	second := "keyfp:v1:fedcba9876543210fedcba9876543210:same"
+	if maskAPIKeyForDisplay(first) != maskAPIKeyForDisplay(second) {
+		t.Fatal("test keys must share the same display mask")
+	}
+	if keySummaryFilterID(first) == keySummaryFilterID(second) {
+		t.Fatal("distinct stored keys received the same filter identifier")
+	}
+}
+
+func TestExportLogRecordsAppliesKeyFilterBeforeLimit(t *testing.T) {
+	t.Setenv("CPA_CONFIG_PATH", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	db, err := openSQLiteDB(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(schemaSQL); err != nil {
+		t.Fatal(err)
+	}
+
+	selectedKey := "keyfp:v1:0123456789abcdef0123456789abcdef:same"
+	otherKey := "keyfp:v1:fedcba9876543210fedcba9876543210:same"
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO usage_events(requested_at,provider,api_key,auth_id,total_tokens) VALUES
+		(?, 'codex', ?, 'selected-account', 1),
+		(?, 'codex', ?, 'other-account', 1)`, now-10, selectedKey, now, otherKey); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := queryKeySummaries(context.Background(), db, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("key summaries = %d, want 2", len(summaries))
+	}
+	if summaries[0].KeyID == summaries[1].KeyID {
+		t.Fatal("key summaries must expose distinct filter identifiers")
+	}
+	if summaries[0].KeyDisplay != summaries[1].KeyDisplay {
+		t.Fatalf("test keys must retain the same display mask: %q != %q", summaries[0].KeyDisplay, summaries[1].KeyDisplay)
+	}
+
+	records, _, err := exportLogRecords(context.Background(), db, logExportFilter{
+		Window:  "all",
+		Scope:   "codex",
+		Account: keySummaryFilterID(selectedKey),
+		Limit:   1,
+	}, defaultModelPrices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("filtered export returned %d records, want 1", len(records))
+	}
+	if got := records[0]["auth_id"]; got != "selected-account" {
+		t.Fatalf("filtered export auth_id = %q, want selected-account", got)
+	}
+
+	legacyRecords, _, err := exportLogRecords(context.Background(), db, logExportFilter{
+		Window:  "all",
+		Scope:   "codex",
+		Account: maskAPIKeyForDisplay(selectedKey),
+		Limit:   10,
+	}, defaultModelPrices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacyRecords) != 0 {
+		t.Fatalf("ambiguous display-mask filter returned %d records, want fail-closed empty result", len(legacyRecords))
 	}
 }
 

@@ -3,10 +3,24 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestModelPriceURLForDiagnosticsDoesNotEchoMalformedCredentials(t *testing.T) {
+	raw := "https://diagnostic-user:diagnostic-password%ZZ@example.com/prices.json?token=secret"
+	got := modelPriceURLForDiagnostics(raw)
+	if got != "<invalid URL>" {
+		t.Fatalf("malformed diagnostic URL = %q", got)
+	}
+	for _, secret := range []string{"diagnostic-user", "diagnostic-password", "token=secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("malformed diagnostic URL leaked %q: %q", secret, got)
+		}
+	}
+}
 
 func TestModelPriceUpdateManagerConcurrentConfigureAndStop(t *testing.T) {
 	priceFile := filepath.Join(t.TempDir(), "model-prices.json")
