@@ -140,10 +140,13 @@ func recordXAIStateIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, st
 		now = time.Now().Unix()
 	}
 	if !rec.Failed && successfulStatusCode(status) {
-		if err := clearRecoveredXAIState(ctx, db, rec); err != nil {
+		changed, err := clearRecoveredXAIState(ctx, db, rec)
+		if err != nil {
 			return err
 		}
-		globalSchedulerState.invalidate()
+		if changed {
+			globalSchedulerState.invalidate()
+		}
 		return nil
 	}
 	state, reason, resetAt := xaiStateForRecord(rec, status, now)
@@ -180,21 +183,26 @@ ON CONFLICT(state_key) DO UPDATE SET
 	return err
 }
 
-func clearRecoveredXAIState(ctx context.Context, db *sql.DB, rec usageRecord) error {
+func clearRecoveredXAIState(ctx context.Context, db *sql.DB, rec usageRecord) (bool, error) {
 	authFile, _ := xaiAuthFileStateForRecord(rec)
 	aliases := normalizeAccountAliases(authFile, rec.AuthID, rec.AuthIndex, rec.Source)
+	changed := false
 	for _, alias := range aliases {
-		if _, err := db.ExecContext(ctx, `
+		result, err := db.ExecContext(ctx, `
 UPDATE xai_account_states SET active=0
 WHERE active=1
 AND state IN (?, ?, ?)
 AND (lower(state_key)=? OR lower(auth_id)=? OR lower(auth_index)=? OR lower(source)=? OR lower(auth_file)=?)`,
 			xaiStateUnauthorized, xaiStateForbidden, xaiStateRateLimited,
-			alias, alias, alias, alias, alias); err != nil {
-			return err
+			alias, alias, alias, alias, alias)
+		if err != nil {
+			return false, err
+		}
+		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+			changed = true
 		}
 	}
-	return nil
+	return changed, nil
 }
 
 func expireXAIStates(ctx context.Context, db *sql.DB, now int64) error {
