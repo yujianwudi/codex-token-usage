@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.37`
+Current version: `0.1.38`
 
 See the [changelog](CHANGELOG.md) for published and superseded versions. Report vulnerabilities through the private process in [SECURITY.md](SECURITY.md).
 
@@ -189,11 +189,11 @@ Each platform zip contains the dynamic library, `LICENSE`, and `THIRD_PARTY_NOTI
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.37_linux_amd64.zip
-codex-token-usage_0.1.37_linux_arm64.zip
-codex-token-usage_0.1.37_windows_amd64.zip
-codex-token-usage_0.1.37_darwin_amd64.zip
-codex-token-usage_0.1.37_darwin_arm64.zip
+codex-token-usage_0.1.38_linux_amd64.zip
+codex-token-usage_0.1.38_linux_arm64.zip
+codex-token-usage_0.1.38_windows_amd64.zip
+codex-token-usage_0.1.38_darwin_amd64.zip
+codex-token-usage_0.1.38_darwin_arm64.zip
 checksums.txt
 ```
 
@@ -208,7 +208,7 @@ sha256sum -c checksums.txt
 Public releases also carry GitHub build provenance. Set `SOURCE_DIGEST` to the 40-character commit reached by the release tag, as shown on the GitHub Release page, then verify each downloaded asset against the expected repository, workflow, tag, commit, and GitHub-hosted runner:
 
 ```bash
-VERSION=0.1.37
+VERSION=0.1.38
 ASSET="codex-token-usage_${VERSION}_linux_amd64.zip"
 SOURCE_DIGEST="<40-character release commit SHA>"
 

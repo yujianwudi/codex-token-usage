@@ -10,7 +10,7 @@ for tool in jq ln python3 sha256sum unzip zip; do
   fi
 done
 
-version="0.1.37"
+version="0.1.38"
 tmp_root="$(mktemp -d)"
 assets_dir="${tmp_root}/assets"
 backups_dir="${tmp_root}/backups"
