@@ -90,7 +90,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils ca-certificates file gcc git libc6-dev python3 tar unzip zip
+            binutils ca-certificates curl file gcc git libc6-dev python3 tar unzip zip
           rm -rf /var/lib/apt/lists/*
 
       - name: Check out tagged source
