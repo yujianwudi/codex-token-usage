@@ -57,6 +57,10 @@ let loading=false;
 let summaryAbortController=null;
 let summaryStaleRefreshTimer=null;
 const summaryWindowCache=new Map();
+let transientManagementKey='';
+let rejectedManagementKey='';
+let rejectedManagementKeyAt=0;
+clearLegacyPluginManagementKeyStorage();
 const saved=managementKey(); if(saved) keyEl.value=saved;
 selectedProviders=loadSelectedProviders();
 initLanguageControl();
@@ -181,7 +185,6 @@ async function downloadLogExport(){
   }
   const key=managementKey();
   if(!key){showFallbackKeyInput();setLogExportStatus('请填写备用 CPA 管理密钥后导出。','warn');return}
-  safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
   setLogExportStatus('正在导出日志...','');
   const res=await fetch(managementExportApi+'?'+params.toString(),{headers:{Authorization:'Bearer '+key}});
   if(!res.ok){
@@ -326,7 +329,7 @@ function openAutobanReleaseModal(){
 function closeAutobanReleaseModal(){autobanReleaseModal.hidden=true}
 function batchProxyKey(){
   const key=managementKey();
-  if(key){keyEl.value=key;safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key)}
+  if(key)keyEl.value=key;
   return key;
 }
 function showFallbackKeyInput(){
@@ -346,38 +349,45 @@ function managementKey(){
   const rejected=recentRejectedManagementKey();
   let key=typed;
   if(!key){
-    for(const candidate of [cpaStoredManagementKey(),safeStorageGet(safeSessionStorage(),'cpa_token_usage_key')]){
+    for(const candidate of [transientManagementKey,cpaStoredManagementKey()]){
       const value=firstText(candidate);
       if(value&&value!==rejected){key=value;break}
     }
   }
   if(key){
+    transientManagementKey=key;
     keyEl.value=key;
-    safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
-    safeStorageRemove(safeSessionStorage(),'cpa_token_usage_rejected_key');
-    safeStorageRemove(safeSessionStorage(),'cpa_token_usage_rejected_at');
+    rejectedManagementKey='';
+    rejectedManagementKeyAt=0;
     keyEl.classList.remove('on');
   }
   return key;
 }
-function recentRejectedManagementKey(){
+function clearLegacyPluginManagementKeyStorage(){
   const storage=safeSessionStorage();
-  const key=safeStorageGet(storage,'cpa_token_usage_rejected_key')||'';
+  safeStorageRemove(storage,'cpa_token_usage_key');
+  safeStorageRemove(storage,'cpa_token_usage_rejected_key');
+  safeStorageRemove(storage,'cpa_token_usage_rejected_at');
+}
+function recentRejectedManagementKey(){
+  const key=rejectedManagementKey;
   if(!key)return '';
-  const ts=Number(safeStorageGet(storage,'cpa_token_usage_rejected_at')||0);
+  const ts=rejectedManagementKeyAt;
   if(!ts||Date.now()-ts>5*60*1000){
-    safeStorageRemove(storage,'cpa_token_usage_rejected_key');
-    safeStorageRemove(storage,'cpa_token_usage_rejected_at');
+    rejectedManagementKey='';
+    rejectedManagementKeyAt=0;
     return '';
   }
   return key;
 }
 function rejectManagementKey(key){
-  if(key)safeStorageSet(safeSessionStorage(),'cpa_token_usage_rejected_key',key);
-  if(key)safeStorageSet(safeSessionStorage(),'cpa_token_usage_rejected_at',String(Date.now()));
-  safeStorageRemove(safeSessionStorage(),'cpa_token_usage_key');
-  keyEl.value='';
-  showFallbackKeyInput();
+  key=firstText(key);
+  if(!key)return;
+  rejectedManagementKey=key;
+  rejectedManagementKeyAt=Date.now();
+  if(firstText(transientManagementKey)===key)transientManagementKey='';
+  if(firstText(keyEl.value)===key)keyEl.value='';
+  if(!firstText(transientManagementKey)&&!firstText(keyEl.value))showFallbackKeyInput();
 }
 function cpaStoredManagementKey(){
   return firstText(
@@ -1063,7 +1073,6 @@ async function readAuthImportFiles(e){
 function authImportKey(){
   const key=managementKey();
   if(!key){showFallbackKeyInput();setAuthImportStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');return ''}
-  safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
   return key;
 }
 function setAuthImportBusy(busy){
@@ -1869,7 +1878,7 @@ async function load(forceRefresh=false,syncRefresh=false,options={}){
   const controller=new AbortController();
   summaryAbortController=controller;
   loading=true;
-  const key=managementKey(); if(key)safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
+  const key=managementKey();
   const win=document.getElementById('window').value;
   const st=document.getElementById('status'); st.textContent=lastData&&options.keepExisting?tr('正在更新当前窗口...'):tr('加载中...');
   try{

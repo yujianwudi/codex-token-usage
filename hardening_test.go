@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -55,15 +54,13 @@ func TestPrivacySafeAPIKeyIsStableAndDoesNotContainRawSecret(t *testing.T) {
 
 func TestLoadOrCreateAPIKeySecretUsesCacheBeforeFilesystem(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "cached-secret")
+	dbPath := filepath.Join(dir, "cached.db")
 	want := bytes.Repeat([]byte{0x5a}, 32)
-	key := filepath.Clean(dir)
-	if runtime.GOOS == "windows" {
-		key = strings.ToLower(key)
-	}
+	key := apiKeySecretCacheKey(dbPath)
 	apiKeySecrets.Lock()
-	apiKeySecrets.byDir[key] = append([]byte(nil), want...)
+	apiKeySecrets.byDB[key] = append([]byte(nil), want...)
 	apiKeySecrets.Unlock()
-	got, err := loadOrCreateAPIKeySecret(dir)
+	got, err := loadOrCreateAPIKeySecret(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}

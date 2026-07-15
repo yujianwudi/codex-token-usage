@@ -7,7 +7,7 @@ const dashboardBody = `</style>
   <div class="hero">
     <div><h1>CPA Token Usage</h1><div class="hint" id="pool-hero-hint">按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、5h/7d 额度窗口和最近异常。</div></div>
     <div class="controls">
-      <input id="key" class="fallback-key" type="password" autocomplete="current-password" aria-label="CPA 管理密码备用输入" placeholder="管理密钥备用输入">
+      <input id="key" class="fallback-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" aria-label="CPA 管理密码备用输入" placeholder="管理密钥备用输入">
       <button id="auth-import-open" class="ghost" type="button">账号 JSON 导入</button>
       <button id="batch-proxy-open" class="ghost" type="button">批量写入代理</button>
       <select id="language" data-no-i18n aria-label="语言"><option value="zh">中文</option><option value="en">English</option></select>

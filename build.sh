@@ -4,10 +4,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 source scripts/semver.sh
 
+goos="$(go env GOOS)"
 ext="so"
-case "$(go env GOOS)" in
+case "${goos}" in
   windows) ext="dll" ;;
-  darwin) ext="dylib" ;;
+  darwin)
+    ext="dylib"
+    # Go 1.26 supports macOS 12 and later. Pin the deployment target so a
+    # newer hosted runner cannot silently raise the plugin's minimum macOS.
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+    if [[ ! "${MACOSX_DEPLOYMENT_TARGET}" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+      echo "Invalid MACOSX_DEPLOYMENT_TARGET: ${MACOSX_DEPLOYMENT_TARGET}" >&2
+      exit 1
+    fi
+    ;;
 esac
 
 ldflags="-s -w"

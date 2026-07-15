@@ -5,12 +5,22 @@ on:
     tags:
       - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer to build, with or without the v prefix"
+        required: true
+        type: string
+      publish_prerelease:
+        description: "Publish a prerelease tag from this exact commit"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'push' && github.ref_name || (startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version)) }}
   cancel-in-progress: false
 
 env:
@@ -20,23 +30,74 @@ env:
 
 jobs:
   validate:
-    name: Validate release tag
+    name: Validate release request
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - name: Check out tagged source
+      - name: Check out release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate tag and source version
+      - name: Validate version, source, and immutable tag event
         id: version
         shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          PUBLISH_PRERELEASE: ${{ inputs.publish_prerelease }}
+          TAG_CREATED: ${{ github.event.created }}
+          TAG_FORCED: ${{ github.event.forced }}
         run: |
-          version="$(bash scripts/resolve-release-version.sh "${GITHUB_REF_NAME}")"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            if [[ "${TAG_CREATED}" != "true" || "${TAG_FORCED}" == "true" ]]; then
+              echo "Release tags are immutable; tag updates and force-pushes are rejected" >&2
+              exit 1
+            fi
+            release_ref="${GITHUB_REF_NAME}"
+          else
+            requested="${REQUESTED_VERSION#v}"
+            if [[ -z "${requested}" ]]; then
+              echo "Manual release validation requires an explicit version" >&2
+              exit 1
+            fi
+            release_ref="v${requested}"
+          fi
+
+          version="$(bash scripts/resolve-release-version.sh "${release_ref}")"
+          tag="v${version}"
+          version_without_build="${version%%+*}"
+          prerelease=false
+          if [[ "${version_without_build}" == *-* ]]; then
+            prerelease=true
+          fi
+
+          publish=false
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            publish=true
+            remote_refs="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}")"
+            remote_commit="$(awk '$2 ~ /\^\{\}$/ { print $1; found=1 } END { if (!found && NR > 0) print first } NR == 1 { first=$1 }' <<< "${remote_refs}" | tail -n 1)"
+            if [[ -z "${remote_commit}" || "${remote_commit}" != "$(git rev-parse HEAD)" ]]; then
+              echo "Remote tag ${tag} no longer resolves to the workflow commit" >&2
+              exit 1
+            fi
+          elif [[ "${PUBLISH_PRERELEASE}" == "true" ]]; then
+            if [[ "${prerelease}" != "true" ]]; then
+              echo "Manual publishing is restricted to prerelease SemVer versions" >&2
+              exit 1
+            fi
+            publish=true
+          fi
+
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "publish=${publish}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
 
   source-security:
     name: Source security gate
@@ -44,7 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Check out tagged source
+      - name: Check out release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -78,7 +139,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     container:
-      image: ubuntu:20.04
+      # Keep the glibc 2.31 build root reproducible on both amd64 and arm64.
+      image: ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214
     env:
       GOOS: linux
       GOARCH: ${{ matrix.goarch }}
@@ -93,7 +155,7 @@ jobs:
             binutils ca-certificates curl file gcc git libc6-dev python3 tar unzip zip
           rm -rf /var/lib/apt/lists/*
 
-      - name: Check out tagged source
+      - name: Check out release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -153,25 +215,31 @@ jobs:
         include:
           - goos: darwin
             goarch: amd64
-            runner: macos-15
+            # macos-15-intel is the current standard x64 label; format() keeps
+            # older actionlint runner catalogs from rejecting the valid label.
+            runner: ${{ format('macos-15-{0}', 'intel') }}
             ext: dylib
+            macos_target: "12.0"
           - goos: darwin
             goarch: arm64
-            runner: macos-latest
+            runner: macos-15
             ext: dylib
+            macos_target: "12.0"
           - goos: windows
             goarch: amd64
-            runner: windows-latest
+            runner: windows-2025
             ext: dll
+            macos_target: ""
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     env:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
       CGO_ENABLED: "1"
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
       PLUGIN_VERSION: ${{ needs.validate.outputs.version }}
     steps:
-      - name: Check out tagged source
+      - name: Check out release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -181,6 +249,15 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Verify native build host architecture
+        shell: bash
+        run: |
+          host_arch="$(go env GOHOSTARCH)"
+          if [[ "${host_arch}" != "${GOARCH}" ]]; then
+            echo "CGO release builds must be native: host=${host_arch} target=${GOARCH}" >&2
+            exit 1
+          fi
 
       - name: Install Windows C compiler
         if: matrix.goos == 'windows'
@@ -202,6 +279,15 @@ jobs:
       - name: Package
         shell: bash
         run: bash ./package-release.sh dist
+
+      - name: Shared-library ABI and architecture smoke test
+        shell: bash
+        run: bash scripts/smoke-abi.sh "./codex-token-usage.${{ matrix.ext }}" "${GOOS}" "${GOARCH}"
+
+      - name: Enforce Darwin architecture and macOS 12 compatibility
+        if: matrix.goos == 'darwin'
+        shell: bash
+        run: bash scripts/check-macho.sh ./codex-token-usage.dylib "${GOARCH}" "${MACOSX_DEPLOYMENT_TARGET}"
 
       - name: Binary vulnerability scan
         shell: bash
@@ -226,21 +312,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: Publish GitHub Release
+  verify-assets:
+    name: Verify complete release bundle
     needs:
       - validate
       - build-linux
       - build-other
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
     steps:
-      - name: Check out tagged source
+      - name: Check out release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -255,6 +336,105 @@ jobs:
         shell: bash
         run: bash scripts/verify-release-assets.sh "${{ needs.validate.outputs.version }}" release-assets
 
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cpa-plugin-release-${{ needs.validate.outputs.version }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - verify-assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: needs.validate.outputs.publish == 'true'
+    concurrency:
+      group: publish-${{ needs.validate.outputs.tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download verified release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cpa-plugin-release-${{ needs.validate.outputs.version }}
+          path: release-assets
+
+      - name: Refuse tag or release replacement
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          github_api_status() {
+            local endpoint="$1"
+            local response exit_code status
+            set +e
+            response="$(gh api --include "${endpoint}" 2>&1)"
+            exit_code=$?
+            set -e
+            status="$(awk '/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/ { code=$2 } END { print code }' <<< "${response}")"
+            if [[ -z "${status}" ]]; then
+              echo "GitHub API request failed before returning an HTTP status: ${endpoint} (exit ${exit_code})" >&2
+              return 1
+            fi
+            printf '%s\n' "${status}"
+          }
+
+          release_status="$(github_api_status "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          case "${release_status}" in
+            200)
+              echo "Release ${RELEASE_TAG} already exists; published releases are immutable" >&2
+              exit 1
+              ;;
+            404) ;;
+            *)
+              echo "Cannot safely determine whether release ${RELEASE_TAG} exists (HTTP ${release_status})" >&2
+              exit 1
+              ;;
+          esac
+
+          tag_ref_exists=false
+          tag_ref=""
+          tag_status="$(github_api_status "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          case "${tag_status}" in
+            200)
+              tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '[.object.type, .object.sha] | @tsv')"
+              tag_ref_exists=true
+              ;;
+            404) ;;
+            *)
+              echo "Cannot safely determine whether tag ${RELEASE_TAG} exists (HTTP ${tag_status})" >&2
+              exit 1
+              ;;
+          esac
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${tag_ref_exists}" == "true" ]]; then
+            echo "Tag ${RELEASE_TAG} already exists; manual prereleases must use a new tag" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${tag_ref_exists}" != "true" ]]; then
+            echo "Release tag ${RELEASE_TAG} disappeared before publication" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            IFS=$'\t' read -r object_type object_sha <<< "${tag_ref}"
+            for _ in 1 2 3; do
+              [[ "${object_type}" == "tag" ]] || break
+              tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '[.object.type, .object.sha] | @tsv')"
+              IFS=$'\t' read -r object_type object_sha <<< "${tag_object}"
+            done
+            if [[ "${object_type}" != "commit" || "${object_sha}" != "${GITHUB_SHA}" ]]; then
+              echo "Release tag ${RELEASE_TAG} moved away from workflow commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          fi
+
       - name: Attest release provenance
         if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -262,8 +442,12 @@ jobs:
           subject-path: release-assets/*.zip
 
       - name: Create release
-        uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: release-assets/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+          tag_name: ${{ needs.validate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ needs.validate.outputs.prerelease }}
+          make_latest: ${{ needs.validate.outputs.prerelease != 'true' }}

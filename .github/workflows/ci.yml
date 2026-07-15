@@ -45,6 +45,8 @@ jobs:
             bash -n "${script}"
           done
           bash scripts/test-semver.sh
+          bash scripts/test-check-macho.sh
+          bash scripts/test-verify-release-assets.sh
 
       - name: Test
         run: go test ./...

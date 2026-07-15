@@ -106,14 +106,15 @@ type modelPriceDiagnostics struct {
 }
 
 type diagnosticsSummary struct {
-	Database     databaseDiagnostics      `json:"database"`
-	AuthFiles    authDiagnostics          `json:"auth_files"`
-	XAIAuth      xaiAuthSourceDiagnostics `json:"xai_auth"`
-	Scheduler    schedulerDiagnostics     `json:"scheduler"`
-	Providers    providerDiagnostics      `json:"providers"`
-	ModelPrices  modelPriceDiagnostics    `json:"model_prices"`
-	QuotaTrigger quotaTriggerState        `json:"quota_trigger"`
-	Retention    retentionState           `json:"retention"`
+	Database      databaseDiagnostics          `json:"database"`
+	AuthFiles     authDiagnostics              `json:"auth_files"`
+	XAIAuth       xaiAuthSourceDiagnostics     `json:"xai_auth"`
+	Scheduler     schedulerDiagnostics         `json:"scheduler"`
+	Providers     providerDiagnostics          `json:"providers"`
+	ModelPrices   modelPriceDiagnostics        `json:"model_prices"`
+	APIKeyPrivacy apiKeyFingerprintDiagnostics `json:"api_key_privacy"`
+	QuotaTrigger  quotaTriggerState            `json:"quota_trigger"`
+	Retention     retentionState               `json:"retention"`
 }
 
 type dashboardAlert struct {
@@ -132,6 +133,7 @@ type retentionState struct {
 	UsageRetentionDays         int    `json:"usage_retention_days"`
 	QuotaTriggerRetentionDays  int    `json:"quota_trigger_retention_days"`
 	RequestDetailRetentionDays int    `json:"request_detail_retention_days"`
+	CatchUpPending             bool   `json:"catch_up_pending"`
 	LastRunAt                  string `json:"last_run_at,omitempty"`
 	LastError                  string `json:"last_error,omitempty"`
 	LastUsageDeleted           int64  `json:"last_usage_deleted"`
@@ -140,36 +142,51 @@ type retentionState struct {
 	LastSizeAfterBytes         int64  `json:"last_size_after_bytes"`
 }
 
+const (
+	retentionInitialDelay             = time.Minute
+	retentionRegularInterval          = 24 * time.Hour
+	retentionCatchUpInterval          = 30 * time.Second
+	retentionErrorRetryInterval       = 5 * time.Minute
+	retentionBatchPause               = 10 * time.Millisecond
+	retentionBatchSize          int64 = 5000
+	retentionMaxBatchesPerTable       = 4
+	retentionMaxTimePerTable          = time.Second
+)
+
 type retentionCleaner struct {
 	mu     sync.Mutex
 	cfg    pluginConfig
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 	state  retentionState
 }
 
 func (r *retentionCleaner) configure(cfg pluginConfig) {
+	r.stop()
 	r.mu.Lock()
-	if r.cancel != nil {
-		r.cancel()
-		r.cancel = nil
-	}
 	r.cfg = cfg
 	r.state.UsageRetentionDays = cfg.UsageRetentionDays
 	r.state.QuotaTriggerRetentionDays = cfg.QuotaTriggerRetentionDays
 	r.state.RequestDetailRetentionDays = cfg.RequestDetailRetentionDays
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
+	r.wg.Add(1)
 	r.mu.Unlock()
-	go r.loop(ctx, cfg)
+	go func() {
+		defer r.wg.Done()
+		r.loop(ctx, cfg)
+	}()
 }
 
 func (r *retentionCleaner) stop() {
 	r.mu.Lock()
-	if r.cancel != nil {
-		r.cancel()
-		r.cancel = nil
-	}
+	cancel := r.cancel
+	r.cancel = nil
 	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	r.wg.Wait()
 }
 
 func (r *retentionCleaner) status() retentionState {
@@ -179,45 +196,75 @@ func (r *retentionCleaner) status() retentionState {
 }
 
 func (r *retentionCleaner) loop(ctx context.Context, cfg pluginConfig) {
-	r.run(ctx, cfg)
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
+	timer := time.NewTimer(retentionInitialDelay)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			r.run(ctx, cfg)
+		case <-timer.C:
+			more := r.run(ctx, cfg)
+			if ctx.Err() != nil {
+				return
+			}
+			next := retentionRegularInterval
+			if more {
+				next = retentionCatchUpInterval
+				if r.status().LastError != "" {
+					next = retentionErrorRetryInterval
+				}
+			}
+			timer.Reset(next)
 		}
 	}
 }
 
-func (r *retentionCleaner) run(ctx context.Context, cfg pluginConfig) {
+func (r *retentionCleaner) run(ctx context.Context, cfg pluginConfig) bool {
 	db, path, err := globalStore.open(ctx)
 	if err != nil {
-		r.record(err, 0, 0, 0, 0)
-		return
+		if ctx.Err() == nil {
+			r.record(err, 0, 0, 0, 0, true)
+			return true
+		}
+		return false
 	}
 	before := databaseFileSize(path)
 	now := time.Now().Unix()
 	usageCutoff := now - int64(cfg.UsageRetentionDays)*86400
 	triggerCutoff := now - int64(cfg.QuotaTriggerRetentionDays)*86400
-	usageDeleted, err := execDelete(ctx, db, `DELETE FROM usage_events WHERE requested_at < ?`, usageCutoff)
+	usageDeleted, usageMore, err := execDeleteBatchesLimited(ctx, db, `
+DELETE FROM usage_events
+WHERE id IN (
+  SELECT id FROM usage_events WHERE requested_at < ? ORDER BY id LIMIT ?
+)`, usageCutoff, retentionBatchSize, retentionMaxBatchesPerTable, retentionMaxTimePerTable)
 	if err != nil {
-		r.record(err, usageDeleted, 0, before, databaseFileSize(path))
-		return
+		if ctx.Err() == nil {
+			r.record(err, usageDeleted, 0, before, databaseFileSize(path), true)
+			return true
+		}
+		return false
 	}
-	triggerDeleted, err := execDelete(ctx, db, `DELETE FROM quota_trigger_runs WHERE finished_at < ?`, triggerCutoff)
+	triggerDeleted, triggerMore, err := execDeleteBatchesLimited(ctx, db, `
+DELETE FROM quota_trigger_runs
+WHERE id IN (
+  SELECT id FROM quota_trigger_runs WHERE finished_at < ? ORDER BY id LIMIT ?
+)`, triggerCutoff, retentionBatchSize, retentionMaxBatchesPerTable, retentionMaxTimePerTable)
 	if err != nil {
-		r.record(err, usageDeleted, triggerDeleted, before, databaseFileSize(path))
-		return
+		if ctx.Err() == nil {
+			r.record(err, usageDeleted, triggerDeleted, before, databaseFileSize(path), true)
+			return true
+		}
+		return false
 	}
-	r.record(nil, usageDeleted, triggerDeleted, before, databaseFileSize(path))
+	more := usageMore || triggerMore
+	r.record(nil, usageDeleted, triggerDeleted, before, databaseFileSize(path), more)
+	return more
 }
 
-func (r *retentionCleaner) record(err error, usageDeleted, triggerDeleted, before, after int64) {
+func (r *retentionCleaner) record(err error, usageDeleted, triggerDeleted, before, after int64, catchUpPending bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.state.CatchUpPending = catchUpPending
 	r.state.LastRunAt = time.Now().Format(time.RFC3339)
 	r.state.LastUsageDeleted = usageDeleted
 	r.state.LastQuotaTriggerDeleted = triggerDeleted
@@ -230,29 +277,60 @@ func (r *retentionCleaner) record(err error, usageDeleted, triggerDeleted, befor
 	}
 }
 
-func execDelete(ctx context.Context, db *sql.DB, query string, cutoff int64) (int64, error) {
-	res, err := db.ExecContext(ctx, query, cutoff)
-	if err != nil {
-		return 0, err
+func execDeleteBatches(ctx context.Context, db *sql.DB, query string, cutoff int64, batchSize int64) (int64, error) {
+	total, _, err := execDeleteBatchesLimited(ctx, db, query, cutoff, batchSize, 0, 0)
+	return total, err
+}
+
+func execDeleteBatchesLimited(ctx context.Context, db *sql.DB, query string, cutoff int64, batchSize int64, maxBatches int, maxDuration time.Duration) (int64, bool, error) {
+	if batchSize <= 0 {
+		batchSize = retentionBatchSize
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, nil
+	started := time.Now()
+	var total int64
+	for batch := 0; ; batch++ {
+		if (maxBatches > 0 && batch >= maxBatches) || (maxDuration > 0 && batch > 0 && time.Since(started) >= maxDuration) {
+			return total, true, nil
+		}
+		res, err := db.ExecContext(ctx, query, cutoff, batchSize)
+		if err != nil {
+			return total, false, err
+		}
+		deleted, err := res.RowsAffected()
+		if err != nil {
+			return total, false, err
+		}
+		total += deleted
+		if deleted < batchSize {
+			return total, false, nil
+		}
+		if (maxBatches > 0 && batch+1 >= maxBatches) || (maxDuration > 0 && time.Since(started) >= maxDuration) {
+			return total, true, nil
+		}
+		timer := time.NewTimer(retentionBatchPause)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return total, false, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return n, nil
 }
 
 func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts []accountRow, providers []providerRow, invalidAuths []invalidAuthRow, autobans []autobanRow, externalAlerts []externalUseAlert) diagnosticsSummary {
 	priceState := globalModelPriceUpdater.status()
 	return diagnosticsSummary{
-		Database:     queryDatabaseDiagnostics(ctx, db, dbPath),
-		AuthFiles:    buildAuthDiagnostics(accounts, invalidAuths, autobans, externalAlerts),
-		XAIAuth:      globalXAIAuthSource.status(),
-		Scheduler:    globalSchedulerDiagnostics.status(len(autobans)),
-		Providers:    buildProviderDiagnostics(providers),
-		ModelPrices:  buildModelPriceDiagnostics(priceState),
-		QuotaTrigger: globalQuotaTrigger.status(),
-		Retention:    globalRetentionCleaner.status(),
+		Database:      queryDatabaseDiagnostics(ctx, db, dbPath),
+		AuthFiles:     buildAuthDiagnostics(accounts, invalidAuths, autobans, externalAlerts),
+		XAIAuth:       globalXAIAuthSource.status(),
+		Scheduler:     globalSchedulerDiagnostics.status(len(autobans)),
+		Providers:     buildProviderDiagnostics(providers),
+		ModelPrices:   buildModelPriceDiagnostics(priceState),
+		APIKeyPrivacy: apiKeyFingerprintStatus(ctx, db),
+		QuotaTrigger:  globalQuotaTrigger.status(),
+		Retention:     globalRetentionCleaner.status(),
 	}
 }
 
@@ -413,13 +491,13 @@ func possibleProviderDuplicates(providers []providerRow) []string {
 func buildModelPriceDiagnostics(state modelPriceUpdateState) modelPriceDiagnostics {
 	out := modelPriceDiagnostics{
 		Enabled:        state.Enabled,
-		URL:            state.URL,
+		URL:            modelPriceURLForDiagnostics(state.URL),
 		Path:           state.Path,
 		IntervalHours:  state.IntervalHours,
 		TimeoutSeconds: state.TimeoutSeconds,
 		LastCheckedAt:  state.LastCheckedAt,
 		LastUpdatedAt:  state.LastUpdatedAt,
-		LastError:      state.LastError,
+		LastError:      sanitizeModelPriceDiagnosticText(state.LastError),
 		FileSizeBytes:  state.FileSizeBytes,
 		Entries:        state.Entries,
 		LoadedPrices:   state.LoadedPrices,
@@ -781,9 +859,9 @@ LIMIT ?`
 			"provider":                 provider,
 			"account":                  account,
 			"api_key":                  maskAPIKeyForDisplay(apiKey),
-			"auth_id":                  safeExportLabel(authID),
-			"auth_index":               safeExportLabel(authIndex),
-			"source":                   safeExportLabel(source),
+			"auth_id":                  safeExportIdentity(authID, apiKey),
+			"auth_index":               safeExportIdentity(authIndex, apiKey),
+			"source":                   safeExportIdentity(source, apiKey),
 			"model":                    model,
 			"alias":                    alias,
 			"status_code":              strconv.Itoa(status),
@@ -941,6 +1019,10 @@ func safeExportLabel(value string) string {
 	if value == "" {
 		return ""
 	}
+	value = maskEmbeddedStoredFingerprints(value)
+	if strings.Contains(value, "****") {
+		return value
+	}
 	if _, ok := storedAPIKeyFingerprintLast4(value); ok {
 		return maskAPIKeyForDisplay(value)
 	}
@@ -949,6 +1031,44 @@ func safeExportLabel(value string) string {
 	}
 	if apiKeyPrefixLength(value) > 0 {
 		return maskAPIKeyForDisplay(value)
+	}
+	if looksLikeOpaqueCredential(value) {
+		return maskAPIKeyForDisplay(value)
+	}
+	return value
+}
+
+func safeExportIdentity(value, storedAPIKey string) string {
+	value = strings.TrimSpace(value)
+	storedAPIKey = strings.TrimSpace(storedAPIKey)
+	if value == "" || storedAPIKey == "" {
+		return safeExportLabel(value)
+	}
+	masked := maskAPIKeyForDisplay(storedAPIKey)
+	value = strings.ReplaceAll(value, "Bearer "+storedAPIKey, masked)
+	value = strings.ReplaceAll(value, "bearer "+storedAPIKey, masked)
+	value = strings.ReplaceAll(value, storedAPIKey, masked)
+	return safeExportLabel(value)
+}
+
+func maskEmbeddedStoredFingerprints(value string) string {
+	const fingerprintLength = len("keyfp:v1:") + 32 + 1 + 4
+	for offset := 0; offset < len(value); {
+		index := strings.Index(strings.ToLower(value[offset:]), "keyfp:")
+		if index < 0 {
+			break
+		}
+		index += offset
+		if len(value)-index < fingerprintLength {
+			break
+		}
+		candidate := value[index : index+fingerprintLength]
+		if _, ok := storedAPIKeyFingerprintLast4(candidate); !ok {
+			offset = index + len("keyfp:")
+			continue
+		}
+		value = value[:index] + maskAPIKeyForDisplay(candidate) + value[index+fingerprintLength:]
+		offset = index + len("key-****")
 	}
 	return value
 }
@@ -1005,21 +1125,8 @@ func maskCredentialForDisplay(value string, prefixLen int) string {
 }
 
 func storedAPIKeyFingerprintLast4(value string) (string, bool) {
-	parts := strings.Split(value, ":")
-	if len(parts) != 4 || !strings.EqualFold(parts[0], "keyfp") || (parts[1] != "v0" && parts[1] != "v1") || len(parts[2]) != 32 || len(parts[3]) != 4 {
-		return "", false
-	}
-	for _, r := range parts[2] {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
-			return "", false
-		}
-	}
-	for _, r := range parts[3] {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
-			return "", false
-		}
-	}
-	return parts[3], true
+	_, _, suffix, ok := parseAPIKeyFingerprint(value)
+	return suffix, ok
 }
 
 func successRateBackend(requests, failed int64) float64 {

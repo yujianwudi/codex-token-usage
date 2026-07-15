@@ -2,11 +2,59 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestXAITierCachePrunesExpiredAndBoundsSize(t *testing.T) {
+	now := time.Now()
+	m := &xaiAuthSourceManager{tierCache: map[string]cachedXAITier{
+		"expired": {FetchedAt: now.Add(-xaiTierCacheTTL - time.Second)},
+	}}
+	for i := 0; i < xaiTierCacheMaxItems; i++ {
+		m.tierCache[fmt.Sprintf("key-%04d", i)] = cachedXAITier{FetchedAt: now.Add(time.Duration(i) * time.Millisecond)}
+	}
+	m.pruneTierCacheLocked(now)
+	if _, ok := m.tierCache["expired"]; ok {
+		t.Fatal("expired xAI tier cache entry was retained")
+	}
+	if len(m.tierCache) >= xaiTierCacheMaxItems {
+		t.Fatalf("tier cache size = %d, want room for a new entry", len(m.tierCache))
+	}
+}
+
+func TestXAITierCacheTTLAppliesWhenVersionIsUnchanged(t *testing.T) {
+	oldCaller := hostAuthCaller
+	t.Cleanup(func() { hostAuthCaller = oldCaller })
+
+	const authIndex = "xai-stable-version"
+	m := &xaiAuthSourceManager{tierCache: map[string]cachedXAITier{
+		authIndex: {
+			Version:   "unchanged",
+			FetchedAt: time.Now().Add(-xaiTierCacheTTL - time.Second),
+			Value:     xaiTierClassification{Tier: xaiTierFree, Source: "cached"},
+		},
+	}}
+	calls := 0
+	hostAuthCaller = func(method string, payload any) (json.RawMessage, error) {
+		if method != "host.auth.get" {
+			return nil, os.ErrNotExist
+		}
+		calls++
+		return json.Marshal(hostAuthGetResponse{AuthIndex: authIndex, JSON: json.RawMessage(`{"tier":"heavy"}`)})
+	}
+
+	classification, err := m.classifyHostEntry(hostAuthFileEntry{AuthIndex: authIndex, UpdatedAt: "unchanged"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || classification.Tier != xaiTierHeavy {
+		t.Fatalf("calls=%d classification=%+v, want one refresh to heavy", calls, classification)
+	}
+}
 
 func TestXAITierClassificationMatchesGrokSignals(t *testing.T) {
 	tests := []struct {

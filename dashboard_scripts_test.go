@@ -139,3 +139,36 @@ func TestInsightRowsEscapeAllInnerHTMLFields(t *testing.T) {
 		t.Fatalf("both insight render paths must escape every dynamic field; found %d safe renderers", count)
 	}
 }
+
+func TestManagementKeyIsNotCopiedIntoWebStorage(t *testing.T) {
+	for _, marker := range []string{
+		"safeStorageSet(safeSessionStorage(),'cpa_token_usage_key'",
+		"safeStorageSet(safeSessionStorage(),'cpa_token_usage_rejected_key'",
+		"safeStorageSet(safeSessionStorage(),'cpa_token_usage_rejected_at'",
+	} {
+		if strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("plugin dashboard must not copy management-key state into Web Storage: %q", marker)
+		}
+	}
+	for _, marker := range []string{"let transientManagementKey=''", "let rejectedManagementKey=''", "transientManagementKey=key"} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard script missing in-memory management-key marker %q", marker)
+		}
+	}
+	for _, marker := range []string{
+		"if(firstText(transientManagementKey)===key)transientManagementKey=''",
+		"if(firstText(keyEl.value)===key)keyEl.value=''",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("stale 401 protection missing marker %q", marker)
+		}
+	}
+	if !strings.Contains(dashboardHTML, `id="key"`) || !strings.Contains(dashboardHTML, `autocomplete="off"`) {
+		t.Fatal("management-key input must not opt into browser password persistence")
+	}
+	for _, legacyName := range []string{"cpa_token_usage_key", "cpa_token_usage_rejected_key", "cpa_token_usage_rejected_at"} {
+		if !strings.Contains(dashboardScripts, "safeStorageRemove(storage,'"+legacyName+"')") {
+			t.Fatalf("dashboard must scrub legacy session storage entry %q after upgrade", legacyName)
+		}
+	}
+}

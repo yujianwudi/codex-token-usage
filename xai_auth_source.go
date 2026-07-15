@@ -12,9 +12,11 @@ import (
 )
 
 const (
-	xaiTierFree  = "free"
-	xaiTierSuper = "super"
-	xaiTierHeavy = "heavy"
+	xaiTierFree          = "free"
+	xaiTierSuper         = "super"
+	xaiTierHeavy         = "heavy"
+	xaiTierCacheMaxItems = 1024
+	xaiTierCacheTTL      = 30 * time.Minute
 )
 
 type hostCallFunc func(method string, payload any) (json.RawMessage, error)
@@ -217,9 +219,15 @@ func (m *xaiAuthSourceManager) classifyHostEntry(entry hostAuthFileEntry) (xaiTi
 	cacheKey := normalizeAccountAlias(entry.AuthIndex)
 	version := strings.TrimSpace(entry.UpdatedAt)
 	m.mu.Lock()
-	if cached, ok := m.tierCache[cacheKey]; ok && ((version != "" && cached.Version == version) || (version == "" && time.Since(cached.FetchedAt) < 5*time.Minute)) {
-		m.mu.Unlock()
-		return cached.Value, nil
+	if cached, ok := m.tierCache[cacheKey]; ok {
+		age := time.Since(cached.FetchedAt)
+		fresh := age >= 0 && age < xaiTierCacheTTL
+		versionMatches := version != "" && cached.Version == version
+		unversionedFresh := version == "" && age >= 0 && age < 5*time.Minute
+		if fresh && (versionMatches || unversionedFresh) {
+			m.mu.Unlock()
+			return cached.Value, nil
+		}
 	}
 	m.mu.Unlock()
 	raw, err := hostAuthCaller("host.auth.get", hostAuthGetRequest{AuthIndex: entry.AuthIndex})
@@ -235,9 +243,29 @@ func (m *xaiAuthSourceManager) classifyHostEntry(entry hostAuthFileEntry) (xaiTi
 	if m.tierCache == nil {
 		m.tierCache = make(map[string]cachedXAITier)
 	}
-	m.tierCache[cacheKey] = cachedXAITier{Version: version, FetchedAt: time.Now(), Value: classification}
+	now := time.Now()
+	m.pruneTierCacheLocked(now)
+	m.tierCache[cacheKey] = cachedXAITier{Version: version, FetchedAt: now, Value: classification}
 	m.mu.Unlock()
 	return classification, nil
+}
+
+func (m *xaiAuthSourceManager) pruneTierCacheLocked(now time.Time) {
+	oldestKey := ""
+	var oldest time.Time
+	for key, cached := range m.tierCache {
+		if now.Sub(cached.FetchedAt) > xaiTierCacheTTL {
+			delete(m.tierCache, key)
+			continue
+		}
+		if oldestKey == "" || cached.FetchedAt.Before(oldest) {
+			oldestKey = key
+			oldest = cached.FetchedAt
+		}
+	}
+	if len(m.tierCache) >= xaiTierCacheMaxItems && oldestKey != "" {
+		delete(m.tierCache, oldestKey)
+	}
 }
 
 func (m *xaiAuthSourceManager) markFilesystemFallback(accounts []configuredAccount, err error) {

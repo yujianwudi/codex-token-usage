@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/semver.sh
 
-valid=(0.1.33 1.2.3-rc.1 1.2.3-alpha.beta 1.2.3+build.7 1.2.3-rc.1+build.7)
+valid=(0.1.34 1.2.3-rc.1 1.2.3-alpha.beta 1.2.3+build.7 1.2.3-rc.1+build.7)
 invalid=(01.2.3 1.02.3 1.2.03 1.2.3-01 1.2.3-alpha.01 1.2 1.2.3- 1.2.3+)
 
 for version in "${valid[@]}"; do

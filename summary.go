@@ -61,21 +61,24 @@ type storeRevision struct {
 }
 
 type summaryPrecomputeManager struct {
-	mu         sync.Mutex
-	refreshMu  sync.Mutex
-	cfg        pluginConfig
-	cancel     context.CancelFunc
-	entries    map[summaryCacheKey]summaryCacheEntry
-	refreshing map[summaryCacheKey]bool
-	active     map[summaryCacheKey]time.Time
+	lifecycleMu sync.Mutex
+	mu          sync.Mutex
+	refreshMu   sync.Mutex
+	cfg         pluginConfig
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	stopping    bool
+	entries     map[summaryCacheKey]summaryCacheEntry
+	refreshing  map[summaryCacheKey]bool
+	active      map[summaryCacheKey]time.Time
 }
 
 func (m *summaryPrecomputeManager) configure(cfg pluginConfig) {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.stopCurrent()
 	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
 	m.cfg = cfg
 	if m.entries == nil {
 		m.entries = map[summaryCacheKey]summaryCacheEntry{}
@@ -87,27 +90,49 @@ func (m *summaryPrecomputeManager) configure(cfg pluginConfig) {
 		m.active = map[summaryCacheKey]time.Time{}
 	}
 	if !cfg.SummaryPrecomputeEnabled {
+		m.stopping = true
 		m.mu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	m.ctx = ctx
 	m.cancel = cancel
+	m.stopping = false
+	m.wg.Add(1)
 	m.mu.Unlock()
-	go m.loop(ctx, cfg)
+	go func() {
+		defer m.wg.Done()
+		m.loop(ctx, cfg)
+	}()
 }
 
 func (m *summaryPrecomputeManager) stop() {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.stopCurrent()
+}
+
+func (m *summaryPrecomputeManager) stopCurrent() {
 	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
+	m.stopping = true
+	cancel := m.cancel
+	m.cancel = nil
+	m.ctx = nil
 	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	m.wg.Wait()
 }
 
 func (m *summaryPrecomputeManager) loop(ctx context.Context, cfg pluginConfig) {
+	if !waitForBackgroundStartup(ctx, summaryPrecomputeStartupGrace) {
+		return
+	}
 	if cfg.SummaryPrecomputeMode == "legacy" {
 		_ = m.refresh(ctx, globalStore, cfg, defaultSummaryPrecomputeKeys())
+	} else {
+		_ = m.refresh(ctx, globalStore, cfg, m.activeKeys(cfg))
 	}
 	ticker := time.NewTicker(time.Duration(cfg.SummaryPrecomputeIntervalSeconds) * time.Second)
 	defer ticker.Stop()
@@ -365,6 +390,10 @@ func (m *summaryPrecomputeManager) refreshAsyncMode(store *store, cfg pluginConf
 	}
 	key = normalizeSummaryCacheKey(key)
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return
+	}
 	if m.refreshing == nil {
 		m.refreshing = map[summaryCacheKey]bool{}
 	}
@@ -381,16 +410,25 @@ func (m *summaryPrecomputeManager) refreshAsyncMode(store *store, cfg pluginConf
 			}
 		}
 	}
+	rootCtx := m.ctx
+	if rootCtx == nil {
+		var cancel context.CancelFunc
+		rootCtx, cancel = context.WithCancel(context.Background())
+		m.ctx = rootCtx
+		m.cancel = cancel
+	}
 	m.refreshing[key] = true
+	m.wg.Add(1)
 	m.mu.Unlock()
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	go func(parent context.Context) {
+		defer m.wg.Done()
+		ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
 		defer cancel()
 		_ = m.refresh(ctx, store, cfg, []summaryCacheKey{key})
 		m.mu.Lock()
 		delete(m.refreshing, key)
 		m.mu.Unlock()
-	}()
+	}(rootCtx)
 }
 
 func (m *summaryPrecomputeManager) cached(ctx context.Context, store *store, key summaryCacheKey, cfg pluginConfig, revision string) (map[string]any, bool) {
@@ -1445,9 +1483,11 @@ func codexAPIKeyProviderScopeSQL(entries []providerConfigEntry) string {
 		if !strings.EqualFold(entry.Provider, "Codex") || strings.TrimSpace(entry.APIKey) == "" {
 			continue
 		}
-		key := strings.TrimSpace(entry.APIKey)
+		key := configuredAPIKeyStorageValue(entry.APIKey)
+		if key == "" {
+			continue
+		}
 		parts = append(parts, "source = "+sqlQuote(key))
-		parts = append(parts, "source = "+sqlQuote("Bearer "+key))
 	}
 	if len(parts) == 0 {
 		return "0=1"
