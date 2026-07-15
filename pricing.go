@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type modelPrice struct {
@@ -38,6 +39,14 @@ type costSummary struct {
 	CostUSD        float64
 	UnpricedTokens int64
 }
+
+var modelPriceFileCache = struct {
+	sync.Mutex
+	path    string
+	modTime int64
+	size    int64
+	prices  map[string]modelPrice
+}{}
 
 func defaultModelPrices() map[string]modelPrice {
 	prices := map[string]modelPrice{
@@ -76,6 +85,16 @@ func defaultModelPrices() map[string]modelPrice {
 func readModelPricesFromFile() map[string]modelPrice {
 	globalModelPriceUpdater.ensureFresh()
 	path := modelPriceFilePath()
+	info, err := os.Stat(path)
+	if err != nil || info.Size() <= 0 {
+		return nil
+	}
+	modelPriceFileCache.Lock()
+	defer modelPriceFileCache.Unlock()
+	modTime := info.ModTime().UnixNano()
+	if modelPriceFileCache.path == path && modelPriceFileCache.modTime == modTime && modelPriceFileCache.size == info.Size() {
+		return cloneModelPrices(modelPriceFileCache.prices)
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -98,10 +117,28 @@ func readModelPricesFromFile() map[string]modelPrice {
 			registerPriceCandidate(prices, sourceModel, price)
 		}
 	}
-	return prices
+	modelPriceFileCache.path = path
+	modelPriceFileCache.modTime = modTime
+	modelPriceFileCache.size = info.Size()
+	modelPriceFileCache.prices = cloneModelPrices(prices)
+	return cloneModelPrices(prices)
+}
+
+func cloneModelPrices(prices map[string]modelPrice) map[string]modelPrice {
+	if len(prices) == 0 {
+		return nil
+	}
+	out := make(map[string]modelPrice, len(prices))
+	for key, price := range prices {
+		out[key] = price
+	}
+	return out
 }
 
 func modelPriceFromJSON(entry map[string]any) (modelPrice, bool) {
+	if !validModelPriceEntry(entry) {
+		return modelPrice{}, false
+	}
 	var price modelPrice
 	price.Prompt = firstPositiveFloat(
 		floatFromAny(entry["prompt"]),
@@ -115,31 +152,72 @@ func modelPriceFromJSON(entry map[string]any) (modelPrice, bool) {
 		floatFromAny(entry["completion_price_per1_m"]),
 		perTokenToPerMillion(floatFromAny(entry["output_cost_per_token"])),
 	)
-	if v, ok := firstPresentFloat(entry, "cache", "cache_price_per_1m", "cache_price_per1_m", "input_cost_per_token_cache_hit", "cache_read_input_token_cost"); ok {
+	if v, present, valid := firstPresentFloat(entry, "cache", "cache_price_per_1m", "cache_price_per1_m", "input_cost_per_token_cache_hit", "cache_read_input_token_cost"); present && valid {
 		if strings.Contains(detectedPriceKey(entry, "cache", "cache_price_per_1m", "cache_price_per1_m", "input_cost_per_token_cache_hit", "cache_read_input_token_cost"), "_cost") {
 			v = perTokenToPerMillion(v)
 		}
 		price.Cache = v
 		price.CacheSet = true
+	} else if present {
+		return modelPrice{}, false
 	}
-	if v, ok := firstPresentFloat(entry, "cacheRead", "cache_read", "cache_read_per_1m", "cache_read_input_token_cost"); ok {
+	if v, present, valid := firstPresentFloat(entry, "cacheRead", "cache_read", "cache_read_per_1m", "cache_read_input_token_cost"); present && valid {
 		if strings.Contains(detectedPriceKey(entry, "cacheRead", "cache_read", "cache_read_per_1m", "cache_read_input_token_cost"), "_cost") {
 			v = perTokenToPerMillion(v)
 		}
 		price.CacheRead = v
 		price.CacheReadSet = true
+	} else if present {
+		return modelPrice{}, false
 	}
-	if v, ok := firstPresentFloat(entry, "cacheCreation", "cache_creation", "cache_creation_per_1m", "cache_creation_price_per_1m", "cache_creation_price_per1_m", "cache_creation_input_token_cost"); ok {
+	if v, present, valid := firstPresentFloat(entry, "cacheCreation", "cache_creation", "cache_creation_per_1m", "cache_creation_price_per_1m", "cache_creation_price_per1_m", "cache_creation_input_token_cost"); present && valid {
 		if strings.Contains(detectedPriceKey(entry, "cacheCreation", "cache_creation", "cache_creation_per_1m", "cache_creation_price_per_1m", "cache_creation_price_per1_m", "cache_creation_input_token_cost"), "_cost") {
 			v = perTokenToPerMillion(v)
 		}
 		price.CacheCreation = v
 		price.CacheCreateSet = true
+	} else if present {
+		return modelPrice{}, false
 	}
 	if price.Prompt <= 0 && price.Completion <= 0 {
 		return modelPrice{}, false
 	}
+	if !validModelPrice(price) {
+		return modelPrice{}, false
+	}
 	return price, true
+}
+
+func validModelPriceEntry(entry map[string]any) bool {
+	priceKeys := [...]string{
+		"prompt", "prompt_price_per_1m", "prompt_price_per1_m", "input_cost_per_token",
+		"completion", "completion_price_per_1m", "completion_price_per1_m", "output_cost_per_token",
+		"cache", "cache_price_per_1m", "cache_price_per1_m", "input_cost_per_token_cache_hit",
+		"cache_read_input_token_cost", "cacheRead", "cache_read", "cache_read_per_1m",
+		"cacheCreation", "cache_creation", "cache_creation_per_1m", "cache_creation_price_per_1m",
+		"cache_creation_price_per1_m", "cache_creation_input_token_cost",
+	}
+	for _, key := range priceKeys {
+		raw, ok := entry[key]
+		if !ok {
+			continue
+		}
+		value, valid := strictFloatFromAny(raw)
+		if !valid || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func validModelPrice(price modelPrice) bool {
+	const maxPricePerMillion = 1_000_000.0
+	for _, value := range []float64{price.Prompt, price.Completion, price.Cache, price.CacheRead, price.CacheCreation} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > maxPricePerMillion {
+			return false
+		}
+	}
+	return true
 }
 
 func registerPriceCandidate(prices map[string]modelPrice, model string, price modelPrice) {
@@ -551,27 +629,38 @@ func formatPricePerMillion(value float64) string {
 }
 
 func floatFromAny(value any) float64 {
+	valueFloat, _ := strictFloatFromAny(value)
+	return valueFloat
+}
+
+func strictFloatFromAny(value any) (float64, bool) {
 	switch v := value.(type) {
 	case float64:
-		return v
+		return v, true
+	case float32:
+		return float64(v), true
 	case int:
-		return float64(v)
+		return float64(v), true
 	case int64:
-		return float64(v)
+		return float64(v), true
 	case json.Number:
-		f, _ := v.Float64()
-		return f
+		f, err := v.Float64()
+		return f, err == nil
 	case string:
-		f, _ := strconv.ParseFloat(strings.TrimSpace(v), 64)
-		return f
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(trimmed, 64)
+		return f, err == nil
 	default:
-		return 0
+		return 0, false
 	}
 }
 
 func firstPositiveFloat(values ...float64) float64 {
 	for _, value := range values {
-		if value > 0 {
+		if value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
 			return value
 		}
 	}
@@ -579,19 +668,20 @@ func firstPositiveFloat(values ...float64) float64 {
 }
 
 func perTokenToPerMillion(value float64) float64 {
-	if value <= 0 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return 0
 	}
 	return value * 1_000_000.0
 }
 
-func firstPresentFloat(entry map[string]any, keys ...string) (float64, bool) {
+func firstPresentFloat(entry map[string]any, keys ...string) (float64, bool, bool) {
 	for _, key := range keys {
 		if value, ok := entry[key]; ok {
-			return floatFromAny(value), true
+			parsed, valid := strictFloatFromAny(value)
+			return parsed, true, valid
 		}
 	}
-	return 0, false
+	return 0, false, false
 }
 
 func detectedPriceKey(entry map[string]any, keys ...string) string {

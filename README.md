@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.32`
+Current version: `0.1.33`
 
 ## Features
 
@@ -110,6 +110,24 @@ request_detail_retention_days: 30
 
 Quota trigger defaults to off. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota. The legacy `quota` value is accepted for compatibility and normalized to `probe`; scheduled triggers no longer only read cached quota state.
 
+## Data Directory and Path Overrides
+
+The plugin stores its SQLite database, API-key fingerprint secret, and downloaded model price table under an OS-specific private data directory:
+
+| Platform | Default data directory |
+| --- | --- |
+| Linux | `~/.cli-proxy-api/plugins/codex-token-usage` |
+| macOS | `~/Library/Application Support/CLIProxyAPI/plugins/codex-token-usage` |
+| Windows | `%LOCALAPPDATA%\CLIProxyAPI\plugins\codex-token-usage` |
+
+Set `CPA_TOKEN_USAGE_DIR` to override the complete plugin data directory. The following related path settings are also supported:
+
+- `CPA_MODEL_PRICE_FILE`: downloaded model price table file.
+- `CPA_AUTH_DIR`: CLIProxyAPI credential directory.
+- `CPA_CONFIG_PATH` or `CPA_CONFIG_FILE`: CLIProxyAPI configuration file.
+
+The process account must be able to create and update the selected directory. On Unix-like systems, the plugin creates its private directory with mode `0700` and sensitive files with mode `0600`.
+
 ## Model Price Table
 
 The plugin includes a small built-in fallback price table. By default it also downloads and refreshes the full LiteLLM-style model price table from:
@@ -118,28 +136,27 @@ The plugin includes a small built-in fallback price table. By default it also do
 https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 ```
 
-The downloaded file is stored at:
-
-```text
-/root/plugins/codex-token-usage/model_prices.json
-```
-
-The file is about 1.5 MB and is not bundled into release zips, so plugin binaries stay smaller and prices can be refreshed without rebuilding the plugin.
-
-To override the location, set:
+The downloaded file is stored as `model_prices.json` in the data directory described above. To override only this file, set:
 
 ```bash
 CPA_MODEL_PRICE_FILE=/path/to/model_prices.json
 ```
 
+The file is about 1.5 MB and is not bundled into release zips, so plugin binaries stay smaller and prices can be refreshed without rebuilding the plugin.
+
 ## Data Safety
 
-- Access tokens, refresh tokens, id tokens, and API keys are not written to summary JSON, UI, alert output, or exports.
-- Exported account labels that look like API keys are masked as `sk-****abcd`.
+- Access tokens, refresh tokens, and id tokens are not written to summary JSON, UI, alert output, or exports.
+- Starting with `0.1.33`, API keys are persisted only as a keyed HMAC fingerprint plus a non-sensitive last-four display suffix. Existing plaintext API-key rows are migrated on first startup; back up `usage.db` before upgrading if the historical database is operationally important.
+- The local fingerprint key is stored as `.api-key-hmac` in the private plugin data directory. Keep this file together with `usage.db` when moving an installation.
+- Exported account labels and API-key fields are masked, and CSV cells that could be interpreted as spreadsheet formulas are neutralized.
+- Dashboard-provided text is escaped before insertion into HTML.
 - Local alert data is generated inside summary/export responses only; this version does not send webhooks.
 - Auth JSON files are read only for account identity, provider classification, quota trigger access, and replacement detection. Tokens are used in memory for trigger requests and are not written to summary/export data.
 
 ## Build
+
+Release builds use Go `1.26.5` with CGO enabled. A platform C compiler, `zip`, and Python 3 are required for the full packaging and Linux ABI smoke workflow.
 
 ```bash
 go test ./...
@@ -147,21 +164,27 @@ go test ./...
 ./package-release.sh dist
 ```
 
+`package-release.sh` validates that `PLUGIN_VERSION` matches `pluginVersion` in `main.go`. Tagged releases additionally require the `vX.Y.Z` tag, injected binary version, source version, and asset filenames to agree.
+
+Official Linux archives are built in an Ubuntu 20.04 container and gated to require no newer than glibc `2.31`. They support glibc-based distributions such as Ubuntu 20.04+ and Debian 11+. Alpine Linux uses musl and is not supported by these CGO release binaries.
+
+Each platform zip contains the dynamic library, `LICENSE`, and `THIRD_PARTY_NOTICES.md`. Releases always publish per-platform SPDX JSON SBOMs and SHA-256 checksums. Public repositories also publish GitHub build provenance attestations; the workflow skips only that attestation step for repositories where GitHub attestations are unavailable, without blocking the remaining release assets.
+
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.32_linux_amd64.zip
-codex-token-usage_0.1.32_linux_arm64.zip
-codex-token-usage_0.1.32_windows_amd64.zip
-codex-token-usage_0.1.32_darwin_amd64.zip
-codex-token-usage_0.1.32_darwin_arm64.zip
+codex-token-usage_0.1.33_linux_amd64.zip
+codex-token-usage_0.1.33_linux_arm64.zip
+codex-token-usage_0.1.33_windows_amd64.zip
+codex-token-usage_0.1.33_darwin_amd64.zip
+codex-token-usage_0.1.33_darwin_arm64.zip
 checksums.txt
 ```
 
 ## Plugin Store Checklist
 
 - Build and upload all required OS / architecture zip files.
-- Include `checksums.txt`.
+- Include `checksums.txt`, per-platform SPDX SBOMs, and license notices. Public repositories must also publish GitHub provenance attestations; where attestations are unavailable, only that attestation step may be skipped.
 - Add screenshots for the Codex account pool, AI provider overview, and a selected AI endpoint page.
 - Document default-off quota trigger behavior and real-probe token cost risk.
 - Confirm `go test ./...` passes before publishing.

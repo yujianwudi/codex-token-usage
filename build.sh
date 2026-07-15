@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd "$(dirname "$0")"
+source scripts/semver.sh
+
 ext="so"
 case "$(go env GOOS)" in
   windows) ext="dll" ;;
@@ -9,6 +12,10 @@ esac
 
 ldflags="-s -w"
 if [[ -n "${PLUGIN_VERSION:-}" ]]; then
+  if ! is_semver "${PLUGIN_VERSION}"; then
+    echo "Invalid PLUGIN_VERSION: ${PLUGIN_VERSION}" >&2
+    exit 1
+  fi
   ldflags="${ldflags} -X 'main.pluginVersion=${PLUGIN_VERSION}'"
 fi
 if [[ -n "${PLUGIN_AUTHOR:-}" ]]; then
@@ -18,8 +25,16 @@ if [[ -n "${PLUGIN_REPOSITORY:-}" ]]; then
   ldflags="${ldflags} -X 'main.pluginRepository=${PLUGIN_REPOSITORY}'"
 fi
 
-CGO_ENABLED="${CGO_ENABLED:-1}" go build -trimpath -ldflags="${ldflags}" -buildmode=c-shared -o "codex-token-usage.${ext}" .
-if command -v strip >/dev/null 2>&1; then
-  strip "codex-token-usage.${ext}" 2>/dev/null || true
+artifact="codex-token-usage.${ext}"
+CGO_ENABLED="${CGO_ENABLED:-1}" go build \
+  -trimpath \
+  -ldflags="${ldflags}" \
+  -buildmode=c-shared \
+  -o "${artifact}" \
+  .
+
+if [[ "${SKIP_STRIP:-0}" != "1" ]] && command -v strip >/dev/null 2>&1; then
+  strip "${artifact}" 2>/dev/null || true
 fi
-echo "Built $(pwd)/codex-token-usage.${ext}"
+
+echo "Built $(pwd)/${artifact}"

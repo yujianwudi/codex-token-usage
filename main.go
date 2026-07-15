@@ -86,7 +86,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.32"
+	pluginVersion    = "0.1.33"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/yujianwudi/codex-token-usage"
 )
@@ -472,7 +472,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			if errors.As(err, &reject) && reject != nil {
 				return errorEnvelopeWithStatus(reject.Code, reject.Message, reject.HTTPStatus), nil
 			}
-			return okJSON(schedulerPickResponse{Handled: false})
+			return errorEnvelopeWithStatus("scheduler_unavailable", "scheduler state is temporarily unavailable", http.StatusServiceUnavailable), nil
 		}
 		return okJSON(resp)
 	default:
@@ -521,13 +521,24 @@ func handleManagement(req managementRequest) managementResponse {
 	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/dashboard") {
 		return managementResponse{
 			StatusCode: http.StatusOK,
-			Headers:    map[string][]string{"content-type": {"text/html; charset=utf-8"}, "cache-control": {"no-store"}},
-			Body:       []byte(dashboardHTML),
+			Headers: map[string][]string{
+				"content-type":               {"text/html; charset=utf-8"},
+				"cache-control":              {"no-store"},
+				"content-security-policy":    {"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"},
+				"x-content-type-options":     {"nosniff"},
+				"referrer-policy":            {"no-referrer"},
+				"x-frame-options":            {"DENY"},
+				"cross-origin-opener-policy": {"same-origin"},
+			},
+			Body: []byte(dashboardHTML),
 		}
 	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/summary") {
-		window := firstQuery(req.Query, "window", "24h")
-		limit := parseInt(firstQuery(req.Query, "limit", "50"), 50, 1, 5000)
+		window, ok := normalizeSummaryWindow(firstQuery(req.Query, "window", "24h"))
+		if !ok {
+			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "invalid_window", "message": "window must be today, 24h, 7d, 30d, or all"})
+		}
+		limit := normalizeSummaryLimit(parseInt(firstQuery(req.Query, "limit", "50"), 50, 1, 5000))
 		forceRefresh := parseBoolString(firstQuery(req.Query, "refresh", "false"), false)
 		syncRefresh := forceRefresh && parseBoolString(firstQuery(req.Query, "sync", "false"), false)
 		var data map[string]any
@@ -548,7 +559,10 @@ func handleManagement(req managementRequest) managementResponse {
 		return jsonResponse(http.StatusOK, data)
 	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/export") {
-		window := firstQuery(req.Query, "window", "24h")
+		window, ok := normalizeSummaryWindow(firstQuery(req.Query, "window", "24h"))
+		if !ok {
+			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "invalid_window", "message": "window must be today, 24h, 7d, 30d, or all"})
+		}
 		limit := parseInt(firstQuery(req.Query, "limit", "5000"), 5000, 1, 20000)
 		kind := firstQuery(req.Query, "type", "accounts")
 		format := firstQuery(req.Query, "format", "csv")
@@ -668,15 +682,17 @@ func configurePlugin(request []byte) error {
 	}
 	cfg = normalizePluginConfig(cfg)
 	globalAccountProtection.configure(cfg)
+	initCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := globalStore.refreshSchedulerState(initCtx); err != nil {
+		globalSchedulerState.invalidate()
+	}
+	cancel()
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
 	globalRetentionCleaner.configure(cfg)
 	globalDBHealth.configure(cfg)
 	globalSummaryMaintenance.configure(cfg)
 	globalSummaryPrecomputer.configure(cfg)
-	if err := globalStore.refreshSchedulerState(context.Background()); err != nil {
-		globalSchedulerState.invalidate()
-	}
 	return nil
 }
 
@@ -959,7 +975,7 @@ func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	if err := initializeSQLiteStore(ctx, db); err != nil {
+	if err := initializeSQLiteStore(ctx, db, path); err != nil {
 		_ = db.Close()
 		return nil, "", err
 	}
@@ -969,21 +985,25 @@ func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
 }
 
 func usageDBPath() (string, error) {
-	dir := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_DIR"))
-	if dir == "" {
-		dir = "/root/.cli-proxy-api/plugins/codex-token-usage"
-	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	dir, err := pluginDataDir()
+	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "usage.db"), nil
+	if err := ensurePrivateDir(dir); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "usage.db")
+	if err := ensurePrivateFile(path); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func openSQLiteDB(path string) (*sql.DB, error) {
 	return sql.Open("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL")
 }
 
-func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
+func initializeSQLiteStore(ctx context.Context, db *sql.DB, path string) error {
 	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
 		return err
 	}
@@ -996,16 +1016,13 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
 	if err := ensureUsageEventColumns(ctx, db); err != nil {
 		return err
 	}
-	if err := normalizeStoredLatencyColumns(ctx, db); err != nil {
-		return err
-	}
 	if err := ensureQuotaTriggerRunColumns(ctx, db); err != nil {
 		return err
 	}
 	if err := ensureAutobanBanColumns(ctx, db); err != nil {
 		return err
 	}
-	return nil
+	return migrateSQLiteStore(ctx, db, path)
 }
 
 func ensureSummaryCacheColumns(ctx context.Context, db *sql.DB) error {
@@ -1536,20 +1553,6 @@ func normalizeStoredResetColumns(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-func normalizeStoredLatencyColumns(ctx context.Context, db *sql.DB) error {
-	statements := []string{
-		`UPDATE usage_events SET latency_ms = CAST((latency_ms + 999999) / 1000000 AS INTEGER) WHERE latency_ms > 10000`,
-		`UPDATE usage_events SET ttft_ms = CAST((ttft_ms + 999999) / 1000000 AS INTEGER) WHERE ttft_ms > 10000`,
-		`UPDATE usage_events SET latency_ms = ttft_ms WHERE ttft_ms > 0 AND (latency_ms <= 0 OR latency_ms < ttft_ms)`,
-	}
-	for _, statement := range statements {
-		if _, err := db.ExecContext(ctx, statement); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func ensureQuotaTriggerRunColumns(ctx context.Context, db *sql.DB) error {
 	columns := []struct {
 		name string
@@ -1762,7 +1765,7 @@ func (m *quotaTriggerManager) runRound(ctx context.Context, cfg pluginConfig) {
 }
 
 func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
-	db, _, err := s.open(ctx)
+	db, dbPath, err := s.open(ctx)
 	if err != nil {
 		return err
 	}
@@ -1791,10 +1794,15 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if ttftMs > 0 && (latencyMs <= 0 || latencyMs < ttftMs) {
 		latencyMs = ttftMs
 	}
+	rawAPIKey := trim(rec.APIKey)
+	storedAPIKey := privacySafeAPIKey(dbPath, rawAPIKey)
+	storedAuthID := sanitizeStoredIdentity(rec.AuthID, rawAPIKey, storedAPIKey)
+	storedAuthIndex := sanitizeStoredIdentity(rec.AuthIndex, rawAPIKey, storedAPIKey)
+	storedSource := sanitizeStoredIdentity(rec.Source, rawAPIKey, storedAPIKey)
 	_, err = db.ExecContext(ctx, insertSQL,
 		rec.RequestedAt.Unix(),
 		trim(rec.Provider), trim(rec.ExecutorType), trim(rec.Model), trim(rec.Alias),
-		trim(rec.APIKey), trim(rec.AuthID), trim(rec.AuthIndex), trim(rec.AuthType), trim(rec.Source),
+		storedAPIKey, trim(storedAuthID), trim(storedAuthIndex), trim(rec.AuthType), trim(storedSource),
 		trim(rec.ReasoningEffort), trim(rec.ServiceTier), latencyMs, ttftMs, boolInt(rec.Failed), status,
 		rec.Detail.InputTokens, rec.Detail.OutputTokens, rec.Detail.ReasoningTokens, rec.Detail.CachedTokens,
 		rec.Detail.CacheReadTokens, rec.Detail.CacheCreationTokens, total,
@@ -3072,6 +3080,10 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
 	}
+	var codexGeneration uint64
+	if s == globalStore {
+		codexGeneration = globalSchedulerState.providerGeneration("codex")
+	}
 	now := time.Now().Unix()
 	bans, err := queryActiveAutobans(ctx, db, now)
 	if err != nil {
@@ -3083,7 +3095,7 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	}
 	if len(bans) == 0 && len(invalids) == 0 && !protectionCfg.AccountProtectionEnabled {
 		if s == globalStore {
-			globalSchedulerState.setRestricted("codex", false)
+			globalSchedulerState.clearRestrictedIfGeneration("codex", codexGeneration)
 		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
@@ -3135,8 +3147,9 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
 	}
-	if err := clearReplacedOrMissingXAIStates(ctx, db); err != nil {
-		return schedulerPickResponse{Handled: false}, err
+	var xaiGeneration uint64
+	if s == globalStore {
+		xaiGeneration = globalSchedulerState.providerGeneration("xai")
 	}
 	now := time.Now().Unix()
 	states, err := queryActiveXAIStates(ctx, db, now)
@@ -3145,7 +3158,7 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 	}
 	if len(states) == 0 {
 		if s == globalStore {
-			globalSchedulerState.setRestricted("xai", false)
+			globalSchedulerState.clearRestrictedIfGeneration("xai", xaiGeneration)
 		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
@@ -3921,8 +3934,7 @@ func queryActiveInvalidAuths(ctx context.Context, db *sql.DB) ([]invalidAuthRow,
 SELECT auth_id, auth_index, source, provider, reason, invalidated_at, active, last_status_code, auth_file, auth_file_mtime
 FROM invalid_auths
 WHERE active=1
-ORDER BY invalidated_at DESC
-LIMIT 2000`)
+ORDER BY invalidated_at DESC`)
 	if err != nil {
 		return nil, err
 	}

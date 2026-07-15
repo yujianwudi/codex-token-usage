@@ -68,6 +68,106 @@ func TestSchedulerStateRefreshTracksActiveRestrictions(t *testing.T) {
 	}
 }
 
+func TestSchedulerStateInitializesProvidersIndependently(t *testing.T) {
+	var state schedulerStateCache
+	state.setRestricted("codex", false)
+	if state.needsDatabase("codex", false) {
+		t.Fatal("initialized Codex state unexpectedly needs the database")
+	}
+	if !state.needsDatabase("xai", false) {
+		t.Fatal("setting Codex state incorrectly initialized xAI")
+	}
+
+	state.setRestricted("xai", false)
+	if state.needsDatabase("xai", false) {
+		t.Fatal("initialized xAI state unexpectedly needs the database")
+	}
+}
+
+func TestSchedulerStateRefreshDoesNotOverwriteNewerRestriction(t *testing.T) {
+	var state schedulerStateCache
+	generation := state.beginRefresh()
+
+	// Simulate a restriction being recorded after refresh read its generation
+	// but before the database snapshot is published.
+	state.setRestricted("codex", true)
+	state.applyRefresh(generation, false, 0, false, 0)
+
+	if !state.needsDatabase("codex", false) {
+		t.Fatal("stale refresh overwrote a newer Codex restriction")
+	}
+	if state.needsDatabase("xai", false) {
+		t.Fatal("uncontended xAI refresh result was not published")
+	}
+}
+
+func TestSchedulerStateInvalidateRejectsInFlightRefresh(t *testing.T) {
+	var state schedulerStateCache
+	generation := state.beginRefresh()
+	state.invalidate()
+	state.applyRefresh(generation, false, 0, false, 0)
+
+	if !state.needsDatabase("codex", false) || !state.needsDatabase("xai", false) {
+		t.Fatal("in-flight refresh repopulated invalidated scheduler state")
+	}
+}
+
+func TestSchedulerStateOlderRefreshCannotOverwriteNewerRefresh(t *testing.T) {
+	var state schedulerStateCache
+	older := state.beginRefresh()
+	newer := state.beginRefresh()
+
+	state.applyRefresh(newer, true, time.Now().Unix()+60, false, 0)
+	state.applyRefresh(older, false, 0, true, time.Now().Unix()+60)
+
+	if !state.needsDatabase("codex", false) {
+		t.Fatal("older refresh cleared the newer Codex restriction")
+	}
+	if state.needsDatabase("xai", false) {
+		t.Fatal("older refresh overwrote the newer xAI result")
+	}
+}
+
+func TestSchedulerStateConditionalClearRejectsNewerRestriction(t *testing.T) {
+	for _, provider := range []string{"codex", "xai"} {
+		t.Run(provider, func(t *testing.T) {
+			var state schedulerStateCache
+			generation := state.providerGeneration(provider)
+			state.setRestricted(provider, true)
+
+			if state.clearRestrictedIfGeneration(provider, generation) {
+				t.Fatal("stale empty query cleared a newer restriction")
+			}
+			if !state.needsDatabase(provider, false) {
+				t.Fatal("newer restriction was lost")
+			}
+
+			generation = state.providerGeneration(provider)
+			if !state.clearRestrictedIfGeneration(provider, generation) {
+				t.Fatal("current empty query did not clear restriction")
+			}
+			if state.needsDatabase(provider, false) {
+				t.Fatal("current empty query left restriction active")
+			}
+		})
+	}
+}
+
+func TestSchedulerStateConditionalClearIsProviderSpecific(t *testing.T) {
+	var state schedulerStateCache
+	codexGeneration := state.providerGeneration("codex")
+	state.setRestricted("xai", true)
+	if !state.clearRestrictedIfGeneration("codex", codexGeneration) {
+		t.Fatal("xAI update incorrectly invalidated Codex snapshot")
+	}
+	if state.needsDatabase("codex", false) {
+		t.Fatal("Codex empty result was not cached")
+	}
+	if !state.needsDatabase("xai", false) {
+		t.Fatal("xAI restriction was unexpectedly cleared")
+	}
+}
+
 func TestQueryActiveAutobansDoesNotRewriteUsageHistory(t *testing.T) {
 	s := newTestStore(t)
 	db, _, err := s.open(context.Background())

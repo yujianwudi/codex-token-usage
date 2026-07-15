@@ -921,9 +921,20 @@ async function copyText(text){
   document.body.removeChild(ta);
   if(!ok)throw new Error('copy failed');
 }
+function safeOAuthURL(value){
+  try{
+    const u=new URL(String(value||''));
+    if(u.protocol!=='https:'||!u.hostname||u.username||u.password)return '';
+    return u.href;
+  }catch(e){
+    return '';
+  }
+}
 function shortOAuthUrl(url){
   try{
-    const u=new URL(url);
+    const safe=safeOAuthURL(url);
+    if(!safe)return 'Codex OAuth 链接';
+    const u=new URL(safe);
     return u.hostname+u.pathname;
   }catch(e){
     return 'Codex OAuth 链接';
@@ -951,9 +962,11 @@ async function startInvalidAuthOAuth(key){
     }
     const payload=parseJSONBody(body);
     if(!payload.url||!payload.state)throw new Error('OAuth 启动响应缺少 url 或 state');
+    const oauthURL=safeOAuthURL(payload.url);
+    if(!oauthURL)throw new Error('OAuth 启动响应包含不安全的 url');
     invalidAuthOAuthUrlEl.hidden=false;
-    invalidAuthOAuthUrlEl.innerHTML='<div class="oauth-link-row"><span>'+tr('授权链接：')+'</span><a class="oauth-open-link" href="'+esc(payload.url)+'" target="_blank" rel="noopener noreferrer">'+esc(tr('打开登录页'))+'</a><button class="ghost oauth-copy-link" type="button" data-oauth-copy="'+esc(payload.url)+'" title="'+esc(payload.url)+'">'+esc(tr('复制授权链接'))+'</button><code title="'+esc(payload.url)+'">'+esc(shortOAuthUrl(payload.url))+'</code></div>';
-    window.open(payload.url,'_blank','noopener,noreferrer');
+    invalidAuthOAuthUrlEl.innerHTML='<div class="oauth-link-row"><span>'+tr('授权链接：')+'</span><a class="oauth-open-link" href="'+esc(oauthURL)+'" target="_blank" rel="noopener noreferrer">'+esc(tr('打开登录页'))+'</a><button class="ghost oauth-copy-link" type="button" data-oauth-copy="'+esc(oauthURL)+'" title="'+esc(oauthURL)+'">'+esc(tr('复制授权链接'))+'</button><code title="'+esc(oauthURL)+'">'+esc(shortOAuthUrl(oauthURL))+'</code></div>';
+    window.open(oauthURL,'_blank','noopener,noreferrer');
     setInvalidAuthStatus('已打开 Codex OAuth，等待登录完成...','');
     pollInvalidAuthOAuth(management,payload.state,row,before,startedAt,oldFile,oldEmail);
   }catch(e){
@@ -1568,6 +1581,7 @@ const i18nEn={
   '未找到这个 401 账号。':'This 401 account was not found.',
   '正在启动 Codex OAuth 登录...':'Starting Codex OAuth login...',
   'OAuth 启动响应缺少 url 或 state':'OAuth start response is missing url or state',
+  'OAuth 启动响应包含不安全的 url':'OAuth start response contains an unsafe URL',
   '授权链接：':'Authorization link:',
   '已打开 Codex OAuth，等待登录完成...':'Codex OAuth opened, waiting for login...',
   'OAuth 启动失败：':'OAuth start failed: ',
@@ -2260,7 +2274,7 @@ function renderInsights(data){
       ['缓存最低',accounts.length?accountName([...accounts].sort((a,b)=>cacheRate(a)-cacheRate(b))[0]):'-',accounts.length?'缓存率 '+pct(cacheRate([...accounts].sort((a,b)=>cacheRate(a)-cacheRate(b))[0])):'暂无输入 Token','']
     ];
     if(noisy&&(noisy.rate_limited||0)>0)items.push(['429 最多',accountName(noisy),fmt(noisy.rate_limited)+' 次 · 失败 '+fmt(noisy.failed),'tone-red']);
-    document.getElementById('insights').innerHTML=items.map(r=>'<div class="insight '+r[3]+'"><span>'+r[0]+'</span><b title="'+esc(r[1])+'">'+esc(r[1])+'</b><span>'+r[2]+'</span></div>').join('');
+    document.getElementById('insights').innerHTML=items.map(r=>'<div class="insight '+esc(r[3])+'"><span>'+esc(r[0])+'</span><b title="'+esc(r[1])+'">'+esc(r[1])+'</b><span>'+esc(r[2])+'</span></div>').join('');
     return;
   }
   const top=accounts[0]; const quota=[...accounts].sort((a,b)=>maxQuota(b)-maxQuota(a))[0]; const lowCache=[...accounts].filter(r=>(r.input_tokens||0)>0).sort((a,b)=>cacheRate(a)-cacheRate(b))[0]; const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0]; const external=[...accounts].filter(r=>r.external_use_suspected).sort((a,b)=>(b.external_use_delta_percent||0)-(a.external_use_delta_percent||0))[0]; const invalid=[...accounts].filter(r=>r.invalid_auth)[0]; const workspace=[...accounts].filter(r=>r.workspace_deactivated)[0];
@@ -2276,7 +2290,7 @@ function renderInsights(data){
     ['缓存最低',lowCache?accountName(lowCache):'-',lowCache?'缓存率 '+pct(cacheRate(lowCache))+' · 输入 '+compact(lowCache.input_tokens):'暂无输入 Token',lowCache&&cacheRate(lowCache)<30?'tone-orange':'']
   ];
   if(noisy&&(noisy.rate_limited||0)>0){items.push(['429 最多',accountName(noisy),fmt(noisy.rate_limited)+' 次 · 失败 '+fmt(noisy.failed),'tone-red'])}
-  document.getElementById('insights').innerHTML=items.map(r=>'<div class="insight '+r[3]+'"><span>'+r[0]+'</span><b title="'+esc(r[1])+'">'+esc(r[1])+'</b><span>'+r[2]+'</span></div>').join('');
+  document.getElementById('insights').innerHTML=items.map(r=>'<div class="insight '+esc(r[3])+'"><span>'+esc(r[0])+'</span><b title="'+esc(r[1])+'">'+esc(r[1])+'</b><span>'+esc(r[2])+'</span></div>').join('');
 }
 function meterCell(value,width,color){width=Math.max(0,Math.min(100,Number(width||0)));return '<div class="cell-meter"><b>'+esc(value)+'</b><div class="bar"><span style="--color:'+color+';width:'+width.toFixed(1)+'%"></span></div></div>'}
 function quotaText(percent,tokens){const p=pct(percent); const tok=Number(tokens||0)>0?compact(tokens)+' tok':'无窗口 Token'; return p+' · '+tok}
@@ -2315,7 +2329,7 @@ function renderRecent(target,rows,mode){
     const price=r.cost_available||Number(r.cost_usd||0)>0?'<span class="cost-pill">'+money(r.cost_usd)+'</span>':'<span class="cost-weak">缺价格</span>';
     const statusClass=r.failed?'danger':((Number(r.status_code||200)>=400)?'warn':'ok');
     const detail=[tierText(r.service_tier),r.price_detail||'缺价格'].filter(Boolean).join(' · ');
-    const reasoning=r.reasoning_effort?('推理 '+r.reasoning_effort+' · '):'';
+    const reasoning=r.reasoning_effort?('推理 '+esc(r.reasoning_effort)+' · '):'';
     return '<tr>'+
       td('<div class="recent-model"><div class="recent-primary"><span class="model-chip" title="'+esc(firstText(r.model,model))+'">'+esc(model)+'</span></div><span class="recent-sub" title="'+esc(who+' · '+(r.time||'-'))+'">'+esc(who)+' · '+esc(r.time||'-')+'</span></div>','recent-model')+
       td('<div class="recent-badges"><span class="latency-pill '+latencyTone(r.latency_ms)+'">'+fmtLatencyMs(r.latency_ms)+'</span><span class="latency-pill '+latencyTone(r.ttft_ms)+'">'+fmtLatencyMs(r.ttft_ms)+'</span></div><span class="token-sub">流 · '+esc(throughput(r))+'</span>')+
