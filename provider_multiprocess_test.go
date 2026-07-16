@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,11 +14,25 @@ import (
 )
 
 const (
-	migrationProcessChildEnv   = "CPA_TEST_SQLITE_V6_MIGRATION_CHILD"
-	migrationProcessDBEnv      = "CPA_TEST_SQLITE_V6_MIGRATION_DB"
-	migrationProcessGateEnv    = "CPA_TEST_SQLITE_V6_MIGRATION_GATE"
-	migrationProcessEnteredEnv = "CPA_TEST_SQLITE_V6_MIGRATION_ENTERED"
+	migrationProcessChildEnv     = "CPA_TEST_SQLITE_V6_MIGRATION_CHILD"
+	migrationProcessDBEnv        = "CPA_TEST_SQLITE_V6_MIGRATION_DB"
+	migrationProcessRoleEnv      = "CPA_TEST_SQLITE_V6_MIGRATION_ROLE"
+	migrationProcessSignalsEnv   = "CPA_TEST_SQLITE_V6_MIGRATION_SIGNALS"
+	migrationProcessRoleHolder   = "holder"
+	migrationProcessRoleWaiter   = "waiter"
+	migrationSignalHolderLocked  = "holder-locked"
+	migrationSignalHolderRelease = "holder-release"
+	migrationSignalWaiterReady   = "waiter-ready"
+	migrationSignalWaiterStart   = "waiter-start"
+	migrationSignalWaiterAttempt = "waiter-begin-attempted"
+	migrationSignalWaiterLocked  = "waiter-locked"
 )
+
+type migrationChildProcess struct {
+	cmd    *exec.Cmd
+	output bytes.Buffer
+	done   chan error
+}
 
 func TestSQLiteV6MigrationTwoOSProcesses(t *testing.T) {
 	dir := t.TempDir()
@@ -49,43 +64,39 @@ INSERT INTO account_protection_reservations(id,auth_id,auth_index,source,auth_fi
 		t.Fatal(err)
 	}
 
-	gate := filepath.Join(dir, "release-migration")
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	type childProcess struct {
-		cmd    *exec.Cmd
-		output bytes.Buffer
-	}
-	children := make([]childProcess, 2)
-	enteredFiles := make([]string, len(children))
-	for i := range children {
-		child := &children[i]
-		enteredFiles[i] = filepath.Join(dir, fmt.Sprintf("migration-entered-%d", i))
-		child.cmd = exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSQLiteV6MigrationProcessHelper$", "-test.count=1")
-		child.cmd.Env = append(os.Environ(),
-			migrationProcessChildEnv+"=1",
-			migrationProcessDBEnv+"="+path,
-			migrationProcessGateEnv+"="+gate,
-			migrationProcessEnteredEnv+"="+enteredFiles[i],
-		)
-		child.cmd.Stdout = &child.output
-		child.cmd.Stderr = &child.output
-		if err := child.cmd.Start(); err != nil {
-			t.Fatalf("start migration child %d: %v", i, err)
-		}
-	}
-	barrierCtx, barrierCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer barrierCancel()
-	if err := waitForMigrationProcessFiles(barrierCtx, enteredFiles); err != nil {
-		t.Fatalf("migration children did not reach the pre-migration barrier: %v", err)
-	}
-	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {
+	signals := filepath.Join(dir, "migration-signals")
+	if err := os.Mkdir(signals, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for i := range children {
-		if err := children[i].cmd.Wait(); err != nil {
-			t.Fatalf("migration child %d: %v\n%s", i, err, children[i].output.String())
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	holder := startSQLiteV6MigrationChild(t, ctx, path, signals, migrationProcessRoleHolder)
+	waitForMigrationSignal(t, ctx, signals, migrationSignalHolderLocked)
+
+	waiter := startSQLiteV6MigrationChild(t, ctx, path, signals, migrationProcessRoleWaiter)
+	waitForMigrationSignal(t, ctx, signals, migrationSignalWaiterReady)
+	writeMigrationSignal(t, signals, migrationSignalWaiterStart)
+	waitForMigrationSignal(t, ctx, signals, migrationSignalWaiterAttempt)
+
+	// The holder has already returned from BEGIN IMMEDIATE, while the waiter has
+	// crossed its final pre-BEGIN handshake. The waiter must not acquire the
+	// writer lock until the holder is allowed to finish and commit.
+	blockedCtx, blockedCancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	err := waitForMigrationProcessFiles(blockedCtx, []string{migrationSignalPath(signals, migrationSignalWaiterLocked)})
+	blockedCancel()
+	if err == nil {
+		t.Fatal("migration waiter acquired BEGIN IMMEDIATE while the holder still owned the writer lock")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait for blocked migration waiter: %v", err)
+	}
+	assertMigrationChildRunning(t, waiter, "waiter blocked on BEGIN IMMEDIATE")
+
+	writeMigrationSignal(t, signals, migrationSignalHolderRelease)
+	waitForMigrationChild(t, ctx, holder, migrationProcessRoleHolder)
+	waitForMigrationChild(t, ctx, waiter, migrationProcessRoleWaiter)
+	if _, err := os.Stat(migrationSignalPath(signals, migrationSignalWaiterLocked)); err != nil {
+		t.Fatalf("migration waiter never acquired BEGIN IMMEDIATE after holder release: %v", err)
 	}
 
 	db := openProviderMigrationDB(t, path)
@@ -117,9 +128,9 @@ func TestSQLiteV6MigrationProcessHelper(t *testing.T) {
 		t.Skip("migration subprocess helper")
 	}
 	path := os.Getenv(migrationProcessDBEnv)
-	gate := os.Getenv(migrationProcessGateEnv)
-	entered := os.Getenv(migrationProcessEnteredEnv)
-	if path == "" || gate == "" || entered == "" {
+	role := os.Getenv(migrationProcessRoleEnv)
+	signals := os.Getenv(migrationProcessSignalsEnv)
+	if path == "" || signals == "" || (role != migrationProcessRoleHolder && role != migrationProcessRoleWaiter) {
 		t.Fatal("migration subprocess environment is incomplete")
 	}
 	db, err := openSQLiteDB(path)
@@ -130,28 +141,105 @@ func TestSQLiteV6MigrationProcessHelper(t *testing.T) {
 	if err := db.Ping(); err != nil {
 		t.Fatal(err)
 	}
-	// Publish entered only after this process owns a live SQLite handle and has
-	// reached the final barrier immediately before initializeSQLiteStore.
-	if err := os.WriteFile(entered, []byte("entered"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, err := os.Stat(gate); err == nil {
-			break
-		} else if !os.IsNotExist(err) {
-			t.Fatal(err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for migration subprocess gate")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	sqliteMigrationV6LockHook = func(ctx context.Context, stage string) error {
+		switch role {
+		case migrationProcessRoleHolder:
+			if stage != "after-begin" {
+				return nil
+			}
+			if err := writeMigrationSignalFile(signals, migrationSignalHolderLocked); err != nil {
+				return err
+			}
+			return waitForMigrationSignalFile(ctx, signals, migrationSignalHolderRelease)
+		case migrationProcessRoleWaiter:
+			switch stage {
+			case "before-begin":
+				if err := writeMigrationSignalFile(signals, migrationSignalWaiterReady); err != nil {
+					return err
+				}
+				if err := waitForMigrationSignalFile(ctx, signals, migrationSignalWaiterStart); err != nil {
+					return err
+				}
+				return writeMigrationSignalFile(signals, migrationSignalWaiterAttempt)
+			case "after-begin":
+				return writeMigrationSignalFile(signals, migrationSignalWaiterLocked)
+			}
+		}
+		return nil
+	}
 	if err := initializeSQLiteStore(ctx, db, path); err != nil {
 		t.Fatal(fmt.Errorf("initialize migrated store: %w", err))
 	}
+}
+
+func startSQLiteV6MigrationChild(t *testing.T, ctx context.Context, path, signals, role string) *migrationChildProcess {
+	t.Helper()
+	child := &migrationChildProcess{
+		cmd:  exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSQLiteV6MigrationProcessHelper$", "-test.count=1"),
+		done: make(chan error, 1),
+	}
+	child.cmd.Env = append(os.Environ(),
+		migrationProcessChildEnv+"=1",
+		migrationProcessDBEnv+"="+path,
+		migrationProcessRoleEnv+"="+role,
+		migrationProcessSignalsEnv+"="+signals,
+	)
+	child.cmd.Stdout = &child.output
+	child.cmd.Stderr = &child.output
+	if err := child.cmd.Start(); err != nil {
+		t.Fatalf("start migration %s: %v", role, err)
+	}
+	go func() { child.done <- child.cmd.Wait() }()
+	return child
+}
+
+func waitForMigrationChild(t *testing.T, ctx context.Context, child *migrationChildProcess, role string) {
+	t.Helper()
+	select {
+	case err := <-child.done:
+		if err != nil {
+			t.Fatalf("migration %s: %v\n%s", role, err, child.output.String())
+		}
+	case <-ctx.Done():
+		t.Fatalf("migration %s did not finish: %v\n%s", role, ctx.Err(), child.output.String())
+	}
+}
+
+func assertMigrationChildRunning(t *testing.T, child *migrationChildProcess, state string) {
+	t.Helper()
+	select {
+	case err := <-child.done:
+		t.Fatalf("migration child exited before %s: %v\n%s", state, err, child.output.String())
+	default:
+	}
+}
+
+func migrationSignalPath(dir, name string) string {
+	return filepath.Join(dir, name)
+}
+
+func writeMigrationSignal(t *testing.T, dir, name string) {
+	t.Helper()
+	if err := writeMigrationSignalFile(dir, name); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeMigrationSignalFile(dir, name string) error {
+	return os.WriteFile(migrationSignalPath(dir, name), []byte(name), 0o600)
+}
+
+func waitForMigrationSignal(t *testing.T, ctx context.Context, dir, name string) {
+	t.Helper()
+	if err := waitForMigrationSignalFile(ctx, dir, name); err != nil {
+		t.Fatalf("wait for migration signal %s: %v", name, err)
+	}
+}
+
+func waitForMigrationSignalFile(ctx context.Context, dir, name string) error {
+	return waitForMigrationProcessFiles(ctx, []string{migrationSignalPath(dir, name)})
 }
 
 func waitForMigrationProcessFiles(ctx context.Context, paths []string) error {

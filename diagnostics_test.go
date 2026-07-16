@@ -236,4 +236,10 @@ func TestSchedulerDiagnosticsCountOnlyCodexReservations(t *testing.T) {
 	if age := diagnostics.Scheduler.OldestReservationAgeSeconds; age < 9 || age > 20 {
 		t.Fatalf("oldest Codex reservation age = %d, want approximately 10 seconds", age)
 	}
+	if diagnostics.Scheduler.ReservationReleaseDuplicateObservable {
+		t.Fatal("legacy CPA mode reported duplicate reservation callbacks as observable")
+	}
+	if diagnostics.Scheduler.ReservationReleaseDuplicateCount != nil {
+		t.Fatalf("legacy CPA mode fabricated duplicate release count %d", *diagnostics.Scheduler.ReservationReleaseDuplicateCount)
+	}
 }

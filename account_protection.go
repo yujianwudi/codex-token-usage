@@ -373,7 +373,8 @@ func protectionCandidateFor(candidate schedulerAuthCandidate, cfg pluginConfig, 
 
 func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []schedulerAuthCandidate, cfg pluginConfig, rotationKey string, affinityKeys ...string) (schedulerAuthCandidate, error) {
 	configuredPlans := globalAccountProtection.configuredPlans()
-	aliasSets := protectionCandidateAliasSets(candidates)
+	reservationAliasSets := protectionCandidateAliasSets(candidates)
+	usageAliasSets := protectionCandidateUsageAliasSets(candidates)
 	now := time.Now().Unix()
 	// Token accounting is a soft-demotion signal and does not need to be in the
 	// reservation critical section. This is the expensive scan on busy stores.
@@ -418,8 +419,8 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 	snapshot := newProtectionSnapshotWithUsageIndex(reservations, usage)
 	states := make([]protectionCandidate, 0, len(candidates))
 	for i, candidate := range candidates {
-		state := protectionCandidateFor(candidate, cfg, configuredPlans, aliasSets[i])
-		state.InFlight, state.Tokens = snapshot.metrics(state.Aliases)
+		state := protectionCandidateFor(candidate, cfg, configuredPlans, reservationAliasSets[i])
+		state.InFlight, state.Tokens = snapshot.metricsFor(state.Aliases, usageAliasSets[i])
 		states = append(states, state)
 	}
 	chosen, err := chooseProtectedCandidate(states, rotationKey, affinityKeys...)
@@ -620,6 +621,46 @@ func protectionCandidateAliasSets(candidates []schedulerAuthCandidate) [][]strin
 		out[i] = aliases
 		if len(out[i]) == 0 {
 			out[i] = raw[i]
+		}
+	}
+	return out
+}
+
+// protectionCandidateUsageAliasSets returns only aliases that can actually be
+// present in usage_events (auth_id, auth_index, or source). When one of those
+// aliases is unique it gives us precise soft token attribution. CPA currently
+// exposes an auth-file path as the scheduler source, while usage callbacks can
+// expose an account/email source and a generated auth index instead. Therefore
+// a shared AuthID remains as a conservative fallback even when another
+// scheduler alias is unique. If every usage-visible alias collides, retain all
+// shared aliases for every affected candidate. Both cases can over-attribute a
+// soft-demotion signal, but prevent duplicate credentials from appearing to
+// have zero usage and bypassing the configured token threshold. Hard
+// concurrency remains isolated by protectionCandidateAliasSets above.
+func protectionCandidateUsageAliasSets(candidates []schedulerAuthCandidate) [][]string {
+	raw := make([][]string, len(candidates))
+	counts := make(map[string]int, len(candidates)*3)
+	for i := range candidates {
+		raw[i] = normalizeAccountAliases(
+			candidates[i].ID,
+			firstNonEmptyString(candidates[i].Attributes["auth_index"], stringFromAny(candidates[i].Metadata["auth_index"])),
+			firstNonEmptyString(candidates[i].Attributes["source"], stringFromAny(candidates[i].Metadata["source"])),
+		)
+		for _, alias := range raw[i] {
+			counts[alias]++
+		}
+	}
+	out := make([][]string, len(candidates))
+	for i := range raw {
+		for _, alias := range raw[i] {
+			if counts[alias] == 1 {
+				out[i] = append(out[i], alias)
+			}
+		}
+		if len(out[i]) == 0 {
+			out[i] = raw[i]
+		} else {
+			out[i] = normalizeAccountAliases(append(out[i], candidates[i].ID)...)
 		}
 	}
 	return out
@@ -908,7 +949,11 @@ GROUP BY auth_id, auth_index, source`, since)
 }
 
 func (snapshot *protectionSnapshot) metrics(aliases []string) (int, int64) {
-	if len(aliases) == 0 {
+	return snapshot.metricsFor(aliases, aliases)
+}
+
+func (snapshot *protectionSnapshot) metricsFor(reservationAliases, usageAliases []string) (int, int64) {
+	if len(reservationAliases) == 0 && len(usageAliases) == 0 {
 		return 0, 0
 	}
 	snapshot.metricGeneration++
@@ -922,7 +967,7 @@ func (snapshot *protectionSnapshot) metrics(aliases []string) (int, int64) {
 	marker := snapshot.metricGeneration
 	inFlight := 0
 	var tokens int64
-	for _, alias := range aliases {
+	for _, alias := range reservationAliases {
 		alias = normalizeAccountAlias(alias)
 		if alias == "" {
 			continue
@@ -933,6 +978,12 @@ func (snapshot *protectionSnapshot) metrics(aliases []string) (int, int64) {
 			}
 			snapshot.reservationMarks[sampleIndex] = marker
 			inFlight += snapshot.Reservations[sampleIndex].Count
+		}
+	}
+	for _, alias := range usageAliases {
+		alias = normalizeAccountAlias(alias)
+		if alias == "" {
+			continue
 		}
 		for _, sampleIndex := range snapshot.usageSamplesByAlias[alias] {
 			if snapshot.usageMarks[sampleIndex] == marker {
@@ -1049,11 +1100,12 @@ func applyAccountProtectionState(ctx context.Context, db *sql.DB, accounts []acc
 	if err != nil {
 		return
 	}
-	aliasSets := protectionCandidateAliasSets(candidates)
+	reservationAliasSets := protectionCandidateAliasSets(candidates)
+	usageAliasSets := protectionCandidateUsageAliasSets(candidates)
 	for i := range accounts {
 		account := &accounts[i]
-		state := protectionCandidateFor(candidates[i], cfg, nil, aliasSets[i])
-		inFlight, tokens := snapshot.metrics(state.Aliases)
+		state := protectionCandidateFor(candidates[i], cfg, nil, reservationAliasSets[i])
+		inFlight, tokens := snapshot.metricsFor(state.Aliases, usageAliasSets[i])
 		account.ProtectionPlan = state.PlanType
 		account.ProtectionInFlight = inFlight
 		account.ProtectionConcurrencyLimit = state.Limit

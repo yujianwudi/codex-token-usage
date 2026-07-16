@@ -6,6 +6,7 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 lock_file="${CPA_COMPAT_LOCK_FILE:-${script_dir}/cpa-compat.lock}"
 test_template="${script_dir}/cpa-compat/plugin_compat_test.go.txt"
 panic_control_template="${script_dir}/cpa-compat/panic_control_unix_test.go.txt"
+cpa_sandbox_image="docker.io/library/golang:1.26.5-trixie@sha256:117e07f49461abb984fc8aef661432461ff43d06faa22c3b73af6a49ce325cb9"
 
 if [[ ! -f "${lock_file}" ]]; then
   echo "CPA compatibility lock not found: ${lock_file}" >&2
@@ -236,6 +237,19 @@ if [[ "${CPA_COMPAT_VALIDATE_ONLY:-false}" == "true" ]]; then
   exit 0
 fi
 
+execution_mode="${CPA_COMPAT_EXECUTION_MODE:-host}"
+case "${execution_mode}" in
+  host | docker) ;;
+  *)
+    echo "Unsupported CPA compatibility execution mode: ${execution_mode}" >&2
+    exit 2
+    ;;
+esac
+if [[ "${GITHUB_ACTIONS:-false}" == "true" && "${execution_mode}" != "docker" ]]; then
+  echo "GitHub Actions must execute external CPA tests in the Docker sandbox" >&2
+  exit 2
+fi
+
 if [[ ! -f "${test_template}" ]]; then
   echo "CPA compatibility test template not found: ${test_template}" >&2
   exit 1
@@ -247,6 +261,7 @@ fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-token-usage-cpa-compat.XXXXXX")"
 cleanup() {
+  chmod -R u+w "${work_dir}" 2>/dev/null || true
   rm -rf "${work_dir}"
 }
 trap cleanup EXIT
@@ -331,7 +346,51 @@ cp "${panic_control_template}" "${cpa_dir}/internal/pluginhost/codex_token_usage
 
 compat_usage_dir="${work_dir}/plugin-data"
 compat_auth_dir="${work_dir}/auth"
-mkdir -p "${compat_usage_dir}" "${compat_auth_dir}"
+compat_home="${work_dir}/home"
+compat_gocache="${work_dir}/go-build-cache"
+compat_gomodcache="${work_dir}/go-mod-cache"
+compat_tmp="${work_dir}/tmp"
+trusted_seed_gomodcache="$(go env GOMODCACHE)"
+mkdir -p \
+  "${compat_usage_dir}" \
+  "${compat_auth_dir}" \
+  "${compat_home}/.config" \
+  "${compat_home}/.cache" \
+  "${compat_gocache}" \
+  "${compat_gomodcache}" \
+  "${compat_tmp}" \
+  "${work_dir}/gopath"
+
+prefetch_proxy="${CPA_COMPAT_PREFETCH_GOPROXY:-https://proxy.golang.org}"
+if [[ -d "${trusted_seed_gomodcache}/cache/download" ]]; then
+  # The caller cache is exposed only to the trusted module downloader as a
+  # read-only logical proxy source. External CPA tests receive only the copied
+  # task-local cache and cannot read or mutate the caller cache.
+  prefetch_proxy="file://${trusted_seed_gomodcache}/cache/download,${prefetch_proxy}"
+fi
+(
+  cd "${cpa_dir}"
+  env -i \
+    PATH="${PATH}" \
+    HOME="${compat_home}" \
+    XDG_CONFIG_HOME="${compat_home}/.config" \
+    XDG_CACHE_HOME="${compat_home}/.cache" \
+    TMPDIR="${compat_tmp}" \
+    GOTMPDIR="${compat_tmp}" \
+    GOCACHE="${compat_gocache}" \
+    GOMODCACHE="${compat_gomodcache}" \
+    GOPATH="${work_dir}/gopath" \
+    GOENV=off \
+    GOTOOLCHAIN=local \
+    CGO_ENABLED=1 \
+    GOPROXY="${prefetch_proxy}" \
+    GONOPROXY=none \
+    GOSUMDB=off \
+    GOFLAGS=-mod=readonly \
+    'GOVCS=*:off' \
+    GOWORK=off \
+    go list -deps -test ./internal/pluginhost >/dev/null
+)
 
 expected_version="$(sed -n 's/^[[:space:]]*pluginVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${repo_root}/main.go" | head -n 1)"
 if [[ -z "${expected_version}" ]]; then
@@ -339,17 +398,82 @@ if [[ -z "${expected_version}" ]]; then
   exit 1
 fi
 
-(
-  cd "${cpa_dir}"
-  CODEX_TOKEN_USAGE_PLUGIN_LIBRARY="${library}" \
-  CODEX_TOKEN_USAGE_PANIC_LIBRARY="${panic_library}" \
-  CODEX_TOKEN_USAGE_EXPECTED_VERSION="${expected_version}" \
-  CODEX_TOKEN_USAGE_CPA_COMMIT="${expected_commit}" \
-  CPA_TOKEN_USAGE_DIR="${compat_usage_dir}" \
-  CPA_AUTH_DIR="${compat_auth_dir}" \
-  GOWORK=off \
-  go test -count=1 -run '^TestExternalCodexTokenUsage(Compatibility|PanicBoundary)$' -v ./internal/pluginhost
+# Execute downloaded CPA source with a strict allowlist rather than trying to
+# enumerate every possible credential variable. CI resolves revisions in an
+# earlier token-bearing step, while this final step receives only the validated
+# commit and no GitHub token. On GitHub Actions the test also runs in a pinned,
+# networkless, non-root container that can see only this task's work directory;
+# external init/TestMain code cannot modify the runner workspace, Actions post
+# hooks, Docker socket, or shared Go caches.
+external_test_env=(
+  HOME="${compat_home}"
+  XDG_CONFIG_HOME="${compat_home}/.config"
+  XDG_CACHE_HOME="${compat_home}/.cache"
+  TMPDIR="${compat_tmp}"
+  GOTMPDIR="${compat_tmp}"
+  GOCACHE="${compat_gocache}"
+  GOMODCACHE="${compat_gomodcache}"
+  GOPATH="${work_dir}/gopath"
+  GOENV=off
+  GOTOOLCHAIN=local
+  CGO_ENABLED=1
+  GOPROXY=off
+  GONOPROXY=none
+  GOSUMDB=off
+  GOFLAGS=-mod=readonly
+  'GOVCS=*:off'
+  LANG=C
+  LC_ALL=C
+  GIT_CONFIG_GLOBAL=/dev/null
+  GIT_CONFIG_NOSYSTEM=1
+  CODEX_TOKEN_USAGE_PLUGIN_LIBRARY="${library}"
+  CODEX_TOKEN_USAGE_PANIC_LIBRARY="${panic_library}"
+  CODEX_TOKEN_USAGE_EXPECTED_VERSION="${expected_version}"
+  CODEX_TOKEN_USAGE_CPA_COMMIT="${expected_commit}"
+  CODEX_TOKEN_USAGE_COMPAT_SANDBOX=1
+  CPA_TOKEN_USAGE_DIR="${compat_usage_dir}"
+  CPA_AUTH_DIR="${compat_auth_dir}"
+  GIT_TERMINAL_PROMPT=0
+  GOWORK=off
 )
+external_test_command=(
+  go test -count=1
+  -run '^TestExternalCodexTokenUsage(Compatibility|PanicBoundary)$'
+  -v ./internal/pluginhost
+)
+
+case "${execution_mode}" in
+  host)
+    (
+      cd "${cpa_dir}"
+      env -i PATH="${PATH}" "${external_test_env[@]}" "${external_test_command[@]}"
+    )
+    ;;
+  docker)
+    if ! command -v docker >/dev/null 2>&1; then
+      echo "docker is required for sandboxed CPA source execution" >&2
+      exit 2
+    fi
+    docker run --rm --pull=always \
+      --network none \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --pids-limit 512 \
+      --memory 3g \
+      --cpus 2 \
+      --ulimit nofile=1024:1024 \
+      --user "$(id -u):$(id -g)" \
+      --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+      --mount "type=bind,src=${work_dir},dst=${work_dir}" \
+      --workdir "${cpa_dir}" \
+      "${cpa_sandbox_image}" \
+      env -i \
+      PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin \
+      "${external_test_env[@]}" \
+      "${external_test_command[@]}"
+    ;;
+esac
 
 echo "CPA compatibility passed"
 echo "repository=${expected_repo}"

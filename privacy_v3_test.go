@@ -444,6 +444,7 @@ func TestReservationsAndQuotaRunsNeverPersistRawCredentialIdentities(t *testing.
 		t.Fatal(err)
 	}
 	s := &store{db: db, dbPath: path}
+	t.Cleanup(s.close)
 	raw := "123e4567-e89b-12d3-a456-426614174000"
 	candidate := schedulerAuthCandidate{
 		ID:       raw,
@@ -1067,6 +1068,46 @@ func TestMalformedQuarantineMarkerAndMixedCandidatesRemainFailClosed(t *testing.
 	}
 	if value != "truncated-marker" {
 		t.Fatalf("malformed marker was silently rewritten or cleared: %q", value)
+	}
+}
+
+func TestPartiallyMalformedQuarantineMarkerCannotBeReconciledOpen(t *testing.T) {
+	isolateAPIKeyPrivacyQuarantineForTest(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.db")
+	db, err := openSQLiteDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := initializeSQLiteStore(context.Background(), db, path); err != nil {
+		t.Fatal(err)
+	}
+	valid := "keyfp:v1:0123456789abcdef0123456789abcdef:ABCD"
+	marker := valid + ",truncated-marker"
+	if _, err := db.Exec(`INSERT INTO store_state(key,value) VALUES('api_key_privacy_quarantine_codex',?)`, marker); err != nil {
+		t.Fatal(err)
+	}
+	reasons, fingerprints, err := loadAPIKeyPrivacyQuarantine(context.Background(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason := reasons[providerCodex]; !strings.Contains(reason, "malformed") || fingerprints[providerCodex] != nil {
+		t.Fatalf("partially malformed marker loaded as reason=%q fingerprints=%+v", reason, fingerprints[providerCodex])
+	}
+	secret, err := loadExistingAPIKeySecret(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileAPIKeyPrivacyQuarantine(context.Background(), db, path, secret); err != nil {
+		t.Fatal(err)
+	}
+	var retained string
+	if err := db.QueryRow(`SELECT value FROM store_state WHERE key='api_key_privacy_quarantine_codex'`).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained != marker {
+		t.Fatalf("partially malformed marker was rewritten or cleared: %q", retained)
 	}
 }
 

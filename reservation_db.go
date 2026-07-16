@@ -70,7 +70,14 @@ func (s *store) reservationTransactionDB(ctx context.Context, mainDB *sql.DB) (*
 }
 
 func openSQLiteReservationDB(path string) (*sql.DB, error) {
-	dsn := path + fmt.Sprintf("?_busy_timeout=%d&_journal_mode=WAL&_txlock=immediate", accountProtectionReservationBusyTimeoutMS)
+	// The primary store enables and verifies WAL before the reservation handle
+	// is opened. Reissuing journal_mode=WAL on every new reservation connection
+	// can itself require the SQLite writer lock. Under contention that consumes
+	// one busy timeout before BEGIN IMMEDIATE consumes another, allowing a cold
+	// scheduler pick to exceed the host's 750 ms deadline. Keep this handle
+	// limited to the bounded lock wait and IMMEDIATE transaction mode; WAL is a
+	// database property already established by initializeSQLiteStore.
+	dsn := path + fmt.Sprintf("?_busy_timeout=%d&_txlock=immediate", accountProtectionReservationBusyTimeoutMS)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err

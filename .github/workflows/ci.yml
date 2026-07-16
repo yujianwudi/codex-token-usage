@@ -91,6 +91,10 @@ jobs:
       - name: Test
         run: go test -count=1 ./...
 
+      - name: Verify v0.1.38 refuses schema v6 without logical writes
+        shell: bash
+        run: bash scripts/test-v0138-downgrade-guard.sh
+
       - name: Benchmark scheduler performance budgets
         id: scheduler_benchmarks
         shell: bash
@@ -139,12 +143,6 @@ jobs:
         shell: bash
         run: bash scripts/test-abi-panic-boundary.sh
 
-      - name: Verify latest published CLIProxyAPI compatibility
-        shell: bash
-        env:
-          CPA_COMPAT_GITHUB_TOKEN: ${{ github.token }}
-        run: bash scripts/check-cpa-compat.sh
-
       - name: Race test
         run: go test -race -count=1 ./...
 
@@ -154,3 +152,27 @@ jobs:
       - name: Source vulnerability scan
         shell: bash
         run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" -mode=source ./...
+
+      - name: Resolve latest published CLIProxyAPI revision
+        id: resolve_cpa
+        shell: bash
+        env:
+          CPA_COMPAT_CHANNEL: latest-release
+          CPA_COMPAT_GITHUB_TOKEN: ${{ github.token }}
+          CPA_COMPAT_VALIDATE_ONLY: "true"
+        run: |
+          resolved="$(bash scripts/check-cpa-compat.sh)"
+          printf '%s\n' "${resolved}"
+          commit="$(sed -n 's/^commit=//p' <<< "${resolved}" | tail -n 1)"
+          [[ "${commit}" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+
+      # Keep untrusted external source execution as the final job step and do
+      # not expose the token used by the resolver above to this process tree.
+      - name: Verify resolved CLIProxyAPI compatibility without credentials
+        shell: bash
+        env:
+          CPA_COMPAT_CHANNEL: locked
+          CPA_COMPAT_COMMIT: ${{ steps.resolve_cpa.outputs.commit }}
+          CPA_COMPAT_EXECUTION_MODE: docker
+        run: bash scripts/check-cpa-compat.sh

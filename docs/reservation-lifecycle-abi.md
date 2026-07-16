@@ -22,6 +22,11 @@ Consequently the current behavior is deliberately named
   TTL and expiry cleanup;
 - duplicate and out-of-order callbacks are **not** exactly-once in this mode.
 
+Diagnostics expose `reservation_release_duplicate_observable=false` and
+`reservation_release_duplicate_count=null`. A numeric duplicate count would be
+fabricated without a correlation token, so this field remains explicitly
+unobservable until the upstream capability below exists.
+
 In particular, a dispatch failure or cancellation that occurs after a
 successful scheduler pick but before any usage callback cannot be released
 precisely by this plugin alone. Documentation and diagnostics must not claim

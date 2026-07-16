@@ -798,6 +798,42 @@ func TestSchedulerStateRefreshCannotPublishAcrossPendingWrite(t *testing.T) {
 	state.finishRestrictionWrite("codex")
 }
 
+func TestSchedulerStateSuccessfulRefreshRejectsSameGenerationReader(t *testing.T) {
+	var state schedulerStateCache
+	generation := state.beginRefresh()
+	readerGeneration := state.providerGeneration(providerCodex)
+	now := time.Now().Unix()
+	fresh := newCodexSchedulerSnapshot([]autobanRow{{AuthID: "fresh", Provider: providerCodex, Active: true}}, nil, now)
+	stale := newCodexSchedulerSnapshot(nil, nil, now)
+	state.applySnapshotRefresh(generation, fresh, newXAISchedulerSnapshot(nil, now))
+
+	if state.publishCodexIfGeneration(readerGeneration, stale) {
+		t.Fatal("same-generation reader overwrote a completed background refresh")
+	}
+	current, _, ok := state.codexForPick(now)
+	if !ok || current == nil || len(current.restrictions) != 1 || current.restrictions[0].AuthID != "fresh" {
+		t.Fatalf("completed refresh snapshot was not preserved: %+v, ok=%v", current, ok)
+	}
+}
+
+func TestSchedulerStateSuccessfulXAIRefreshRejectsSameGenerationReader(t *testing.T) {
+	var state schedulerStateCache
+	generation := state.beginRefresh()
+	readerGeneration := state.providerGeneration(providerXAI)
+	now := time.Now().Unix()
+	fresh := newXAISchedulerSnapshot([]xaiAccountStateRow{{StateKey: "fresh", Provider: providerXAI, Active: true}}, now)
+	stale := newXAISchedulerSnapshot(nil, now)
+	state.applySnapshotRefresh(generation, newCodexSchedulerSnapshot(nil, nil, now), fresh)
+
+	if state.publishXAIIfGeneration(readerGeneration, stale) {
+		t.Fatal("same-generation xAI reader overwrote a completed background refresh")
+	}
+	current, _, ok := state.xaiForPick(now)
+	if !ok || current == nil || len(current.states) != 1 || current.states[0].StateKey != "fresh" {
+		t.Fatalf("completed xAI refresh snapshot was not preserved: %+v, ok=%v", current, ok)
+	}
+}
+
 func TestQueryActiveAutobansDoesNotRewriteUsageHistory(t *testing.T) {
 	s := newTestStore(t)
 	db, _, err := s.open(context.Background())

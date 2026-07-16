@@ -61,18 +61,20 @@ type authDiagnostics struct {
 }
 
 type schedulerDiagnostics struct {
-	ActiveBanCount                   int    `json:"active_ban_count"`
-	FilteredCandidates               int    `json:"filtered_candidates"`
-	UnmatchedActiveBans              int    `json:"unmatched_active_bans"`
-	LastFilteredAt                   string `json:"last_filtered_at,omitempty"`
-	ActiveReservations               int64  `json:"active_reservations"`
-	OldestReservationAgeSeconds      int64  `json:"oldest_reservation_age_seconds,omitempty"`
-	ExpiredReservationsCleaned       int64  `json:"expired_reservations_cleaned"`
-	LegacyUncorrelatedReleaseMatched int64  `json:"legacy_uncorrelated_release_matched"`
-	LegacyUncorrelatedReleaseMissed  int64  `json:"legacy_uncorrelated_release_unmatched"`
-	ReservationDBBusyCount           int64  `json:"reservation_db_busy_count"`
-	ReservationLockWaitMicroseconds  int64  `json:"reservation_lock_wait_microseconds"`
-	ReservationInsertMicroseconds    int64  `json:"reservation_insert_microseconds"`
+	ActiveBanCount                        int    `json:"active_ban_count"`
+	FilteredCandidates                    int    `json:"filtered_candidates"`
+	UnmatchedActiveBans                   int    `json:"unmatched_active_bans"`
+	LastFilteredAt                        string `json:"last_filtered_at,omitempty"`
+	ActiveReservations                    int64  `json:"active_reservations"`
+	OldestReservationAgeSeconds           int64  `json:"oldest_reservation_age_seconds,omitempty"`
+	ExpiredReservationsCleaned            int64  `json:"expired_reservations_cleaned"`
+	LegacyUncorrelatedReleaseMatched      int64  `json:"legacy_uncorrelated_release_matched"`
+	LegacyUncorrelatedReleaseMissed       int64  `json:"legacy_uncorrelated_release_unmatched"`
+	ReservationReleaseDuplicateObservable bool   `json:"reservation_release_duplicate_observable"`
+	ReservationReleaseDuplicateCount      *int64 `json:"reservation_release_duplicate_count"`
+	ReservationDBBusyCount                int64  `json:"reservation_db_busy_count"`
+	ReservationLockWaitMicroseconds       int64  `json:"reservation_lock_wait_microseconds"`
+	ReservationInsertMicroseconds         int64  `json:"reservation_insert_microseconds"`
 }
 
 type schedulerDiagnosticsTracker struct {
@@ -96,6 +98,11 @@ func (t *schedulerDiagnosticsTracker) status(activeBans int) schedulerDiagnostic
 	defer t.mu.Unlock()
 	out := t.state
 	out.ActiveBanCount = activeBans
+	// CPA's legacy callback has no request/reservation token. Two identical
+	// callbacks cannot be distinguished from two legitimate identical requests,
+	// so exposing a fabricated duplicate counter would be misleading.
+	out.ReservationReleaseDuplicateObservable = false
+	out.ReservationReleaseDuplicateCount = nil
 	if activeBans == 0 {
 		out.UnmatchedActiveBans = 0
 	}

@@ -873,6 +873,60 @@ func TestProtectionCandidateAliasesExcludeSharedWorkspaceID(t *testing.T) {
 	}
 }
 
+func TestProtectionUsageAliasesRetainSharedAuthIDFallbackForCPAPathSource(t *testing.T) {
+	candidates := []schedulerAuthCandidate{
+		{ID: "shared-workspace", Attributes: map[string]string{"source": "/auth/a.json", "auth_file": "a.json"}},
+		{ID: "shared-workspace", Attributes: map[string]string{"source": "/auth/b.json", "auth_file": "b.json"}},
+	}
+	sets := protectionCandidateUsageAliasSets(candidates)
+	if len(sets) != 2 ||
+		!containsAlias(sets[0], "/auth/a.json") || !containsAlias(sets[0], "shared-workspace") ||
+		!containsAlias(sets[1], "/auth/b.json") || !containsAlias(sets[1], "shared-workspace") {
+		t.Fatalf("usage alias sets = %+v, want unique paths plus the shared auth ID fallback", sets)
+	}
+
+	// CPA usage callbacks do not necessarily repeat the scheduler's path source;
+	// AuthID is the only guaranteed bridge for these duplicate candidates.
+	snapshot := newProtectionSnapshotWithUsageIndex(nil, newProtectionUsageIndex([]protectionUsageSample{{
+		Aliases: []string{"shared-workspace", "generated-index-a", "a@example.com"},
+		Tokens:  2_000_000,
+	}}))
+	for i := range candidates {
+		_, tokens := snapshot.metricsFor(nil, sets[i])
+		if tokens != 2_000_000 {
+			t.Fatalf("candidate %d tokens = %d, want conservative AuthID attribution", i, tokens)
+		}
+	}
+}
+
+func TestProtectionUsageAliasesConservativelyRetainFullyCollidingIdentity(t *testing.T) {
+	candidates := []schedulerAuthCandidate{
+		{ID: "shared-workspace", Attributes: map[string]string{"auth_index": "shared-workspace", "source": "shared@example.com", "auth_file": "a.json"}},
+		{ID: "shared-workspace", Attributes: map[string]string{"auth_index": "shared-workspace", "source": "shared@example.com", "auth_file": "b.json"}},
+	}
+	reservationSets := protectionCandidateAliasSets(candidates)
+	usageSets := protectionCandidateUsageAliasSets(candidates)
+	for i := range candidates {
+		if containsAlias(reservationSets[i], "shared-workspace") || containsAlias(reservationSets[i], "shared@example.com") {
+			t.Fatalf("candidate %d hard-limit aliases retained a colliding broad identity: %+v", i, reservationSets[i])
+		}
+		if !containsAlias(usageSets[i], "shared-workspace") || !containsAlias(usageSets[i], "shared@example.com") {
+			t.Fatalf("candidate %d soft-token aliases dropped an ambiguous usage identity: %+v", i, usageSets[i])
+		}
+	}
+
+	snapshot := newProtectionSnapshotWithUsageIndex(nil, newProtectionUsageIndex([]protectionUsageSample{{
+		Aliases: []string{"shared-workspace", "shared@example.com"},
+		Tokens:  2_000_000,
+	}}))
+	for i := range candidates {
+		inFlight, tokens := snapshot.metricsFor(reservationSets[i], usageSets[i])
+		if inFlight != 0 || tokens != 2_000_000 {
+			t.Fatalf("candidate %d ambiguous metrics = %d/%d, want 0/2000000", i, inFlight, tokens)
+		}
+	}
+}
+
 func TestConfiguredProtectionPlanIndexIgnoresSharedAliases(t *testing.T) {
 	index := configuredProtectionPlanIndex([]configuredAccount{
 		{AuthID: "shared", AuthIndex: "shared", Email: "a@example.com", AuthFile: "a.json", PlanType: "free"},

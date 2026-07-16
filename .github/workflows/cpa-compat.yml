@@ -38,9 +38,26 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Dynamically load plugin in CPA
+      - name: Resolve CPA revision
+        id: resolve_cpa
         shell: bash
         env:
           CPA_COMPAT_CHANNEL: ${{ matrix.channel }}
           CPA_COMPAT_GITHUB_TOKEN: ${{ github.token }}
+          CPA_COMPAT_VALIDATE_ONLY: "true"
+        run: |
+          resolved="$(bash scripts/check-cpa-compat.sh)"
+          printf '%s\n' "${resolved}"
+          commit="$(sed -n 's/^commit=//p' <<< "${resolved}" | tail -n 1)"
+          [[ "${commit}" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+
+      # Keep downloaded latest-main source in a token-free final step so it
+      # cannot inspect an ancestor process that carries the resolver token.
+      - name: Dynamically load plugin in resolved CPA without credentials
+        shell: bash
+        env:
+          CPA_COMPAT_CHANNEL: locked
+          CPA_COMPAT_COMMIT: ${{ steps.resolve_cpa.outputs.commit }}
+          CPA_COMPAT_EXECUTION_MODE: docker
         run: bash scripts/check-cpa-compat.sh

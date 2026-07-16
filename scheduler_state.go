@@ -410,10 +410,12 @@ func (c *schedulerStateCache) applySnapshotRefresh(
 	// committed independently so activity on one provider cannot suppress the
 	// other provider's fresh database snapshot.
 	if c.codexGeneration == generation.codex && c.codexPending == 0 {
+		c.codexGeneration++
 		c.codexInitialized = true
 		c.codexSnapshot = codex
 	}
 	if c.xaiGeneration == generation.xai && c.xaiPending == 0 {
+		c.xaiGeneration++
 		c.xaiInitialized = true
 		c.xaiSnapshot = xai
 	}
@@ -434,6 +436,7 @@ func (c *schedulerStateCache) applyRefresh(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.codexGeneration == generation.codex && c.codexPending == 0 {
+		c.codexGeneration++
 		if codexRestricted {
 			c.codexInitialized = false
 			c.codexSnapshot = nil
@@ -443,6 +446,7 @@ func (c *schedulerStateCache) applyRefresh(
 		}
 	}
 	if c.xaiGeneration == generation.xai && c.xaiPending == 0 {
+		c.xaiGeneration++
 		if xaiRestricted {
 			c.xaiInitialized = false
 			c.xaiSnapshot = nil

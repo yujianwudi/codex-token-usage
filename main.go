@@ -420,14 +420,25 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		writeABIPanicResponse(response)
 	}()
 	clearABIResponseBuffer(response)
+	// A response buffer is required by the ABI. Reject a malformed host call
+	// before the panic hook, lifecycle gate, or method handler can mutate plugin
+	// state when there is nowhere safe to return the result.
+	if response == nil {
+		return 1
+	}
 	runABIPanicHook(abiPanicCall)
 	return cliproxyPluginCallBody(method, request, requestLen, response)
 }
 
 func cliproxyPluginCallBody(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
-	if response != nil {
-		response.ptr = nil
-		response.len = 0
+	if response == nil {
+		return 1
+	}
+	response.ptr = nil
+	response.len = 0
+	if request == nil && requestLen > 0 {
+		writeResponse(response, errorEnvelope("invalid_request", "request pointer is required when request length is non-zero"))
+		return 1
 	}
 	methodName := ""
 	if method != nil {

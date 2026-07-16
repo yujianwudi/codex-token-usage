@@ -108,6 +108,7 @@ func TestUnsupportedProviderRowsAreInertAndDiagnosed(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
 	t.Setenv("CPA_AUTH_DIR", filepath.Join(dir, "auth"))
 	s := &store{}
+	t.Cleanup(s.close)
 	db, path, err := s.open(context.Background())
 	if err != nil {
 		t.Fatal(err)

@@ -884,13 +884,20 @@ func loadAPIKeyPrivacyQuarantine(ctx context.Context, db *sql.DB) (map[string]st
 			continue
 		}
 		var stored []string
+		malformed := false
 		for _, fingerprint := range strings.Split(value, ",") {
 			fingerprint = strings.ToLower(strings.TrimSpace(fingerprint))
-			if _, _, _, ok := parseAPIKeyFingerprint(fingerprint); ok {
-				stored = append(stored, fingerprint)
+			if fingerprint == "" {
+				malformed = true
+				break
 			}
+			if _, _, _, ok := parseAPIKeyFingerprint(fingerprint); !ok {
+				malformed = true
+				break
+			}
+			stored = append(stored, fingerprint)
 		}
-		if len(stored) == 0 {
+		if malformed || len(stored) == 0 {
 			fingerprints[provider] = nil
 			reasons[provider] = "privacy quarantine marker is malformed; repair the marker or explicitly remove it only after verifying legacy restrictions"
 			continue

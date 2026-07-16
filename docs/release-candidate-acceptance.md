@@ -1,6 +1,6 @@
 # Release candidate acceptance runbook
 
-This runbook keeps independent acceptance attached to the exact files that are later published. A Release workflow run builds the platform archives and SPDX files once, verifies the closed asset set, generates `checksums.txt`, and records the SHA-256 digest of that manifest. The publish job then waits at the `independent-release` Environment. It does not rebuild the plugin.
+This runbook keeps independent acceptance attached to the exact files that are later published. A Release workflow run builds the platform archives and SPDX files once, verifies the closed asset set, generates `checksums.txt`, and records the SHA-256 digest of that manifest. The normal publish job then waits at the `independent-release` Environment. It does not rebuild the plugin. A separately audited repository-owner waiver exists for emergencies and is documented below; it never fabricates an acceptance report.
 
 Do not merge the candidate or create the version tag before independent acceptance finishes. After acceptance, promote the exact tested commit to `main` without changing its SHA. The workflow creates the annotated tag only after the accepted version, source commit, and bundle digest have all been authorized.
 
@@ -9,6 +9,7 @@ Do not merge the candidate or create the version tag before independent acceptan
 Configure these controls before starting a candidate:
 
 - Create an `independent-release` Environment with required reviewers. Prevent the candidate author from being the only reviewer where the repository plan supports that control.
+- Keep only one stable candidate in the approval lane at a time. GitHub concurrency preserves the running publication but keeps at most one pending run; starting a third stable candidate can replace an older pending candidate even with `cancel-in-progress: false`.
 - Allow reviewed candidate branches in the Environment deployment policy. The workflow run keeps its candidate-branch identity after the accepted commit is promoted to `main`; keep that branch until publication completes.
 - Create the non-secret Environment variable `CPA_INDEPENDENT_ACCEPTED_RELEASES`. Keep it empty until a second-machine report accepts a candidate.
 - Restrict `v*` tag creation and direct GitHub Release publication so the Release workflow is the only normal publication path.
@@ -180,3 +181,28 @@ After publication, verify that the annotated tag resolves to `HEAD_SHA`, the Rel
 If publication fails after the accepted tag or draft is created, rerun the failed publish job in the same `RUN_ID`; exact tag-message, commit, digest, and asset checks make that recovery idempotent. If a draft contains unexpected assets, delete only that draft and rerun while retaining the accepted annotated tag. A published Release is accepted as an idempotent success only when every downloaded asset is byte-for-byte identical to the candidate.
 
 If acceptance is rejected, leave the Environment unapproved and cancel the run. Fix the source, choose the appropriate next version, and repeat the complete procedure. Never create, move, or force-update a version tag to rescue a rejected candidate.
+
+## Emergency repository-owner waiver
+
+Use this only when the repository owner explicitly accepts publication without second-machine evidence. It does not disable automated source-security, CPA compatibility, race, vulnerability, multi-process, platform-build, asset, checksum, SBOM, attestation, exact-SHA, or tag-integrity gates.
+
+Before dispatch, fast-forward `main` to the exact candidate commit and verify that the candidate branch still points to the same object. Then dispatch from that candidate branch with both waiver inputs:
+
+```bash
+VERSION=0.1.39
+CANDIDATE_BRANCH=agent/v0.1.39-cpa-compat-hardening
+git fetch origin main "${CANDIDATE_BRANCH}"
+CANDIDATE_SHA="$(git rev-parse "origin/${CANDIDATE_BRANCH}")"
+MAIN_SHA="$(git rev-parse origin/main)"
+test "$(git merge-base "${MAIN_SHA}" "${CANDIDATE_SHA}")" = "${MAIN_SHA}"
+git push origin "${CANDIDATE_SHA}:refs/heads/main"
+test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "${CANDIDATE_SHA}"
+
+gh workflow run release.yml \
+  --ref "${CANDIDATE_BRANCH}" \
+  -f version="${VERSION}" \
+  -f waive_independent_acceptance=true \
+  -f waiver_confirmation="WAIVE_SECOND_MACHINE_v${VERSION}"
+```
+
+The waiver fails closed unless the triggering actor is the repository owner, the candidate SHA already equals `origin/main`, and the confirmation matches the exact version. The publish job uses the separate `owner-waived-release` Environment, writes the waiver into the job summary and annotated tag message, and requires the final GitHub Release body to display the waiver notice. Do not populate `CPA_INDEPENDENT_ACCEPTED_RELEASES` for this path.

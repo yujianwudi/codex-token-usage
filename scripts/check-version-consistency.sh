@@ -126,6 +126,15 @@ for workflow in "${workflow_go_files[@]}"; do
     exit 1
   fi
 done
+sandbox_image_line="$(sed -n 's/^cpa_sandbox_image="\([^"]*\)"$/\1/p' scripts/check-cpa-compat.sh)"
+if [[ ! "${sandbox_image_line}" =~ ^docker\.io/library/golang:([^@-]+)-[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo "CPA compatibility sandbox image must be an immutable official golang digest" >&2
+  exit 1
+fi
+if [[ "${BASH_REMATCH[1]}" != "${go_version}" ]]; then
+  echo "CPA sandbox Go version mismatch: go.mod=${go_version} image=${BASH_REMATCH[1]}" >&2
+  exit 1
+fi
 if ! grep -Fq "Release builds use Go \`${go_version}\`" README.md; then
   echo "README.md build Go version does not match go.mod ${go_version}" >&2
   exit 1

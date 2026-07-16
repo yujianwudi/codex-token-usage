@@ -222,7 +222,37 @@ int main(int argc, char **argv) {
     plugin_free = api.free_buffer;
     plugin_shutdown = api.shutdown;
 
+    const char null_response_reconfigure_request[] =
+        "{\"config_yaml\":\"account_protection_enabled: true\"}";
+    if (plugin_call("plugin.reconfigure", (uint8_t *)null_response_reconfigure_request,
+                    strlen(null_response_reconfigure_request), NULL) != 1) {
+        fail("call with a NULL response buffer did not fail before method execution");
+    }
+
     cliproxy_buffer response = {0};
+    const char scheduler_probe_request[] =
+        "{\"Provider\":\"codex\",\"Candidates\":[{\"ID\":\"null-response-sentinel\",\"Provider\":\"codex\"}]}";
+    if (plugin_call("scheduler.pick", (uint8_t *)scheduler_probe_request,
+                    strlen(scheduler_probe_request), &response) != 0) {
+        fail("scheduler probe failed after the NULL response call");
+    }
+    if (!buffer_contains(&response, "\"Handled\":false")) {
+        fail("NULL response validation dispatched plugin.reconfigure before failing");
+    }
+    plugin_free(response.ptr, response.len);
+
+    response.ptr = NULL;
+    response.len = 0;
+    if (plugin_call("plugin.reconfigure", NULL, 1, &response) != 1) {
+        fail("call with a NULL request pointer and non-zero length did not fail");
+    }
+    if (!buffer_contains(&response, "\"code\":\"invalid_request\"")) {
+        fail("malformed request pointer response did not contain invalid_request");
+    }
+    plugin_free(response.ptr, response.len);
+
+    response.ptr = NULL;
+    response.len = 0;
     set_panic_point(PANIC_CALL);
     if (plugin_call("management.register", NULL, 0, &response) != 1) {
         fail("panic-injected call did not return failure");

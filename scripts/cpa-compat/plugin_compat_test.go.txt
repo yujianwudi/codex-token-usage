@@ -25,6 +25,7 @@ import (
 const compatAccountProtectionSaturatedMessage = "all Codex auth candidates are at their configured concurrency limit; retry after an in-flight request completes"
 
 func TestExternalCodexTokenUsageCompatibility(t *testing.T) {
+	assertCompatibilityProcessHasNoGitHubCredentials(t)
 	if pluginabi.ABIVersion != 1 || pluginabi.SchemaVersion != 1 {
 		t.Fatalf("CPA contract versions = ABI %d schema %d, want 1/1", pluginabi.ABIVersion, pluginabi.SchemaVersion)
 	}
@@ -367,6 +368,38 @@ func TestExternalCodexTokenUsageCompatibility(t *testing.T) {
 	}
 }
 
+func assertCompatibilityProcessHasNoGitHubCredentials(t *testing.T) {
+	t.Helper()
+	if os.Getenv("CODEX_TOKEN_USAGE_COMPAT_SANDBOX") != "1" {
+		t.Fatal("compatibility process is not running in the sanitized execution environment")
+	}
+	if strings.TrimSpace(os.Getenv("HOME")) == "" {
+		t.Fatal("compatibility process does not have an isolated HOME")
+	}
+	for _, name := range []string{
+		"CPA_COMPAT_GITHUB_TOKEN",
+		"GITHUB_TOKEN",
+		"GH_TOKEN",
+		"GITHUB_ENTERPRISE_TOKEN",
+		"GH_ENTERPRISE_TOKEN",
+		"ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+		"ACTIONS_RUNTIME_TOKEN",
+		"GIT_ASKPASS",
+		"SSH_ASKPASS",
+		"SSH_AUTH_SOCK",
+		"GIT_SSH_COMMAND",
+		"NETRC",
+		"GITHUB_ENV",
+		"GITHUB_OUTPUT",
+		"GITHUB_PATH",
+		"GITHUB_STEP_SUMMARY",
+	} {
+		if os.Getenv(name) != "" {
+			t.Fatalf("compatibility process inherited credential-bearing environment variable %s", name)
+		}
+	}
+}
+
 const (
 	compatABIPanicInit                       uint32 = 1
 	compatABIPanicCall                       uint32 = 2
@@ -378,6 +411,7 @@ const (
 )
 
 func TestExternalCodexTokenUsagePanicBoundary(t *testing.T) {
+	assertCompatibilityProcessHasNoGitHubCredentials(t)
 	library := strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_PANIC_LIBRARY"))
 	if library == "" {
 		t.Fatal("CODEX_TOKEN_USAGE_PANIC_LIBRARY is required")

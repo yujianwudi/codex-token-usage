@@ -37,11 +37,16 @@ the first open of a v0-v5 database.
 - Usage events, quota-trigger runs, and reservations preserve their complete
   rows and original IDs; they are not merged by account alias.
 - Existing usage rows receive `generate=1`, preserving pre-v6 accounting.
-- A v0.1.38 or older plugin is not a supported reader or downgrade tool for a
-  v6 database. Its legacy initializer performs idempotent schema/column probes
-  before it notices the newer `user_version`, so do not point it at the live v6
-  file or rely on it as a no-write verifier. Restore the complete v5 backup
-  before starting an older plugin.
+- The pinned official v0.1.38 Linux amd64 asset is executed in CI and candidate
+  builds against both checkpointed and committed-WAL v6 databases. It must
+  return the explicit `schema 6 is newer than supported schema 5` refusal and
+  leave `user_version`, schema objects, rows, and counts unchanged. A closed,
+  checkpointed fixture remains byte-for-byte unchanged. A committed WAL is a
+  historical-binary limitation: v0.1.38 may checkpoint it into the main file
+  and remove sidecars before refusing, changing file hashes without changing
+  logical data. Therefore never point v0.1.38 or older code at a live v6
+  database; restore the complete v5 backup first. Byte-level no-write for every
+  v6 WAL state cannot be retrofitted into an already published binary.
 
 The cross-process guarantees apply to SQLite on a supported local filesystem.
 They are not claimed for NFS, SMB, cloud-synchronized folders, or other network

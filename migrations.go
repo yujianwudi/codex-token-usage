@@ -12,11 +12,23 @@ const currentSQLiteSchemaVersion = 6
 
 var sqliteMigrationV6FaultHook func(context.Context, *sql.Tx, string) error
 
+// sqliteMigrationV6LockHook is nil in production. The OS-process migration
+// test uses it to prove that one process is blocked inside BEGIN IMMEDIATE
+// while another process owns the SQLite writer lock.
+var sqliteMigrationV6LockHook func(context.Context, string) error
+
 func sqliteMigrationV6Checkpoint(ctx context.Context, tx *sql.Tx, stage string) error {
 	if sqliteMigrationV6FaultHook == nil {
 		return nil
 	}
 	return sqliteMigrationV6FaultHook(ctx, tx, stage)
+}
+
+func sqliteMigrationV6LockCheckpoint(ctx context.Context, stage string) error {
+	if sqliteMigrationV6LockHook == nil {
+		return nil
+	}
+	return sqliteMigrationV6LockHook(ctx, stage)
 }
 
 func migrateSQLiteStore(ctx context.Context, db *sql.DB, dbPath string) error {
@@ -46,11 +58,17 @@ func migrateSQLiteStore(ctx context.Context, db *sql.DB, dbPath string) error {
 		return err
 	}
 	defer conn.Close()
+	if err := sqliteMigrationV6LockCheckpoint(ctx, "before-begin"); err != nil {
+		return err
+	}
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if err := sqliteMigrationV6LockCheckpoint(ctx, "after-begin"); err != nil {
+		return err
+	}
 
 	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return err
