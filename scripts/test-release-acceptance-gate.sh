@@ -146,12 +146,12 @@ if release_environment.count(expected_environment) != 1:
 if any(line == "  build-other:" for line in lines):
     raise SystemExit("Release workflow must not publish non-Linux platform builds")
 build_linux_start, build_linux_end = job_bounds("build-linux")
-release_arches = {
+release_arches = [
     line.strip()[len("- goarch: "):]
     for line in lines[build_linux_start:build_linux_end]
     if line.strip().startswith("- goarch: ")
-}
-if release_arches != {"amd64", "arm64"}:
+]
+if sorted(release_arches) != ["amd64", "arm64"]:
     raise SystemExit(f"Release workflow Linux architecture matrix changed: {sorted(release_arches)}")
 verify_start, verify_end = job_bounds("verify-assets")
 verify_needs = {
