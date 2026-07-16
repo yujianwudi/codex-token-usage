@@ -508,7 +508,7 @@ func TestReservationWriterLockFailsClosedWithinSchedulerBudget(t *testing.T) {
 		t.Fatalf("error=%v, want a temporary scheduler database failure", err)
 	}
 	if elapsed >= 650*time.Millisecond {
-		t.Fatalf("writer lock elapsed=%v, want safety margin below 750ms scheduler deadline", elapsed)
+		t.Fatalf("writer lock elapsed=%v, want at least 100ms safety margin below the 750ms scheduler deadline", elapsed)
 	}
 	var reservations int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations WHERE provider=?`, providerCodex).Scan(&reservations); err != nil {

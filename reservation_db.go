@@ -10,7 +10,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
-const accountProtectionReservationBusyTimeoutMS = 300
+const accountProtectionReservationBusyTimeoutMS = 200
 
 // reservationTransactionDB returns a handle whose BeginTx uses SQLite
 // BEGIN IMMEDIATE. The early writer reservation is the cross-process
