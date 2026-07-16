@@ -649,10 +649,15 @@ jobs:
           esac
 
           release_state=none
-          release_status="$(github_api_status "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
-          case "${release_status}" in
-            200)
-              release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          release_json="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+              jq -s --arg tag "${RELEASE_TAG}" '[.[][] | select(.tag_name == $tag)]'
+          )"
+          release_count="$(jq 'length' <<< "${release_json}")"
+          case "${release_count}" in
+            0) ;;
+            1)
+              release_json="$(jq '.[0]' <<< "${release_json}")"
               if [[ "$(jq -r .tag_name <<< "${release_json}")" != "${RELEASE_TAG}" || \
                     "$(jq -r .name <<< "${release_json}")" != "${RELEASE_TAG}" || \
                     "$(jq -r .prerelease <<< "${release_json}")" != "false" ]]; then
@@ -669,9 +674,8 @@ jobs:
                 release_state=published
               fi
               ;;
-            404) ;;
             *)
-              echo "Cannot safely determine whether release ${RELEASE_TAG} exists (HTTP ${release_status})" >&2
+              echo "Multiple Releases use tag ${RELEASE_TAG}; refusing ambiguous recovery" >&2
               exit 1
               ;;
           esac
@@ -826,8 +830,7 @@ jobs:
           esac
 
           if [[ -n "${waiver_notice}" ]]; then
-            release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
-            release_body="$(jq -r '.body // ""' <<< "${release_json}")"
+            release_body="$(gh release view "${RELEASE_TAG}" --json body --jq '.body // ""')"
             if [[ "${release_body}" != *"${waiver_notice}"* ]]; then
               if [[ "${RELEASE_STATE}" == "published" ]]; then
                 echo "Published owner-waived Release is missing its required waiver notice" >&2

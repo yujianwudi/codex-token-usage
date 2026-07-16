@@ -218,6 +218,31 @@ for required in (
     if required not in waiver_run:
         raise SystemExit(f"Publication waiver step is missing: {required}")
 
+publication_state_steps = [step for step in release_steps if step_name(step) == "Inspect resumable publication state"]
+if len(publication_state_steps) != 1:
+    raise SystemExit("Release workflow must contain one resumable publication-state step")
+publication_state_run = step_run(publication_state_steps[0])
+for required in (
+    'gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100"',
+    "[.[][] | select(.tag_name == $tag)]",
+    "Multiple Releases use tag ${RELEASE_TAG}; refusing ambiguous recovery",
+):
+    if required not in publication_state_run:
+        raise SystemExit(f"Publication-state recovery is not draft-safe: {required}")
+if 'release_status="$(github_api_status "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"' in publication_state_run:
+    raise SystemExit("Publication-state recovery must not query the draft-blind release-by-tag endpoint")
+
+publication_steps = [step for step in release_steps if step_name(step) == "Create, resume, and verify release publication"]
+if len(publication_steps) != 1:
+    raise SystemExit("Release workflow must contain one publication step")
+publication_run = step_run(publication_steps[0])
+for required in (
+    'gh release view "${RELEASE_TAG}" --json body',
+    "--jq '.body // \"\"'",
+):
+    if required not in publication_run:
+        raise SystemExit(f"Draft Release body lookup is not resumable: {required}")
+
 previous_release_steps = [step for step in release_steps if step_name(step) == "Resolve previous published release"]
 if len(previous_release_steps) != 1 or "bash scripts/select-previous-release-tag.sh" not in step_run(previous_release_steps[0]):
     raise SystemExit("Stable publication is missing its serialized version-order gate")
