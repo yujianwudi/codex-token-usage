@@ -31,12 +31,11 @@ See the [changelog](CHANGELOG.md) for version history, the [release candidate ac
 
 ## Install Manually
 
-Download the matching release zip, then place the dynamic library under the CLIProxyAPI plugin directory:
+Official releases support Linux on amd64 and arm64. Download the matching release zip, then place the dynamic library under the CLIProxyAPI plugin directory:
 
 ```text
 plugins/linux/amd64/codex-token-usage.so
-plugins/windows/amd64/codex-token-usage.dll
-plugins/darwin/arm64/codex-token-usage.dylib
+plugins/linux/arm64/codex-token-usage.so
 ```
 
 Restart CLIProxyAPI after replacing the file.
@@ -131,13 +130,11 @@ Opening a v0-v5 database upgrades it atomically to schema v6. Back up active SQL
 
 ## Data Directory and Path Overrides
 
-The plugin stores its SQLite database, API-key fingerprint secret, and downloaded model price table under an OS-specific private data directory:
+The plugin stores its SQLite database, API-key fingerprint secret, and downloaded model price table under a private Linux data directory:
 
 | Platform | Default data directory |
 | --- | --- |
 | Linux | `~/.cli-proxy-api/plugins/codex-token-usage` |
-| macOS | `~/Library/Application Support/CLIProxyAPI/plugins/codex-token-usage` |
-| Windows | `%LOCALAPPDATA%\CLIProxyAPI\plugins\codex-token-usage` |
 
 Set `CPA_TOKEN_USAGE_DIR` to override the complete plugin data directory. The following related path settings are also supported:
 
@@ -145,7 +142,7 @@ Set `CPA_TOKEN_USAGE_DIR` to override the complete plugin data directory. The fo
 - `CPA_AUTH_DIR`: CLIProxyAPI credential directory.
 - `CPA_CONFIG_PATH` or `CPA_CONFIG_FILE`: CLIProxyAPI configuration file.
 
-The process account must be able to create and update the selected directory. On Unix-like systems, the plugin creates its private directory with mode `0700` and sensitive files with mode `0600`.
+The process account must be able to create and update the selected directory. On Linux, the plugin creates its private directory with mode `0700` and sensitive files with mode `0600`.
 
 ## Model Price Table
 
@@ -177,7 +174,7 @@ The file is about 1.5 MB and is not bundled into release zips, so plugin binarie
 
 ## Build
 
-Release builds use Go `1.26.5` with CGO enabled. A platform C compiler, `zip`, and Python 3 are required for the full packaging and Linux ABI smoke workflow.
+Release builds use Go `1.26.5` with CGO enabled. A Linux C compiler, `zip`, and Python 3 are required for the full packaging and ABI smoke workflow.
 
 ```bash
 go test ./...
@@ -191,7 +188,7 @@ The normal Release workflow is dispatched from an unmerged candidate branch whos
 
 CI and the Release workflow both run the scheduler benchmark suite three times, enforce the checked-in performance budgets, and retain the raw benchmark output as an Actions artifact for review.
 
-CI first confirms that `scripts/cpa-compat.lock` still points to GitHub's latest published CLIProxyAPI release, then builds and dynamically loads the plugin against that exact commit. External CPA init/test code runs in a digest-pinned Go container with no network, no capabilities, a read-only root filesystem, and only the task-local work directory mounted; it cannot modify the runner workspace, Actions post hooks, Docker socket, or shared Go caches. This ABI/RPC gate exercises the real CPA Host registration, `ApplyConfig`/reconfiguration, guarded client, `PickAuth`, in-process usage adapter (including omitted/true/false `Generate`), management resources, host-auth callbacks, Provider pollution, mixed partial availability, hard-limit behavior, and shutdown/re-init. It also starts two independent CPA Host processes against one SQLite database with a reservation limit of one and a synchronized barrier, requiring exactly one success and one saturated result; the internal stress gate retains the fuller 2/4/8-process and crash/lock-recovery coverage. The same real CPA loader also loads a build-tagged test library and injects init/call/free/shutdown panics; exported test controls and panic markers are rejected from the release-compatible library. The gate injects usage through the Host adapter; it does not run a Provider network executor or prove that a real request emitted its terminal usage callback. That Provider-executor end-to-end lifecycle remains a separate independent acceptance item and must not be replaced by direct usage RPC calls. To run the ABI/RPC gate locally on Linux or macOS:
+CI first confirms that `scripts/cpa-compat.lock` still points to GitHub's latest published CLIProxyAPI release, then builds and dynamically loads the plugin against that exact commit. External CPA init/test code runs in a digest-pinned Go container with no network, no capabilities, a read-only root filesystem, and only the task-local work directory mounted; it cannot modify the runner workspace, Actions post hooks, Docker socket, or shared Go caches. This ABI/RPC gate exercises the real CPA Host registration, `ApplyConfig`/reconfiguration, guarded client, `PickAuth`, in-process usage adapter (including omitted/true/false `Generate`), management resources, host-auth callbacks, Provider pollution, mixed partial availability, hard-limit behavior, and shutdown/re-init. It also starts two independent CPA Host processes against one SQLite database with a reservation limit of one and a synchronized barrier, requiring exactly one success and one saturated result; the internal stress gate retains the fuller 2/4/8-process and crash/lock-recovery coverage. The same real CPA loader also loads a build-tagged test library and injects init/call/free/shutdown panics; exported test controls and panic markers are rejected from the release-compatible library. The gate injects usage through the Host adapter; it does not run a Provider network executor or prove that a real request emitted its terminal usage callback. That Provider-executor end-to-end lifecycle remains a separate independent acceptance item and must not be replaced by direct usage RPC calls. To run the ABI/RPC gate locally on Linux:
 
 ```bash
 bash scripts/check-cpa-compat.sh
@@ -201,29 +198,21 @@ Set `CPA_SOURCE_DIR` to an existing CLIProxyAPI checkout containing the resolved
 
 Official Linux archives are built in an Ubuntu 20.04 container and gated to require no newer than glibc `2.31`. They support glibc-based distributions such as Ubuntu 20.04+ and Debian 11+. Alpine Linux uses musl and is not supported by these CGO release binaries.
 
-Official macOS archives are native single-architecture builds for Intel and Apple Silicon. Both are pinned and verified with a minimum deployment target of macOS `12.0`, so newer hosted runners cannot silently raise the required system version.
-
-Each platform zip contains the dynamic library, `LICENSE`, and `THIRD_PARTY_NOTICES.md`. Releases always publish per-platform SPDX JSON SBOMs and SHA-256 checksums. Public repositories also publish GitHub build provenance attestations; the workflow skips only that attestation step for repositories where GitHub attestations are unavailable, without blocking the remaining release assets.
+Each Linux zip contains the dynamic library, `LICENSE`, and `THIRD_PARTY_NOTICES.md`. Releases always publish per-architecture SPDX JSON SBOMs and SHA-256 checksums. Public repositories also publish GitHub build provenance attestations; the workflow skips only that attestation step for repositories where GitHub attestations are unavailable, without blocking the remaining release assets.
 
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
 codex-token-usage_0.1.39_linux_amd64.zip
 codex-token-usage_0.1.39_linux_arm64.zip
-codex-token-usage_0.1.39_windows_amd64.zip
-codex-token-usage_0.1.39_darwin_amd64.zip
-codex-token-usage_0.1.39_darwin_arm64.zip
 codex-token-usage_0.1.39_linux_amd64.spdx.json
 codex-token-usage_0.1.39_linux_arm64.spdx.json
-codex-token-usage_0.1.39_windows_amd64.spdx.json
-codex-token-usage_0.1.39_darwin_amd64.spdx.json
-codex-token-usage_0.1.39_darwin_arm64.spdx.json
 checksums.txt
 ```
 
 ### Verify a Release
 
-Download `checksums.txt` together with all five platform archives and all five SPDX JSON files into the same directory. The checksum manifest intentionally covers all ten assets, so verify the complete set before installing the plugin:
+Download `checksums.txt` together with both Linux archives and both SPDX JSON files into the same directory. The checksum manifest intentionally covers all four assets, so verify the complete set before installing the plugin:
 
 ```bash
 sha256sum -c checksums.txt
@@ -247,8 +236,8 @@ Repeat the attestation command for the SPDX JSON file and `checksums.txt`. The w
 
 ## Plugin Store Checklist
 
-- Build and upload all required OS / architecture zip files.
-- Include `checksums.txt`, per-platform SPDX SBOMs, and license notices. Public repositories must also publish GitHub provenance attestations; where attestations are unavailable, only that attestation step may be skipped.
+- Build and upload both supported Linux architecture zip files.
+- Include `checksums.txt`, per-architecture SPDX SBOMs, and license notices. Public repositories must also publish GitHub provenance attestations; where attestations are unavailable, only that attestation step may be skipped.
 - Add screenshots for the Codex account pool, AI provider overview, and a selected AI endpoint page.
 - Document both quota-trigger modes: read-only `quota` GET behavior and the real-probe token cost risk of `probe`.
 - Confirm `go test ./...` passes before publishing.

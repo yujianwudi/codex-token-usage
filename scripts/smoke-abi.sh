@@ -9,58 +9,21 @@ if [[ ! -f "${library}" ]]; then
   exit 1
 fi
 
-required_symbols=(
-  cliproxy_plugin_init
-  cliproxyPluginCall
-  cliproxyPluginFree
-  cliproxyPluginShutdown
-)
-
-case "${target_os}" in
-  linux)
-    ldd -r "${library}"
-    ;;
-  darwin)
-    exported="$(nm -gU "${library}")"
-    for symbol in "${required_symbols[@]}"; do
-      if ! grep -Eq "[[:space:]]_?${symbol}$" <<< "${exported}"; then
-        echo "Missing Darwin ABI export: ${symbol}" >&2
-        exit 1
-      fi
-    done
-    otool -L "${library}"
-    ;;
-  windows)
-    headers="$(objdump -f "${library}")"
-    case "${target_arch}" in
-      amd64)
-        if ! grep -Eq 'file format (pei-x86-64|pe-x86-64)|architecture: i386:x86-64' <<< "${headers}"; then
-          echo "Windows DLL is not amd64:" >&2
-          echo "${headers}" >&2
-          exit 1
-        fi
-        ;;
-      *)
-        echo "Unsupported Windows GOARCH for ABI smoke test: ${target_arch}" >&2
-        exit 2
-        ;;
-    esac
-    exported="$(objdump -p "${library}")"
-    for symbol in "${required_symbols[@]}"; do
-      if ! grep -Eq "[[:space:]]${symbol}$" <<< "${exported}"; then
-        echo "Missing Windows ABI export: ${symbol}" >&2
-        exit 1
-      fi
-    done
-    ;;
+if [[ "${target_os}" != "linux" ]]; then
+  echo "Official ABI smoke tests support Linux only; got GOOS=${target_os}" >&2
+  exit 2
+fi
+case "${target_arch}" in
+  amd64 | arm64) ;;
   *)
-    echo "Unsupported ABI smoke-test platform: ${target_os}" >&2
+    echo "Unsupported Linux ABI smoke-test architecture: ${target_arch}" >&2
     exit 2
     ;;
 esac
+ldd -r "${library}"
 
 # The tagged panic-injection build is test-only. Check the exact library that
-# will be packaged, on every release platform, so a harness symbol or marker
+# will be packaged, on both supported Linux architectures, so a harness symbol or marker
 # cannot slip into an uploaded asset after the separate Linux harness test.
 for forbidden in CODEX_TOKEN_USAGE_ABI_PANIC ABI_PANIC_HARNESS_SECRET cliproxyTestSetPanicPoint cliproxyTestGetPanicPoint; do
   if strings "${library}" | grep -Fq "${forbidden}"; then

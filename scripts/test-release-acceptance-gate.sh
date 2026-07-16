@@ -143,6 +143,38 @@ expected_environment = "      name: ${{ inputs.waive_independent_acceptance && '
 if release_environment.count(expected_environment) != 1:
     raise SystemExit("Release workflow must route owner waivers through owner-waived-release")
 
+if any(line == "  build-other:" for line in lines):
+    raise SystemExit("Release workflow must not publish non-Linux platform builds")
+build_linux_start, build_linux_end = job_bounds("build-linux")
+release_arches = {
+    line.strip()[len("- goarch: "):]
+    for line in lines[build_linux_start:build_linux_end]
+    if line.strip().startswith("- goarch: ")
+}
+if release_arches != {"amd64", "arm64"}:
+    raise SystemExit(f"Release workflow Linux architecture matrix changed: {sorted(release_arches)}")
+verify_start, verify_end = job_bounds("verify-assets")
+verify_needs = {
+    line.strip()
+    for line in field_block(verify_start, verify_end, "needs", 4)
+    if line.strip()
+}
+if verify_needs != {"- validate", "- build-linux"}:
+    raise SystemExit(f"Release asset verification has unexpected dependencies: {sorted(verify_needs)}")
+if lines.count("          pattern: cpa-plugin-build-linux-*") != 1:
+    raise SystemExit("Release asset download must be restricted to Linux build artifacts")
+for subject in (
+    "release-assets/codex-token-usage_${{ needs.validate.outputs.version }}_linux_amd64.zip",
+    "release-assets/codex-token-usage_${{ needs.validate.outputs.version }}_linux_arm64.zip",
+    "release-assets/codex-token-usage_${{ needs.validate.outputs.version }}_linux_amd64.spdx.json",
+    "release-assets/codex-token-usage_${{ needs.validate.outputs.version }}_linux_arm64.spdx.json",
+    "release-assets/checksums.txt",
+):
+    if lines.count(f"            {subject}") != 1:
+        raise SystemExit(f"Release provenance must name exactly one Linux bundle subject: {subject}")
+if "            release-assets/*.zip" in lines or "            release-assets/*.spdx.json" in lines:
+    raise SystemExit("Release provenance must not use open-ended asset globs")
+
 validate_steps = job_steps("validate")
 release_steps = job_steps("release")
 all_steps = validate_steps + release_steps

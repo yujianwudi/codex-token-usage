@@ -55,7 +55,7 @@ for candidate in \
   fi
 done
 
-platforms=(linux_amd64 linux_arm64 windows_amd64 darwin_amd64 darwin_arm64)
+platforms=(linux_amd64 linux_arm64)
 for platform in "${platforms[@]}"; do
   asset="codex-token-usage_${version}_${platform}.zip"
   if ! grep -Fq "${asset}" README.md; then

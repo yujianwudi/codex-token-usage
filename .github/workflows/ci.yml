@@ -70,7 +70,6 @@ jobs:
           bash scripts/test-check-benchmark-budget.sh
           bash scripts/test-cpa-compat-lock.sh
           bash scripts/test-release-acceptance-gate.sh
-          bash scripts/test-check-macho.sh
           bash scripts/test-select-previous-release-tag.sh
           bash scripts/test-verify-release-assets.sh
 

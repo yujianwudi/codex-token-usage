@@ -5,20 +5,19 @@ cd "$(dirname "$0")"
 source scripts/semver.sh
 
 goos="$(go env GOOS)"
-ext="so"
-case "${goos}" in
-  windows) ext="dll" ;;
-  darwin)
-    ext="dylib"
-    # Go 1.26 supports macOS 12 and later. Pin the deployment target so a
-    # newer hosted runner cannot silently raise the plugin's minimum macOS.
-    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
-    if [[ ! "${MACOSX_DEPLOYMENT_TARGET}" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
-      echo "Invalid MACOSX_DEPLOYMENT_TARGET: ${MACOSX_DEPLOYMENT_TARGET}" >&2
-      exit 1
-    fi
+goarch="$(go env GOARCH)"
+if [[ "${goos}" != "linux" ]]; then
+  echo "Official codex-token-usage builds support Linux only; got GOOS=${goos}" >&2
+  exit 2
+fi
+case "${goarch}" in
+  amd64 | arm64) ;;
+  *)
+    echo "Unsupported Linux release architecture: ${goarch}" >&2
+    exit 2
     ;;
 esac
+ext="so"
 
 ldflags="-s -w"
 if [[ -n "${PLUGIN_VERSION:-}" ]]; then

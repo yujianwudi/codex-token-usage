@@ -70,13 +70,10 @@ expect_rejected() {
 
 make_fixture linux_amd64 so
 make_fixture linux_arm64 so
-make_fixture darwin_amd64 dylib
-make_fixture darwin_arm64 dylib
-make_fixture windows_amd64 dll
 
 bash scripts/verify-release-assets.sh "${version}" "${assets_dir}" >/dev/null
-if [[ "$(wc -l < "${assets_dir}/checksums.txt" | tr -d ' ')" != "10" ]]; then
-  echo "release verification did not generate exactly ten checksum entries" >&2
+if [[ "$(wc -l < "${assets_dir}/checksums.txt" | tr -d ' ')" != "4" ]]; then
+  echo "release verification did not generate exactly four checksum entries" >&2
   exit 1
 fi
 if ! (cd "${assets_dir}" && sha256sum -c checksums.txt >/dev/null); then
@@ -86,8 +83,8 @@ fi
 shopt -s nullglob dotglob
 final_entries=("${assets_dir}"/*)
 shopt -u nullglob dotglob
-if (( ${#final_entries[@]} != 11 )); then
-  echo "verified release bundle has ${#final_entries[@]} entries, want 11" >&2
+if (( ${#final_entries[@]} != 5 )); then
+  echo "verified release bundle has ${#final_entries[@]} entries, want 5" >&2
   exit 1
 fi
 for entry in "${final_entries[@]}"; do
@@ -153,8 +150,8 @@ expect_rejected "an SPDX checksum mismatch"
 mv "${sbom_backup}" "${sbom}"
 
 bash scripts/verify-release-assets.sh "${version}" "${assets_dir}" >/dev/null
-if [[ "$(wc -l < "${assets_dir}/checksums.txt" | tr -d ' ')" != "10" ]]; then
-  echo "restored release bundle did not regenerate ten checksums" >&2
+if [[ "$(wc -l < "${assets_dir}/checksums.txt" | tr -d ' ')" != "4" ]]; then
+  echo "restored release bundle did not regenerate four checksums" >&2
   exit 1
 fi
 

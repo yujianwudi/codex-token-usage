@@ -1,6 +1,6 @@
 # Release candidate acceptance runbook
 
-This runbook keeps independent acceptance attached to the exact files that are later published. A Release workflow run builds the platform archives and SPDX files once, verifies the closed asset set, generates `checksums.txt`, and records the SHA-256 digest of that manifest. The normal publish job then waits at the `independent-release` Environment. It does not rebuild the plugin. A separately audited repository-owner waiver exists for emergencies and is documented below; it never fabricates an acceptance report.
+This runbook keeps independent acceptance attached to the exact files that are later published. A Release workflow run builds the Linux amd64 and arm64 archives and SPDX files once, verifies the closed asset set, generates `checksums.txt`, and records the SHA-256 digest of that manifest. The normal publish job then waits at the `independent-release` Environment. It does not rebuild the plugin. A separately audited repository-owner waiver exists for emergencies and is documented below; it never fabricates an acceptance report.
 
 Do not merge the candidate or create the version tag before independent acceptance finishes. After acceptance, promote the exact tested commit to `main` without changing its SHA. The workflow creates the annotated tag only after the accepted version, source commit, and bundle digest have all been authorized.
 
@@ -66,7 +66,7 @@ gh run download "${RUN_ID}" \
   cd "${CANDIDATE_DIR}"
   expected_names="$({ awk '{print $2}' checksums.txt; echo checksums.txt; } | LC_ALL=C sort)"
   actual_names="$(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
-  test "$(printf '%s\n' "${actual_names}" | wc -l | tr -d ' ')" = 11
+  test "$(printf '%s\n' "${actual_names}" | wc -l | tr -d ' ')" = 5
   test "${actual_names}" = "${expected_names}"
   while IFS= read -r file; do
     test -f "${file}"
@@ -78,7 +78,7 @@ BUNDLE_DIGEST="$(sha256sum "${CANDIDATE_DIR}/checksums.txt" | awk '{print tolowe
 printf 'tag=%s\ncommit=%s\nbundle_digest=%s\n' "${TAG}" "${HEAD_SHA}" "${BUNDLE_DIGEST}"
 ```
 
-Compare `BUNDLE_DIGEST` with the digest in the `Verify complete release bundle` job summary. The manifest covers all five platform archives and all five SPDX JSON files. A missing, extra, renamed, or changed release asset requires rejection and a new workflow run.
+Compare `BUNDLE_DIGEST` with the digest in the `Verify complete release bundle` job summary. The manifest covers both Linux architecture archives and both SPDX JSON files. A missing, extra, renamed, or changed release asset requires rejection and a new workflow run.
 
 Also record the benchmark artifact named `release-scheduler-benchmarks-<commit>`. The Release workflow applies the same benchmark budget used by CI before building the candidate.
 
@@ -99,12 +99,11 @@ The automated loader does not replace the real Provider executor check below.
 
 ## 4. Install the candidate on the second machine
 
-Unpack only the archive for the second machine's operating system and architecture. Put the dynamic library in the matching CLIProxyAPI plugin directory, for example:
+Unpack only the archive for the second machine's supported Linux architecture. Put the dynamic library in the matching CLIProxyAPI plugin directory:
 
 ```text
 plugins/linux/amd64/codex-token-usage.so
-plugins/windows/amd64/codex-token-usage.dll
-plugins/darwin/arm64/codex-token-usage.dylib
+plugins/linux/arm64/codex-token-usage.so
 ```
 
 Use a dedicated data directory and start with quota probes and account protection disabled:
@@ -130,7 +129,7 @@ Restart CLIProxyAPI and confirm that it loads the candidate library, registers t
 
 Record the command, observed result, CPA tag and commit, OS/architecture, candidate run URL, `HEAD_SHA`, and `BUNDLE_DIGEST` for every item.
 
-1. **Integrity:** the top level contains exactly the ten manifest assets plus `checksums.txt`, every entry is a regular non-symlink file, all ten checksums pass `sha256sum --check --strict`, and the computed manifest digest equals the workflow summary.
+1. **Integrity:** the top level contains exactly the four manifest assets plus `checksums.txt`, every entry is a regular non-symlink file, all four checksums pass `sha256sum --check --strict`, and the computed manifest digest equals the workflow summary.
 2. **Latest CPA compatibility:** `CPA_COMPAT_CHANNEL=latest-release` passes and reports the latest published CPA tag/commit plus ABI/schema `1/1`.
 3. **Native candidate load:** the downloaded library, not a local rebuild, starts, reconfigures, exposes management resources, and shuts down under that CPA release.
 4. **Real CPA executor lifecycle with a local mock upstream:** enable account protection with a limit of one and issue the request through CPA's real Provider network executor, but route it only to a controlled local mock server. Do not use a real Provider credential, real account pool, external Provider endpoint, or production CPA service. Prove that a reservation exists while the mock request is in flight and returns to the baseline after CPA emits the terminal usage callback. Direct usage RPC injection is not acceptable evidence for this item.
@@ -169,7 +168,7 @@ Set `CPA_INDEPENDENT_ACCEPTED_RELEASES` in the `independent-release` Environment
 The publish job will:
 
 1. download the already uploaded `cpa-plugin-release-<version>` artifact from that run;
-2. recheck the exact 11-file allowlist, `checksums.txt`, its bundle digest, and `origin/main == HEAD_SHA`;
+2. recheck the exact 5-file Linux allowlist, `checksums.txt`, its bundle digest, and `origin/main == HEAD_SHA`;
 3. verify the exact acceptance triple and revalidate that the CPA lock still names the latest published release;
 4. refuse any unrelated tag or Release, while allowing only an annotated tag/draft created by this same run with the exact commit and bundle digest;
 5. attest the downloaded files;
@@ -184,7 +183,7 @@ If acceptance is rejected, leave the Environment unapproved and cancel the run. 
 
 ## Emergency repository-owner waiver
 
-Use this only when the repository owner explicitly accepts publication without second-machine evidence. It does not disable automated source-security, CPA compatibility, race, vulnerability, multi-process, platform-build, asset, checksum, SBOM, attestation, exact-SHA, or tag-integrity gates.
+Use this only when the repository owner explicitly accepts publication without second-machine evidence. It does not disable automated source-security, CPA compatibility, race, vulnerability, multi-process, Linux-build, asset, checksum, SBOM, attestation, exact-SHA, or tag-integrity gates.
 
 Before dispatch, fast-forward `main` to the exact candidate commit and verify that the candidate branch still points to the same object. Then dispatch from that candidate branch with both waiver inputs:
 

@@ -168,7 +168,6 @@ jobs:
           bash scripts/test-check-benchmark-budget.sh
           bash scripts/test-cpa-compat-lock.sh
           bash scripts/test-release-acceptance-gate.sh
-          bash scripts/test-check-macho.sh
           bash scripts/test-select-previous-release-tag.sh
           bash scripts/test-verify-release-assets.sh
 
@@ -387,120 +386,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  build-other:
-    name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
-    needs:
-      - validate
-      - source-security
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: darwin
-            goarch: amd64
-            # macos-15-intel is the current standard x64 label; format() keeps
-            # older actionlint runner catalogs from rejecting the valid label.
-            runner: ${{ format('macos-15-{0}', 'intel') }}
-            ext: dylib
-            macos_target: "12.0"
-          - goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-            macos_target: "12.0"
-          - goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-            macos_target: ""
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
-    env:
-      GOOS: ${{ matrix.goos }}
-      GOARCH: ${{ matrix.goarch }}
-      CGO_ENABLED: "1"
-      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
-      PLUGIN_VERSION: ${{ needs.validate.outputs.version }}
-    steps:
-      - name: Check out release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: Verify native build host architecture
-        shell: bash
-        run: |
-          host_arch="$(go env GOHOSTARCH)"
-          if [[ "${host_arch}" != "${GOARCH}" ]]; then
-            echo "CGO release builds must be native: host=${host_arch} target=${GOARCH}" >&2
-            exit 1
-          fi
-
-      - name: Install Windows C compiler
-        if: matrix.goos == 'windows'
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
-        with:
-          update: true
-          install: >-
-            mingw-w64-x86_64-gcc
-            zip
-
-      - name: Add MSYS2 to PATH
-        if: matrix.goos == 'windows'
-        shell: pwsh
-        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Test
-        run: go test -count=1 ./...
-
-      - name: Package
-        shell: bash
-        run: bash ./package-release.sh dist
-
-      - name: Shared-library ABI and architecture smoke test
-        shell: bash
-        run: bash scripts/smoke-abi.sh "./codex-token-usage.${{ matrix.ext }}" "${GOOS}" "${GOARCH}"
-
-      - name: Enforce Darwin architecture and macOS 12 compatibility
-        if: matrix.goos == 'darwin'
-        shell: bash
-        run: bash scripts/check-macho.sh ./codex-token-usage.dylib "${GOARCH}" "${MACOSX_DEPLOYMENT_TARGET}"
-
-      - name: Binary vulnerability scan
-        shell: bash
-        run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" -mode=binary "./codex-token-usage.${{ matrix.ext }}"
-
-      - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          file: codex-token-usage.${{ matrix.ext }}
-          format: spdx-json
-          output-file: dist/codex-token-usage_${{ needs.validate.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: cpa-plugin-build-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            dist/*.zip
-            dist/*.spdx.json
-          if-no-files-found: error
-          retention-days: 7
-
   verify-assets:
     name: Verify complete release bundle
     needs:
       - validate
       - build-linux
-      - build-other
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -514,7 +404,7 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: cpa-plugin-build-*
+          pattern: cpa-plugin-build-linux-*
           path: release-assets
           merge-multiple: true
 
@@ -620,7 +510,7 @@ jobs:
           LC_ALL=C sort -o "${expected_files}" "${expected_files}"
           find release-assets -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "${actual_files}"
           if ! diff -u "${expected_files}" "${actual_files}"; then
-            echo "Downloaded candidate does not contain the exact finalized 11-file release bundle" >&2
+            echo "Downloaded candidate does not contain the exact finalized 5-file Linux release bundle" >&2
             exit 1
           fi
           while IFS= read -r file; do
@@ -825,8 +715,10 @@ jobs:
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
-            release-assets/*.zip
-            release-assets/*.spdx.json
+            release-assets/codex-token-usage_${{ needs.validate.outputs.version }}_linux_amd64.zip
+            release-assets/codex-token-usage_${{ needs.validate.outputs.version }}_linux_arm64.zip
+            release-assets/codex-token-usage_${{ needs.validate.outputs.version }}_linux_amd64.spdx.json
+            release-assets/codex-token-usage_${{ needs.validate.outputs.version }}_linux_arm64.spdx.json
             release-assets/checksums.txt
 
       - name: Create or resume accepted annotated release tag
@@ -963,7 +855,7 @@ jobs:
           LC_ALL=C sort -o "${expected_files}" "${expected_files}"
           find "${published_assets}" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "${actual_files}"
           if ! diff -u "${expected_files}" "${actual_files}"; then
-            echo "GitHub Release does not contain the exact finalized 11-file bundle" >&2
+            echo "GitHub Release does not contain the exact finalized 5-file Linux bundle" >&2
             if [[ "${RELEASE_STATE}" == "draft" || "${RELEASE_STATE}" == "none" ]]; then
               echo "Delete only the draft Release, keep the accepted annotated tag, and rerun this job" >&2
             fi

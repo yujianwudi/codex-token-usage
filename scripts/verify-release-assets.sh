@@ -17,9 +17,6 @@ done
 platforms=(
   linux_amd64
   linux_arm64
-  darwin_amd64
-  darwin_arm64
-  windows_amd64
 )
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -31,7 +28,7 @@ for platform in "${platforms[@]}"; do
   release_assets+=("${archive_name}" "${sbom_name}")
 done
 
-# The verified input bundle is closed: exactly five archives and five SPDX
+# The verified input bundle is closed: exactly two Linux archives and two SPDX
 # documents, all as top-level regular files. In particular, reject stale
 # checksums, hidden files, directories, and symlinks before inspecting content.
 shopt -s nullglob dotglob
@@ -65,12 +62,8 @@ for platform in "${platforms[@]}"; do
   sbom="${directory}/codex-token-usage_${version}_${platform}.spdx.json"
   [[ -s "${zip}" ]] || { echo "Missing release archive: ${zip}" >&2; exit 1; }
   [[ -s "${sbom}" ]] || { echo "Missing release SBOM: ${sbom}" >&2; exit 1; }
-  case "${platform}" in
-    windows_*) ext="dll" ;;
-    darwin_*) ext="dylib" ;;
-    *) ext="so" ;;
-  esac
-  binary_name="codex-token-usage.${ext}"
+  ext="so"
+  binary_name="codex-token-usage.so"
 
   if ! unzip -tqq "${zip}"; then
     echo "Release archive failed its CRC/integrity check: ${zip}" >&2

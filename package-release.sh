@@ -32,15 +32,23 @@ for notice in LICENSE THIRD_PARTY_NOTICES.md; do
   fi
 done
 
-bash ./build.sh
-
 goos="$(go env GOOS)"
 goarch="$(go env GOARCH)"
-ext="so"
-case "${goos}" in
-  windows) ext="dll" ;;
-  darwin) ext="dylib" ;;
+if [[ "${goos}" != "linux" ]]; then
+  echo "Official codex-token-usage packages support Linux only; got GOOS=${goos}" >&2
+  exit 2
+fi
+case "${goarch}" in
+  amd64 | arm64) ;;
+  *)
+    echo "Unsupported Linux release architecture: ${goarch}" >&2
+    exit 2
+    ;;
 esac
+
+bash ./build.sh
+
+ext="so"
 
 artifact="${plugin_id}.${ext}"
 zip_name="${plugin_id}_${version}_${goos}_${goarch}.zip"
