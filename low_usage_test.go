@@ -389,7 +389,7 @@ func TestInvalidAuthUsesEventTimeSoNewAuthFileClearsOld401(t *testing.T) {
 	if err != nil {
 		t.Fatalf("record invalid auth: %v", err)
 	}
-	invalids, err := queryActiveInvalidAuths(ctx, db)
+	invalids, err := queryActiveInvalidAuths(ctx, db, providerCodex)
 	if err != nil {
 		t.Fatalf("query invalids: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestInvalidAuthUsesEventTimeSoNewAuthFileClearsOld401(t *testing.T) {
 	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
 		t.Fatalf("clear replaced invalid auths: %v", err)
 	}
-	invalids, err = queryActiveInvalidAuths(ctx, db)
+	invalids, err = queryActiveInvalidAuths(ctx, db, providerCodex)
 	if err != nil {
 		t.Fatalf("query invalids after clear: %v", err)
 	}

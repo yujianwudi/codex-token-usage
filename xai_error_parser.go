@@ -31,51 +31,79 @@ type xaiParsedError struct {
 func parseXAIError(status int, body string) xaiParsedError {
 	parsed := extractXAIError(body)
 	text := strings.ToLower(strings.TrimSpace(parsed.Code + " " + parsed.Message))
-	contains := func(markers ...string) bool {
-		for _, marker := range markers {
-			if strings.Contains(text, marker) {
-				return true
-			}
-		}
-		return false
-	}
 
-	switch {
-	case contains("free-usage-exhausted", "included free usage", "usage_limit_reached", "quota exhausted"):
-		parsed.Kind = xaiErrorFreeUsageExhausted
-	case contains("token has been invalidated", "token invalidated", "token_invalidated", "token revoked", "token_revoked", "revoked token", "credential revoked"):
-		parsed.Kind = xaiErrorTokenRevoked
-	case contains("token is expired", "token expired", "token_expired", "expired token", "expired_token", "jwt expired", "invalid_grant"):
-		parsed.Kind = xaiErrorTokenExpired
-	case contains("invalid token", "invalid bearer", "invalid credential", "invalid authentication", "unauthorized"):
-		parsed.Kind = xaiErrorUnauthorized
-	case contains("account suspended", "account_suspended", "account banned", "account_banned", "user suspended", "user banned", "suspended", "banned", "deactivated", "workspace disabled"):
-		parsed.Kind = xaiErrorAccountUnavailable
-	case contains("model unavailable", "model_unavailable", "model-unavailable", "model_not_found", "model not found", "unknown model", "model does not exist"):
-		parsed.Kind = xaiErrorModelUnavailable
-	case contains("permission-denied", "permission_denied", "permission denied", "insufficient permissions", "insufficient_scope", "access denied", "endpoint is denied", "not allowed", "forbidden"):
-		parsed.Kind = xaiErrorPermissionDenied
-	case contains("rate_limit", "rate-limit", "rate limited", "rate_limited", "rate limit", "too many requests", "temporarily throttled", "throttling"):
-		parsed.Kind = xaiErrorRateLimited
-	case contains("upstream error", "upstream_error", "upstream failure", "upstream_failure", "upstream timeout", "upstream_timeout", "internal_server_error", "service unavailable", "temporarily unavailable", "bad gateway", "gateway timeout", "request timeout"):
-		parsed.Kind = xaiErrorUpstreamTransient
-	default:
+	// HTTP status defines the only allowed classification family. Response-body
+	// markers may refine that family, but must never turn (for example) a 5xx or
+	// 404 into a credential restriction. Status 0 is the compatibility path for
+	// callers that have body evidence but no HTTP status at all.
+	switch status {
+	case 0:
+		parsed.Kind = classifyXAIErrorBody(text)
+	case http.StatusUnauthorized:
 		switch {
-		case status == http.StatusUnauthorized:
-			parsed.Kind = xaiErrorUnauthorized
-		case status == http.StatusForbidden || status == http.StatusPaymentRequired:
-			parsed.Kind = xaiErrorPermissionDenied
-		case status == http.StatusTooManyRequests:
-			parsed.Kind = xaiErrorRateLimited
-		case status == http.StatusNotFound:
-			parsed.Kind = xaiErrorModelUnavailable
-		case status >= http.StatusInternalServerError:
-			parsed.Kind = xaiErrorUpstreamTransient
+		case containsXAIErrorMarker(text, "token has been invalidated", "token invalidated", "token_invalidated", "token revoked", "token_revoked", "revoked token", "credential revoked"):
+			parsed.Kind = xaiErrorTokenRevoked
+		case containsXAIErrorMarker(text, "token is expired", "token expired", "token_expired", "expired token", "expired_token", "jwt expired", "invalid_grant"):
+			parsed.Kind = xaiErrorTokenExpired
 		default:
+			parsed.Kind = xaiErrorUnauthorized
+		}
+	case http.StatusPaymentRequired, http.StatusForbidden:
+		if containsXAIErrorMarker(text, "account suspended", "account_suspended", "account banned", "account_banned", "user suspended", "user banned", "suspended", "banned", "deactivated", "workspace disabled") {
+			parsed.Kind = xaiErrorAccountUnavailable
+		} else {
+			parsed.Kind = xaiErrorPermissionDenied
+		}
+	case http.StatusNotFound:
+		parsed.Kind = xaiErrorModelUnavailable
+	case http.StatusTooManyRequests:
+		if containsXAIErrorMarker(text, "free-usage-exhausted", "included free usage", "usage_limit_reached", "quota exhausted") {
+			parsed.Kind = xaiErrorFreeUsageExhausted
+		} else {
+			parsed.Kind = xaiErrorRateLimited
+		}
+	default:
+		if status >= http.StatusInternalServerError {
+			parsed.Kind = xaiErrorUpstreamTransient
+		} else {
 			parsed.Kind = xaiErrorUnknown
 		}
 	}
 	return parsed
+}
+
+func containsXAIErrorMarker(text string, markers ...string) bool {
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyXAIErrorBody(text string) xaiErrorKind {
+	switch {
+	case containsXAIErrorMarker(text, "free-usage-exhausted", "included free usage", "usage_limit_reached", "quota exhausted"):
+		return xaiErrorFreeUsageExhausted
+	case containsXAIErrorMarker(text, "token has been invalidated", "token invalidated", "token_invalidated", "token revoked", "token_revoked", "revoked token", "credential revoked"):
+		return xaiErrorTokenRevoked
+	case containsXAIErrorMarker(text, "token is expired", "token expired", "token_expired", "expired token", "expired_token", "jwt expired", "invalid_grant"):
+		return xaiErrorTokenExpired
+	case containsXAIErrorMarker(text, "invalid token", "invalid bearer", "invalid credential", "invalid authentication", "unauthorized"):
+		return xaiErrorUnauthorized
+	case containsXAIErrorMarker(text, "account suspended", "account_suspended", "account banned", "account_banned", "user suspended", "user banned", "suspended", "banned", "deactivated", "workspace disabled"):
+		return xaiErrorAccountUnavailable
+	case containsXAIErrorMarker(text, "model unavailable", "model_unavailable", "model-unavailable", "model_not_found", "model not found", "unknown model", "model does not exist"):
+		return xaiErrorModelUnavailable
+	case containsXAIErrorMarker(text, "permission-denied", "permission_denied", "permission denied", "insufficient permissions", "insufficient_scope", "access denied", "endpoint is denied", "not allowed", "forbidden"):
+		return xaiErrorPermissionDenied
+	case containsXAIErrorMarker(text, "rate_limit", "rate-limit", "rate limited", "rate_limited", "rate limit", "too many requests", "temporarily throttled", "throttling"):
+		return xaiErrorRateLimited
+	case containsXAIErrorMarker(text, "upstream error", "upstream_error", "upstream failure", "upstream_failure", "upstream timeout", "upstream_timeout", "internal_server_error", "service unavailable", "temporarily unavailable", "bad gateway", "gateway timeout", "request timeout"):
+		return xaiErrorUpstreamTransient
+	default:
+		return xaiErrorUnknown
+	}
 }
 
 func extractXAIError(body string) xaiParsedError {

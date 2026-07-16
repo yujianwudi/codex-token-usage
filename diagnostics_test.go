@@ -219,3 +219,21 @@ func TestRecordsToCSVSanitizesHeadersAndValues(t *testing.T) {
 		t.Fatalf("CSV rows = %#v, want %#v", rows, want)
 	}
 }
+
+func TestSchedulerDiagnosticsCountOnlyCodexReservations(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO account_protection_reservations
+		(provider,auth_id,auth_index,created_at,expires_at) VALUES
+		('future-provider','foreign','foreign',?,?),
+		('codex','codex','codex',?,?)`, now-1000, now+900, now-10, now+900); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics := buildDiagnostics(context.Background(), db, "", nil, nil, nil, nil, nil)
+	if diagnostics.Scheduler.ActiveReservations != 1 {
+		t.Fatalf("active Codex reservations = %d, want 1", diagnostics.Scheduler.ActiveReservations)
+	}
+	if age := diagnostics.Scheduler.OldestReservationAgeSeconds; age < 9 || age > 20 {
+		t.Fatalf("oldest Codex reservation age = %d, want approximately 10 seconds", age)
+	}
+}

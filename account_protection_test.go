@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -370,9 +371,33 @@ func TestProtectionTokenDemotionPrefersLowerUsageCandidate(t *testing.T) {
 	cfg := defaultPluginConfig()
 	cfg.AccountProtectionEnabled = true
 	cfg.AccountProtectionFreeTokenLimit = 2_000_000
+	previousCfg := globalAccountProtection.config()
+	globalAccountProtection.configure(cfg)
+	t.Cleanup(func() { globalAccountProtection.configure(previousCfg) })
 	now := time.Now().Unix()
 	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, total_tokens) VALUES (?, 'codex', 'a', 'a', ?)`, now, 2_000_000); err != nil {
 		t.Fatal(err)
+	}
+	since := now - int64(cfg.AccountProtectionTokenWindowSeconds)
+	if _, err := globalAccountProtection.loadUsageIndex(context.Background(), db, since); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		globalAccountProtection.usageCacheMu.RLock()
+		index := globalAccountProtection.usage
+		refreshing := globalAccountProtection.usageRefreshing
+		globalAccountProtection.usageCacheMu.RUnlock()
+		if index != nil && len(index.samples) == 1 && index.samples[0].Tokens == 2_000_000 && !refreshing {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	globalAccountProtection.usageCacheMu.RLock()
+	loaded := globalAccountProtection.usage
+	globalAccountProtection.usageCacheMu.RUnlock()
+	if loaded == nil || len(loaded.samples) != 1 || loaded.samples[0].Tokens != 2_000_000 {
+		t.Fatal("background token usage refresh did not publish the demotion index")
 	}
 	got, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
 		protectionTestCandidate("a", "free", 10), protectionTestCandidate("b", "free", 1),
@@ -413,6 +438,130 @@ func TestProtectionSaturationRejectsWithoutCreatingReservation(t *testing.T) {
 	}
 	if count != 3 {
 		t.Fatalf("reservation count = %d, want unchanged count 3", count)
+	}
+}
+
+func TestProtectionSaturationCommitsExpiredReservationCleanup(t *testing.T) {
+	globalSchedulerRotation.reset()
+	db := newProtectionTestDB(t)
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	cfg.AccountProtectionFreeConcurrency = 1
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO account_protection_reservations
+		(provider,auth_id,auth_index,source,plan_type,created_at,expires_at) VALUES
+		('codex','expired','expired','','free',?,?),
+		('codex','active','active','','free',?,?)`, now-60, now-1, now, now+900); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
+		protectionTestCandidate("active", "free", 1),
+	}, cfg, "codex\x00saturated-cleanup")
+	var reject *schedulerRejectError
+	if !errors.As(err, &reject) || reject.Code != "account_protection_saturated" {
+		t.Fatalf("error = %#v / %v, want account_protection_saturated", reject, err)
+	}
+	var expired, active int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations WHERE auth_id='expired'`).Scan(&expired); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations WHERE auth_id='active'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if expired != 0 || active != 1 {
+		t.Fatalf("reservation rows expired=%d active=%d, want 0/1", expired, active)
+	}
+}
+
+func TestProtectionSaturationCommitFailureOverridesCapacityConclusion(t *testing.T) {
+	globalSchedulerRotation.reset()
+	db := newProtectionTestDB(t)
+	if _, err := db.Exec(`
+PRAGMA foreign_keys=ON;
+CREATE TABLE reservation_commit_parent (id INTEGER PRIMARY KEY);
+CREATE TABLE reservation_commit_child (
+  parent_id INTEGER,
+  FOREIGN KEY(parent_id) REFERENCES reservation_commit_parent(id) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TRIGGER fail_saturated_cleanup_commit
+AFTER DELETE ON account_protection_reservations
+WHEN OLD.provider='codex'
+BEGIN
+  INSERT INTO reservation_commit_child(parent_id) VALUES(999);
+END;`); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	cfg.AccountProtectionFreeConcurrency = 1
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO account_protection_reservations
+		(provider,auth_id,auth_index,source,plan_type,created_at,expires_at) VALUES
+		('codex','expired','expired','','free',?,?),
+		('codex','active','active','','free',?,?)`, now-60, now-1, now, now+900); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{
+		protectionTestCandidate("active", "free", 1),
+	}, cfg, "codex\x00saturated-commit-failure")
+	if err == nil {
+		t.Fatal("commit failure returned a saturated success path")
+	}
+	var reject *schedulerRejectError
+	if errors.As(err, &reject) && reject.Code == "account_protection_saturated" {
+		t.Fatalf("commit failure was hidden by saturated result: %v", err)
+	}
+	var expired, children int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations WHERE auth_id='expired'`).Scan(&expired); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM reservation_commit_child`).Scan(&children); err != nil {
+		t.Fatal(err)
+	}
+	if expired != 1 || children != 0 {
+		t.Fatalf("failed commit left partial state expired=%d child_rows=%d, want 1/0", expired, children)
+	}
+}
+
+func TestUsageInsertAndProtectionReleaseAreAtomic(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO account_protection_reservations
+		(auth_id, auth_index, source, plan_type, created_at, expires_at)
+		VALUES ('atomic', 'atomic', '', 'free', ?, ?)`, now, now+900); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER fail_atomic_reservation_release
+		BEFORE DELETE ON account_protection_reservations
+		WHEN OLD.auth_id = 'atomic'
+		BEGIN SELECT RAISE(ABORT, 'forced reservation release failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	err = s.recordUsage(context.Background(), usageRecord{
+		Provider:    "codex",
+		AuthID:      "atomic",
+		AuthIndex:   "atomic",
+		RequestedAt: time.Now(),
+		Detail:      usageDetail{TotalTokens: 10},
+	})
+	if err == nil || !strings.Contains(err.Error(), "release protection reservation") {
+		t.Fatalf("recordUsage error=%v, want atomic reservation release failure", err)
+	}
+	var usageRows, reservations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM usage_events WHERE auth_id='atomic'`).Scan(&usageRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations WHERE auth_id='atomic'`).Scan(&reservations); err != nil {
+		t.Fatal(err)
+	}
+	if usageRows != 0 || reservations != 1 {
+		t.Fatalf("usageRows=%d reservations=%d, want rollback to 0 usage and 1 reservation", usageRows, reservations)
 	}
 }
 
@@ -544,7 +693,7 @@ func TestProtectionReservationExpiresAndReleasesOnUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := releaseProtectionReservation(context.Background(), db, usageRecord{AuthID: "active", AuthIndex: "active"}); err != nil {
+	if _, err := releaseProtectionReservation(context.Background(), db, usageRecord{Provider: "codex", AuthID: "active", AuthIndex: "active"}); err != nil {
 		t.Fatal(err)
 	}
 	var count int
@@ -553,6 +702,35 @@ func TestProtectionReservationExpiresAndReleasesOnUsage(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("reservation count = %d, want 0", count)
+	}
+}
+
+func TestApplyAccountProtectionStateExpiresOnlyCodexReservations(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	for _, provider := range []string{providerCodex, "future-provider"} {
+		if _, err := db.Exec(`INSERT INTO account_protection_reservations
+			(provider, auth_id, auth_index, source, plan_type, created_at, expires_at)
+			VALUES (?, ?, ?, '', 'plus', ?, ?)`, provider, provider, provider, now-1000, now-1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	previousCfg := globalAccountProtection.config()
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	globalAccountProtection.configure(cfg)
+	t.Cleanup(func() { globalAccountProtection.configure(previousCfg) })
+
+	applyAccountProtectionState(context.Background(), db, nil)
+	var codexRows, foreignRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations WHERE provider=?`, providerCodex).Scan(&codexRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM account_protection_reservations WHERE provider='future-provider'`).Scan(&foreignRows); err != nil {
+		t.Fatal(err)
+	}
+	if codexRows != 0 || foreignRows != 1 {
+		t.Fatalf("expired reservation rows codex=%d foreign=%d, want 0/1", codexRows, foreignRows)
 	}
 }
 
@@ -572,7 +750,7 @@ func TestProtectionReservationReleaseKeepsSiblingWithSharedAliases(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	if err := releaseProtectionReservation(context.Background(), db, usageRecord{
+	if _, err := releaseProtectionReservation(context.Background(), db, usageRecord{
 		Provider:  "codex",
 		AuthID:    "shared-workspace",
 		AuthIndex: "shared-workspace",
@@ -600,7 +778,7 @@ func TestProtectionReservationSnapshotSeparatesDuplicateFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	snapshot, err := loadProtectionReservationSnapshot(context.Background(), db, now)
+	snapshot, err := loadProtectionReservationSnapshot(context.Background(), db, providerCodex, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +816,7 @@ func TestProtectionReservationCanonicalizesSchedulerAuthFile(t *testing.T) {
 	if authFile != "a.json" {
 		t.Fatalf("stored auth file = %q, want a.json", authFile)
 	}
-	if err := releaseProtectionReservation(context.Background(), db, usageRecord{
+	if _, err := releaseProtectionReservation(context.Background(), db, usageRecord{
 		Provider:  "codex",
 		AuthID:    "shared-workspace",
 		AuthIndex: "shared-workspace",
@@ -736,7 +914,7 @@ func TestProtectionSnapshotAggregatesUsageBeforeLoading(t *testing.T) {
 	now := time.Now().Unix()
 	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, source, total_tokens) VALUES
 		(?, 'codex', 'a', 'a', 'a@example.com', 100),
-		(?, 'CODEX', 'a', 'a', 'a@example.com', 200),
+		(?, 'codex', 'a', 'a', 'a@example.com', 200),
 		(?, 'codex', 'b', 'b', 'b@example.com', 400)`, now, now, now); err != nil {
 		t.Fatal(err)
 	}
@@ -904,7 +1082,7 @@ func TestDeleteFirstProtectionReservationAdvancesAfterConcurrentDelete(t *testin
 		go func() {
 			defer wg.Done()
 			<-start
-			deleted, err := deleteFirstProtectionReservation(context.Background(), db, ids)
+			deleted, err := deleteFirstProtectionReservation(context.Background(), db, "codex", ids)
 			results <- deleted
 			errs <- err
 		}()
@@ -955,24 +1133,34 @@ func TestProtectionPickMutexWaitHonorsContext(t *testing.T) {
 	}
 }
 
-func TestProtectionUsageMutexWaitHonorsContext(t *testing.T) {
+func TestProtectionColdUsageIndexDoesNotWaitForRefreshMutex(t *testing.T) {
 	db := newProtectionTestDB(t)
 	var manager accountProtectionManager
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	manager.configure(cfg)
+	t.Cleanup(manager.stop)
 	if err := manager.usageMu.lock(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer manager.usageMu.unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	_, err := manager.loadUsageSnapshot(ctx, db, time.Now().Unix()-300)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("usage snapshot error = %v, want context deadline exceeded", err)
+	index, err := manager.loadUsageIndex(ctx, db, time.Now().Unix()-300)
+	if err != nil {
+		manager.usageMu.unlock()
+		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("canceled usage mutex wait took %v", elapsed)
+	if len(index.samples) != 0 {
+		manager.usageMu.unlock()
+		t.Fatalf("cold usage samples=%d, want immediate empty soft-demotion snapshot", len(index.samples))
 	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		manager.usageMu.unlock()
+		t.Fatalf("cold usage read waited for refresh mutex for %v", elapsed)
+	}
+	manager.usageMu.unlock()
 }
 
 func TestProtectionUsageIndexServesStaleWhileRefreshing(t *testing.T) {
@@ -991,8 +1179,22 @@ func TestProtectionUsageIndexServesStaleWhileRefreshing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := newProtectionSnapshotWithUsageIndex(nil, index); got.Usage[0].Tokens != 100 {
-		t.Fatalf("initial tokens = %d, want 100", got.Usage[0].Tokens)
+	if len(index.samples) != 0 {
+		t.Fatalf("cold usage samples=%d, want immediate empty snapshot", len(index.samples))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.usageCacheMu.RLock()
+		index = manager.usage
+		refreshing := manager.usageRefreshing
+		manager.usageCacheMu.RUnlock()
+		if index != nil && len(index.samples) == 1 && index.samples[0].Tokens == 100 && !refreshing {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if index == nil || len(index.samples) != 1 || index.samples[0].Tokens != 100 {
+		t.Fatal("background cold usage refresh did not publish the initial index")
 	}
 	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, total_tokens) VALUES (?, 'codex', 'a', 'a', 200)`, now); err != nil {
 		t.Fatal(err)
@@ -1011,7 +1213,7 @@ func TestProtectionUsageIndexServesStaleWhileRefreshing(t *testing.T) {
 	if got := stale.samples[0].Tokens; got != 100 {
 		t.Fatalf("stale tokens = %d, want cached 100", got)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		manager.usageCacheMu.RLock()
 		current := manager.usage
@@ -1023,4 +1225,107 @@ func TestProtectionUsageIndexServesStaleWhileRefreshing(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("background usage refresh did not publish the updated index")
+}
+
+func TestProtectionUsageIndexServesOldWindowWhileRefreshing(t *testing.T) {
+	db := newProtectionTestDB(t)
+	var manager accountProtectionManager
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	manager.configure(cfg)
+	t.Cleanup(manager.stop)
+	since := time.Now().Unix() - 300
+	manager.usageCacheMu.Lock()
+	manager.usageDB = db
+	manager.usageSince = since
+	manager.usageLoadedAt = time.Now()
+	manager.usage = newProtectionUsageIndex([]protectionUsageSample{{Aliases: []string{"a"}, Tokens: 100}})
+	manager.usageCacheMu.Unlock()
+	if err := manager.usageMu.lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	advancedSince := since + int64(accountProtectionUsageMaxWindowAdvance/time.Second) + 2
+	started := time.Now()
+	index, err := manager.loadUsageIndex(context.Background(), db, advancedSince)
+	if err != nil {
+		manager.usageMu.unlock()
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		manager.usageMu.unlock()
+		t.Fatalf("old-window usage read waited for refresh for %v", elapsed)
+	}
+	if len(index.samples) != 1 || index.samples[0].Tokens != 100 {
+		manager.usageMu.unlock()
+		t.Fatalf("old-window usage=%+v, want conservative cached tokens", index.samples)
+	}
+	manager.usageMu.unlock()
+}
+
+func TestProtectionUsageRefreshPublishesAdvancedWindow(t *testing.T) {
+	db := newProtectionTestDB(t)
+	var manager accountProtectionManager
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	manager.configure(cfg)
+	t.Cleanup(manager.stop)
+
+	now := time.Now().Unix()
+	oldSince := now - 300
+	targetSince := now - 60
+	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, total_tokens) VALUES
+		(?, 'codex', 'a', 'a', 100),
+		(?, 'codex', 'a', 'a', 200)`, targetSince-1, targetSince+1); err != nil {
+		t.Fatal(err)
+	}
+	manager.usageCacheMu.Lock()
+	manager.usageDB = db
+	manager.usageSince = oldSince
+	manager.usageLoadedAt = time.Now()
+	manager.usage = newProtectionUsageIndex([]protectionUsageSample{{Aliases: []string{"a"}, Tokens: 300}})
+	manager.usageCacheMu.Unlock()
+
+	if err := manager.usageMu.lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			manager.usageMu.unlock()
+		}
+	}()
+
+	stale, err := manager.loadUsageIndex(context.Background(), db, targetSince)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale.samples) != 1 || stale.samples[0].Tokens != 300 {
+		t.Fatalf("stale advanced-window usage=%+v, want conservative old-window tokens", stale.samples)
+	}
+	manager.usageCacheMu.RLock()
+	done := manager.usageRefreshDone
+	refreshing := manager.usageRefreshing
+	manager.usageCacheMu.RUnlock()
+	if !refreshing || done == nil {
+		t.Fatal("advanced-window usage refresh did not start")
+	}
+
+	manager.usageMu.unlock()
+	locked = false
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("advanced-window usage refresh did not finish")
+	}
+
+	manager.usageCacheMu.RLock()
+	loadedSince := manager.usageSince
+	loaded := manager.usage
+	manager.usageCacheMu.RUnlock()
+	if loadedSince != targetSince {
+		t.Fatalf("published usage window since=%d, want target %d", loadedSince, targetSince)
+	}
+	if loaded == nil || len(loaded.samples) != 1 || loaded.samples[0].Tokens != 200 {
+		t.Fatalf("advanced-window usage=%+v, want only target-window tokens", loaded)
+	}
 }

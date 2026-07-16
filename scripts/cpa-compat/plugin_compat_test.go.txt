@@ -1,12 +1,15 @@
 package pluginhost
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
-	"net/url"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,9 +17,12 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+const compatAccountProtectionSaturatedMessage = "all Codex auth candidates are at their configured concurrency limit; retry after an in-flight request completes"
 
 func TestExternalCodexTokenUsageCompatibility(t *testing.T) {
 	if pluginabi.ABIVersion != 1 || pluginabi.SchemaVersion != 1 {
@@ -49,24 +55,29 @@ func TestExternalCodexTokenUsageCompatibility(t *testing.T) {
 	}
 
 	usageDir := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_DIR"))
-	authDir := strings.TrimSpace(os.Getenv("CPA_AUTH_DIR"))
-	if usageDir == "" || authDir == "" {
+	pluginFallbackAuthDir := strings.TrimSpace(os.Getenv("CPA_AUTH_DIR"))
+	if usageDir == "" || pluginFallbackAuthDir == "" {
 		t.Fatal("CPA_TOKEN_USAGE_DIR and CPA_AUTH_DIR must be set before the CPA test process starts")
 	}
-	for _, dir := range []string{usageDir, authDir} {
+	for _, dir := range []string{usageDir, pluginFallbackAuthDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatalf("create compatibility directory %q: %v", dir, err)
 		}
 	}
 
-	xaiPath := filepath.Join(authDir, "xai-compat.json")
+	// Keep the host-owned auth directory separate from CPA_AUTH_DIR. The plugin
+	// cannot satisfy the xAI assertions by scanning its filesystem fallback; it
+	// must use host.auth.list/get/get_runtime through the real host table.
+	hostAuthDir := t.TempDir()
+	pluginDir := installCompatPluginLibrary(t, library)
+	xaiPath := filepath.Join(hostAuthDir, "xai-compat.json")
 	xaiJSON := []byte(`{"type":"xai","email":"compat-xai@example.com","account_tier":"heavy"}`)
 	if err := os.WriteFile(xaiPath, xaiJSON, 0o600); err != nil {
 		t.Fatalf("write xAI auth: %v", err)
 	}
 
 	host := New()
-	host.runtimeConfig = &config.Config{AuthDir: authDir}
+	defer host.ShutdownAll()
 	host.SetAuthManager(coreauth.NewManager(nil, nil, nil))
 	xaiAuth := &coreauth.Auth{
 		ID:       "xai-compat.json",
@@ -78,9 +89,8 @@ func TestExternalCodexTokenUsageCompatibility(t *testing.T) {
 			"source": xaiPath,
 		},
 		Metadata: map[string]any{
-			"type":         "xai",
-			"email":        "compat-xai@example.com",
-			"account_tier": "heavy",
+			"type":  "xai",
+			"email": "compat-xai@example.com",
 		},
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
@@ -108,39 +118,18 @@ func TestExternalCodexTokenUsageCompatibility(t *testing.T) {
 		t.Fatalf("register runtime Codex auth: %v", err)
 	}
 
-	client, err := (dynamicLibraryLoader{}).Open(pluginFile{
-		ID:      "codex-token-usage",
-		Path:    library,
-		Version: strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_EXPECTED_VERSION")),
-	}, host)
-	if err != nil {
-		t.Fatalf("latest CPA loader rejected plugin: %v", err)
-	}
-	defer client.Shutdown()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	configYAML := []byte(strings.Join([]string{
-		"account_protection_enabled: false",
-		"quota_trigger_enabled: false",
-		"model_price_auto_update_enabled: false",
-		"summary_precompute_enabled: false",
-	}, "\n"))
-
-	registered, err := registerRPCPlugin(ctx, host, "codex-token-usage", client, pluginabi.MethodPluginRegister, configYAML)
-	if err != nil {
-		t.Fatalf("plugin.register through latest CPA: %v", err)
+	baseConfig := compatRuntimeConfig(t, pluginDir, hostAuthDir, false)
+	host.ApplyConfig(ctx, baseConfig)
+	if !host.PluginLoaded("codex-token-usage") || !host.PluginRegistered("codex-token-usage") {
+		t.Fatalf("real CPA Host.ApplyConfig lifecycle loaded=%v registered=%v", host.PluginLoaded("codex-token-usage"), host.PluginRegistered("codex-token-usage"))
 	}
+	registered := compatActivePlugin(t, host)
 	assertCodexTokenUsageRegistration(t, registered)
+	client := compatLoadedClient(t, host)
 
-	reconfigured, err := registerRPCPlugin(ctx, host, "codex-token-usage", client, pluginabi.MethodPluginReconfigure, configYAML)
-	if err != nil {
-		t.Fatalf("plugin.reconfigure through latest CPA: %v", err)
-	}
-	assertCodexTokenUsageRegistration(t, reconfigured)
-
-	pick, err := reconfigured.Capabilities.Scheduler.Pick(ctx, pluginapi.SchedulerPickRequest{
-		Plugin:    reconfigured.Metadata,
+	pick, handled, err := host.PickAuth(ctx, pluginapi.SchedulerPickRequest{
 		Provider:  "codex",
 		Providers: []string{"codex"},
 		Model:     "gpt-5.5",
@@ -157,125 +146,785 @@ func TestExternalCodexTokenUsageCompatibility(t *testing.T) {
 			Attributes: map[string]string{
 				"auth_index": "compat-index",
 				"source":     "codex-compat.json",
-				"path":       filepath.Join(authDir, "codex-compat.json"),
+				"path":       filepath.Join(hostAuthDir, "codex-compat.json"),
 			},
 		}},
 	})
 	if err != nil {
-		t.Fatalf("scheduler.pick through latest CPA: %v", err)
+		t.Fatalf("Host.PickAuth through latest CPA: %v", err)
 	}
-	if pick.Handled || pick.AuthID != "" || pick.DelegateBuiltin != "" {
-		t.Fatalf("healthy scheduler response = %#v, want unhandled", pick)
+	if handled || pick.Handled || pick.AuthID != "" || pick.DelegateBuiltin != "" {
+		t.Fatalf("healthy Host.PickAuth response = %#v handled=%v, want unhandled", pick, handled)
 	}
 
-	protectedConfigYAML := []byte(strings.Join([]string{
-		"account_protection_enabled: true",
-		"account_protection_free_concurrency: 2",
-		"quota_trigger_enabled: false",
-		"model_price_auto_update_enabled: false",
-		"summary_precompute_enabled: false",
-	}, "\n"))
-	protected, err := registerRPCPlugin(ctx, host, "codex-token-usage", client, pluginabi.MethodPluginReconfigure, protectedConfigYAML)
-	if err != nil {
-		t.Fatalf("enable account protection through latest CPA: %v", err)
-	}
+	// Re-applying the same discovered library exercises plugin.reconfigure via
+	// Host.ApplyConfig and the guarded client instead of calling the RPC helper.
+	host.ApplyConfig(ctx, compatRuntimeConfig(t, pluginDir, hostAuthDir, true))
+	protected := compatActivePlugin(t, host)
 	assertCodexTokenUsageRegistration(t, protected)
-	assertProtectedSchedulerCompatibility(t, ctx, protected)
+	assertProtectedSchedulerCompatibility(t, ctx, host)
+	assertRealLoaderMultiprocessCompatibility(t, library)
 
-	reconfigured, err = registerRPCPlugin(ctx, host, "codex-token-usage", client, pluginabi.MethodPluginReconfigure, configYAML)
-	if err != nil {
-		t.Fatalf("restore compatibility config through latest CPA: %v", err)
-	}
+	host.ApplyConfig(ctx, baseConfig)
+	reconfigured := compatActivePlugin(t, host)
 	assertCodexTokenUsageRegistration(t, reconfigured)
 
-	reconfigured.Capabilities.UsagePlugin.HandleUsage(ctx, pluginapi.UsageRecord{
+	usage := &usageAdapter{
+		host:     host,
+		pluginID: "codex-token-usage",
+		plugin:   reconfigured.Capabilities.UsagePlugin,
+	}
+	usage.HandleUsage(ctx, coreusage.Record{
 		Provider:     "codex",
-		ExecutorType: "compat",
+		ExecutorType: "compat-lifecycle-true",
 		Model:        "gpt-5.5",
 		AuthID:       "codex-compat.json",
 		AuthIndex:    "compat-index",
 		AuthType:     "oauth",
 		Source:       "codex-compat.json",
-		Generate:     true,
+		Generate:     coreusage.GenerateFlag(true),
 		RequestedAt:  time.Now().UTC(),
 		Latency:      250 * time.Millisecond,
 		TTFT:         75 * time.Millisecond,
-		Detail: pluginapi.UsageDetail{
+		Detail: coreusage.Detail{
 			InputTokens:  12,
 			OutputTokens: 5,
 			TotalTokens:  17,
 		},
 		ResponseHeaders: http.Header{"x-codex-primary-used-percent": {"1"}},
 	})
+	usage.HandleUsage(ctx, coreusage.Record{
+		Provider:     "codex",
+		ExecutorType: "compat-lifecycle-omitted",
+		Model:        "gpt-5.5",
+		AuthID:       "codex-lifecycle-omitted",
+		AuthIndex:    "codex-lifecycle-omitted",
+		AuthType:     "oauth",
+		Source:       "codex-lifecycle-omitted",
+		RequestedAt:  time.Now().UTC(),
+		Detail: coreusage.Detail{
+			InputTokens:  1,
+			OutputTokens: 2,
+			TotalTokens:  3,
+		},
+	})
+	usage.HandleUsage(ctx, coreusage.Record{
+		Provider:     "xai",
+		ExecutorType: "xai-image-compat",
+		Model:        "grok-imagine",
+		AuthID:       xaiAuth.ID,
+		AuthIndex:    xaiAuth.Index,
+		AuthType:     "oauth",
+		Source:       "xai-compat.json",
+		Generate:     coreusage.GenerateFlag(true),
+		RequestedAt:  time.Now().UTC(),
+		Latency:      100 * time.Millisecond,
+		Detail:       coreusage.Detail{},
+	})
 
-	registration, err := reconfigured.Capabilities.ManagementAPI.RegisterManagement(ctx, pluginapi.ManagementRegistrationRequest{
-		Plugin:           reconfigured.Metadata,
-		BasePath:         "/v0/management",
-		ResourceBasePath: "/v0/resource/plugins/codex-token-usage",
+	// Keep a raw ABI request with Generate omitted. This is separate from the
+	// real CPA usageAdapter nil->true lifecycle above and protects compatibility
+	// with legacy hosts and direct ABI callers. Decode the additive response and
+	// require the plugin to confirm that the row was actually stored.
+	rawUsage, err := callPlugin[compatUsageHandleResponse](ctx, client, pluginabi.MethodUsageHandle, map[string]any{
+		"Provider":     "codex",
+		"ExecutorType": "compat-raw-omitted",
+		"Model":        "gpt-5.5",
+		"AuthID":       "codex-affinity-b",
+		"AuthIndex":    "codex-affinity-b",
+		"AuthType":     "oauth",
+		"Source":       "codex-affinity-b",
+		"RequestedAt":  time.Now().UTC(),
+		"Detail": map[string]any{
+			"InputTokens":  10,
+			"OutputTokens": 13,
+			"TotalTokens":  23,
+		},
 	})
 	if err != nil {
-		t.Fatalf("management.register through latest CPA: %v", err)
+		t.Fatalf("usage.handle omitted Generate through latest CPA loader: %v", err)
 	}
-	if len(registration.Routes) != 5 || len(registration.Resources) != 1 {
-		t.Fatalf("management registration = %d routes/%d resources, want 5/1", len(registration.Routes), len(registration.Resources))
+	if !rawUsage.Stored || strings.TrimSpace(rawUsage.Error) != "" {
+		t.Fatalf("usage.handle omitted Generate result = %+v, want stored=true", rawUsage)
 	}
-
-	summaryRoute := findManagementRoute(t, registration.Routes, http.MethodGet, "/summary")
-	summaryResp, err := summaryRoute.Handler.HandleManagement(ctx, pluginapi.ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/management/plugins/codex-token-usage/summary",
-		Query:  url.Values{"window": {"24h"}, "limit": {"50"}},
+	usage.HandleUsage(ctx, coreusage.Record{
+		Provider:     "codex",
+		ExecutorType: "compat-lifecycle-false",
+		Model:        "gpt-5.5",
+		AuthID:       "codex-affinity-a",
+		AuthIndex:    "codex-affinity-a",
+		AuthType:     "oauth",
+		Source:       "codex-affinity-a",
+		Generate:     coreusage.GenerateFlag(false),
+		RequestedAt:  time.Now().UTC(),
+		Latency:      5 * time.Second,
+		TTFT:         2 * time.Second,
+		Detail: coreusage.Detail{
+			InputTokens:  4_000_000,
+			OutputTokens: 5_000_000,
+			TotalTokens:  9_000_000,
+		},
 	})
-	if err != nil {
-		t.Fatalf("management.handle summary through latest CPA: %v", err)
+	for _, status := range []int{http.StatusBadRequest, http.StatusRequestTimeout} {
+		usage.HandleUsage(ctx, coreusage.Record{
+			Provider:     "codex",
+			ExecutorType: "compat-request-error",
+			Model:        "gpt-5.5",
+			AuthID:       "codex-compat.json",
+			AuthIndex:    "compat-index",
+			AuthType:     "oauth",
+			Source:       "codex-compat.json",
+			Generate:     coreusage.GenerateFlag(true),
+			RequestedAt:  time.Now().UTC(),
+			Failed:       true,
+			Fail:         coreusage.Failure{StatusCode: status},
+		})
 	}
-	if summaryResp.StatusCode != http.StatusOK {
-		t.Fatalf("summary status = %d, body=%s", summaryResp.StatusCode, summaryResp.Body)
-	}
-	assertSummaryCompatibility(t, summaryResp.Body)
-
-	resource := registration.Resources[0]
-	if resource.Handler == nil {
-		t.Fatal("dashboard resource handler is nil")
-	}
-	dashboardResp, err := resource.Handler.HandleManagement(ctx, pluginapi.ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/resource/plugins/codex-token-usage/dashboard",
+	postFailurePick, postFailureHandled, err := host.PickAuth(ctx, pluginapi.SchedulerPickRequest{
+		Provider:  "codex",
+		Providers: []string{"codex"},
+		Model:     "gpt-5.5",
+		Candidates: []pluginapi.SchedulerAuthCandidate{{
+			ID:       "codex-compat.json",
+			Provider: "codex",
+			Priority: 10,
+			Status:   "active",
+			Attributes: map[string]string{
+				"auth_index": "compat-index",
+				"source":     "codex-compat.json",
+			},
+		}},
 	})
-	if err != nil {
-		t.Fatalf("dashboard resource through latest CPA: %v", err)
-	}
-	if dashboardResp.StatusCode != http.StatusOK || !strings.Contains(string(dashboardResp.Body), "CPA Token Usage") {
-		t.Fatalf("dashboard response status=%d body_prefix=%q", dashboardResp.StatusCode, truncateCompat(string(dashboardResp.Body), 120))
+	if err != nil || postFailureHandled || postFailurePick.Handled {
+		t.Fatalf("request-scoped 400/408 changed account scheduling: response=%#v handled=%v err=%v", postFailurePick, postFailureHandled, err)
 	}
 
-	commitRoute := findManagementRoute(t, registration.Routes, http.MethodPost, "/auth-import/commit")
+	host.RegisterManagementRoutes(ctx, nil)
+	managementRoutes, resourceRoutes := compatManagementRouteCounts(host)
+	if managementRoutes != 5 || resourceRoutes != 1 {
+		t.Fatalf("real host management registration = %d routes/%d resources, want 5/1", managementRoutes, resourceRoutes)
+	}
+
+	summaryRequest := httptest.NewRequest(http.MethodGet, "/v0/management/plugins/codex-token-usage/summary?window=24h&limit=50", nil).WithContext(ctx)
+	summaryResponse := httptest.NewRecorder()
+	if !host.ServeManagementHTTP(summaryResponse, summaryRequest) {
+		t.Fatal("real Host.ServeManagementHTTP did not route the summary request")
+	}
+	if summaryResponse.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, body=%s", summaryResponse.Code, summaryResponse.Body.String())
+	}
+	assertSummaryCompatibility(t, summaryResponse.Body.Bytes())
+
+	dashboardRequest := httptest.NewRequest(http.MethodGet, "/v0/resource/plugins/codex-token-usage/dashboard", nil).WithContext(ctx)
+	dashboardResponse := httptest.NewRecorder()
+	if !host.ServeResourceHTTP(dashboardResponse, dashboardRequest) {
+		t.Fatal("real Host.ServeResourceHTTP did not route the dashboard request")
+	}
+	if dashboardResponse.Code != http.StatusOK || !strings.Contains(dashboardResponse.Body.String(), "CPA Token Usage") {
+		t.Fatalf("dashboard response status=%d body_prefix=%q", dashboardResponse.Code, truncateCompat(dashboardResponse.Body.String(), 120))
+	}
+
 	importText := `[{"email":"compat-import@example.com","account_id":"compat-account","access_token":"compat-token"}]`
 	requestBody, err := json.Marshal(map[string]any{"text": importText, "overwrite": true})
 	if err != nil {
 		t.Fatalf("marshal import request: %v", err)
 	}
-	importResp, err := commitRoute.Handler.HandleManagement(ctx, pluginapi.ManagementRequest{
-		Method:  http.MethodPost,
-		Path:    "/v0/management/plugins/codex-token-usage/auth-import/commit",
-		Headers: http.Header{"content-type": {"application/json"}},
-		Body:    requestBody,
-	})
-	if err != nil {
-		t.Fatalf("auth import host callbacks through latest CPA: %v", err)
+	importRequest := httptest.NewRequest(http.MethodPost, "/v0/management/plugins/codex-token-usage/auth-import/commit", bytes.NewReader(requestBody)).WithContext(ctx)
+	importRequest.Header.Set("content-type", "application/json")
+	importResponse := httptest.NewRecorder()
+	if !host.ServeManagementHTTP(importResponse, importRequest) {
+		t.Fatal("real Host.ServeManagementHTTP did not route auth import")
 	}
-	if importResp.StatusCode != http.StatusOK {
-		t.Fatalf("auth import status = %d, body=%s", importResp.StatusCode, importResp.Body)
+	if importResponse.Code != http.StatusOK {
+		t.Fatalf("auth import status = %d, body=%s", importResponse.Code, importResponse.Body.String())
 	}
 	var importResult struct {
 		Imported int `json:"imported"`
 	}
-	if err := json.Unmarshal(importResp.Body, &importResult); err != nil || importResult.Imported != 1 {
-		t.Fatalf("auth import result = %+v err=%v body=%s", importResult, err, importResp.Body)
+	if err := json.Unmarshal(importResponse.Body.Bytes(), &importResult); err != nil || importResult.Imported != 1 {
+		t.Fatalf("auth import result = %+v err=%v body=%s", importResult, err, importResponse.Body.String())
 	}
-	if matches, _ := filepath.Glob(filepath.Join(authDir, "codex-compat-import@example.com*.json")); len(matches) != 1 {
+	if matches, _ := filepath.Glob(filepath.Join(hostAuthDir, "codex-compat-import@example.com*.json")); len(matches) != 1 {
 		t.Fatalf("host.auth.save output = %v, want one imported auth file", matches)
 	}
+
+	host.ShutdownAll()
+	if host.PluginLoaded("codex-token-usage") || host.PluginRegistered("codex-token-usage") {
+		t.Fatalf("ShutdownAll left plugin loaded=%v registered=%v", host.PluginLoaded("codex-token-usage"), host.PluginRegistered("codex-token-usage"))
+	}
+
+	// Re-apply the same real Host configuration after a complete unload. This
+	// proves the plugin can initialize again in the same CPA process instead of
+	// only surviving reconfigure calls before shutdown.
+	host.ApplyConfig(ctx, baseConfig)
+	if !host.PluginLoaded("codex-token-usage") || !host.PluginRegistered("codex-token-usage") {
+		t.Fatalf("post-shutdown re-init loaded=%v registered=%v", host.PluginLoaded("codex-token-usage"), host.PluginRegistered("codex-token-usage"))
+	}
+	assertCodexTokenUsageRegistration(t, compatActivePlugin(t, host))
+	host.ShutdownAll()
+	if host.PluginLoaded("codex-token-usage") || host.PluginRegistered("codex-token-usage") {
+		t.Fatalf("second ShutdownAll left plugin loaded=%v registered=%v", host.PluginLoaded("codex-token-usage"), host.PluginRegistered("codex-token-usage"))
+	}
+}
+
+const (
+	compatABIPanicInit                       uint32 = 1
+	compatABIPanicCall                       uint32 = 2
+	compatABIPanicFree                       uint32 = 3
+	compatABIPanicShutdownBoundary           uint32 = 4
+	compatABIPanicShutdownSummaryMaintenance uint32 = 12
+	compatABIPanicInitAfterPublish           uint32 = 17
+	compatABIPanicCallAfterResponse          uint32 = 18
+)
+
+func TestExternalCodexTokenUsagePanicBoundary(t *testing.T) {
+	library := strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_PANIC_LIBRARY"))
+	if library == "" {
+		t.Fatal("CODEX_TOKEN_USAGE_PANIC_LIBRARY is required")
+	}
+	if info, err := os.Stat(library); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("panic-injection plugin library %q is unavailable: %v", library, err)
+	}
+	t.Setenv("CPA_TOKEN_USAGE_DIR", filepath.Join(t.TempDir(), "plugin-data"))
+	t.Setenv("CPA_AUTH_DIR", filepath.Join(t.TempDir(), "auth"))
+
+	for _, test := range []struct {
+		name  string
+		point uint32
+	}{
+		{name: "init", point: compatABIPanicInit},
+		{name: "init_after_publish", point: compatABIPanicInitAfterPublish},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pluginDir := installCompatPluginLibrary(t, library)
+			pluginPath := compatInstalledPluginPath(library, pluginDir)
+			control := mustCompatABIPanicControl(t, pluginPath)
+			defer control.Close()
+			if err := control.Set(test.point); err != nil {
+				t.Fatal(err)
+			}
+			host := New()
+			host.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			host.ApplyConfig(ctx, compatRuntimeConfig(t, pluginDir, t.TempDir(), false))
+			loaded := host.PluginLoaded("codex-token-usage")
+			registered := host.PluginRegistered("codex-token-usage")
+			if current := control.Current(); current != 0 {
+				host.ShutdownAll()
+				t.Fatalf("panic point %d was not consumed by real CPA init; current=%d", test.point, current)
+			}
+			host.ShutdownAll()
+			if loaded || registered {
+				t.Fatalf("panic-injected %s left plugin loaded=%v registered=%v", test.name, loaded, registered)
+			}
+		})
+	}
+
+	// A clean load after both recovered init failures proves the real CPA test
+	// process is still alive and can initialize the same harness library.
+	cleanHost, cleanCtx, cleanCancel, _ := loadCompatPanicHost(t, library)
+	if _, err := compatLoadedClient(t, cleanHost).Call(cleanCtx, pluginabi.MethodPluginRegister, nil); err != nil {
+		cleanCancel()
+		cleanHost.ShutdownAll()
+		t.Fatalf("clean load after init panic recovery failed: %v", err)
+	}
+	cleanCancel()
+	cleanHost.ShutdownAll()
+
+	for _, test := range []struct {
+		name  string
+		point uint32
+	}{
+		{name: "call", point: compatABIPanicCall},
+		{name: "call_after_response", point: compatABIPanicCallAfterResponse},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			host, ctx, cancel, pluginPath := loadCompatPanicHost(t, library)
+			defer cancel()
+			defer host.ShutdownAll()
+			control := mustCompatABIPanicControl(t, pluginPath)
+			defer control.Close()
+			if err := control.Set(test.point); err != nil {
+				t.Fatal(err)
+			}
+			client := compatLoadedClient(t, host)
+			raw, err := client.Call(ctx, pluginabi.MethodPluginRegister, nil)
+			if err != nil {
+				t.Fatalf("panic-injected %s escaped the real CPA loader: %v", test.name, err)
+			}
+			if current := control.Current(); current != 0 {
+				t.Fatalf("panic point %d was not consumed by real CPA call; current=%d", test.point, current)
+			}
+			assertCompatPanicEnvelope(t, raw)
+			if raw, err = client.Call(ctx, pluginabi.MethodPluginRegister, nil); err != nil || bytes.Contains(raw, []byte("\"code\":\"plugin_panic\"")) {
+				t.Fatalf("normal call after %s panic failed: err=%v body=%s", test.name, err, raw)
+			}
+		})
+	}
+
+	t.Run("free", func(t *testing.T) {
+		host, ctx, cancel, pluginPath := loadCompatPanicHost(t, library)
+		defer cancel()
+		defer host.ShutdownAll()
+		control := mustCompatABIPanicControl(t, pluginPath)
+		defer control.Close()
+		if err := control.Set(compatABIPanicFree); err != nil {
+			t.Fatal(err)
+		}
+		client := compatLoadedClient(t, host)
+		raw, err := client.Call(ctx, pluginabi.MethodPluginRegister, nil)
+		if err != nil || len(raw) == 0 {
+			t.Fatalf("free panic escaped the real CPA loader: err=%v body=%s", err, raw)
+		}
+		if current := control.Current(); current != 0 {
+			t.Fatalf("free panic point was not consumed by the real CPA loader; current=%d", current)
+		}
+		if _, err := client.Call(ctx, pluginabi.MethodPluginRegister, nil); err != nil {
+			t.Fatalf("normal call after free panic failed: %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		point uint32
+	}{
+		{name: "shutdown_summary_maintenance", point: compatABIPanicShutdownSummaryMaintenance},
+		{name: "shutdown_boundary", point: compatABIPanicShutdownBoundary},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			host, _, cancel, pluginPath := loadCompatPanicHost(t, library)
+			defer cancel()
+			control := mustCompatABIPanicControl(t, pluginPath)
+			defer control.Close()
+			if err := control.Set(test.point); err != nil {
+				t.Fatal(err)
+			}
+			host.ShutdownAll()
+			if current := control.Current(); current != 0 {
+				t.Fatalf("panic point %d was not consumed by real CPA shutdown; current=%d", test.point, current)
+			}
+			if host.PluginLoaded("codex-token-usage") || host.PluginRegistered("codex-token-usage") {
+				t.Fatalf("panic-injected %s left plugin loaded=%v registered=%v", test.name, host.PluginLoaded("codex-token-usage"), host.PluginRegistered("codex-token-usage"))
+			}
+		})
+	}
+}
+
+func loadCompatPanicHost(t *testing.T, library string) (*Host, context.Context, context.CancelFunc, string) {
+	t.Helper()
+	pluginDir := installCompatPluginLibrary(t, library)
+	pluginPath := compatInstalledPluginPath(library, pluginDir)
+	host := New()
+	host.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	host.ApplyConfig(ctx, compatRuntimeConfig(t, pluginDir, t.TempDir(), false))
+	loaded := host.PluginLoaded("codex-token-usage")
+	registered := host.PluginRegistered("codex-token-usage")
+	if !loaded || !registered {
+		cancel()
+		host.ShutdownAll()
+		t.Fatalf("real CPA Host could not load panic-injection library: loaded=%v registered=%v", loaded, registered)
+	}
+	return host, ctx, cancel, pluginPath
+}
+
+func compatInstalledPluginPath(source, pluginDir string) string {
+	return filepath.Join(pluginDir, "codex-token-usage"+filepath.Ext(source))
+}
+
+func mustCompatABIPanicControl(t *testing.T, pluginPath string) *compatABIPanicControl {
+	t.Helper()
+	control, err := openCompatABIPanicControl(pluginPath)
+	if err != nil {
+		t.Fatalf("open panic-injection control for %q: %v", pluginPath, err)
+	}
+	return control
+}
+
+func assertCompatPanicEnvelope(t *testing.T, raw []byte) {
+	t.Helper()
+	if !bytes.Contains(raw, []byte("\"code\":\"plugin_panic\"")) || !bytes.Contains(raw, []byte("plugin encountered an internal failure")) {
+		t.Fatalf("unsafe or missing plugin panic envelope: %s", raw)
+	}
+	for _, forbidden := range [][]byte{[]byte("ABI_PANIC_HARNESS_SECRET"), []byte("goroutine"), []byte("stack")} {
+		if bytes.Contains(raw, forbidden) {
+			t.Fatalf("plugin panic envelope leaked %q: %s", forbidden, raw)
+		}
+	}
+}
+
+type compatUsageHandleResponse struct {
+	Stored  bool   `json:"stored"`
+	Warning string `json:"warning,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+func installCompatPluginLibrary(t *testing.T, source string) string {
+	t.Helper()
+	raw, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("read compatibility plugin library: %v", err)
+	}
+	pluginDir := t.TempDir()
+	extension := filepath.Ext(source)
+	if extension == "" {
+		t.Fatalf("compatibility plugin library has no extension: %s", source)
+	}
+	destination := filepath.Join(pluginDir, "codex-token-usage"+extension)
+	if err := os.WriteFile(destination, raw, 0o700); err != nil {
+		t.Fatalf("install compatibility plugin library: %v", err)
+	}
+	return pluginDir
+}
+
+func compatRuntimeConfig(t *testing.T, pluginDir, authDir string, protection bool) *config.Config {
+	return compatRuntimeConfigWithFreeLimit(t, pluginDir, authDir, protection, 2)
+}
+
+func compatRuntimeConfigWithFreeLimit(t *testing.T, pluginDir, authDir string, protection bool, freeLimit int) *config.Config {
+	t.Helper()
+	raw := fmt.Sprintf(`
+auth-dir: %q
+plugins:
+  enabled: true
+  dir: %q
+  configs:
+    codex-token-usage:
+      enabled: true
+      account_protection_enabled: %t
+      account_protection_free_concurrency: %d
+      quota_trigger_enabled: false
+      model_price_auto_update_enabled: false
+      summary_precompute_enabled: false
+`, authDir, pluginDir, protection, freeLimit)
+	cfg, err := config.ParseConfigBytes([]byte(raw))
+	if err != nil {
+		t.Fatalf("parse real CPA plugin runtime config: %v", err)
+	}
+	return cfg
+}
+
+func TestCodexTokenUsageMultiprocessHelper(t *testing.T) {
+	if os.Getenv("CODEX_TOKEN_USAGE_MULTIPROCESS_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	mode := strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_MULTIPROCESS_MODE"))
+	if mode == "" {
+		mode = "pick"
+	}
+	library := strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_PLUGIN_LIBRARY"))
+	usageDir := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_DIR"))
+	authDir := strings.TrimSpace(os.Getenv("CPA_AUTH_DIR"))
+	readyPath := strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_MULTIPROCESS_READY"))
+	barrierPath := strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_MULTIPROCESS_BARRIER"))
+	resultPath := strings.TrimSpace(os.Getenv("CODEX_TOKEN_USAGE_MULTIPROCESS_RESULT"))
+	if library == "" || usageDir == "" || authDir == "" || resultPath == "" {
+		t.Fatal("multiprocess helper environment is incomplete")
+	}
+	if mode != "pick" && mode != "inspect" {
+		t.Fatalf("unsupported multiprocess helper mode %q", mode)
+	}
+	if mode == "pick" && (readyPath == "" || barrierPath == "") {
+		t.Fatal("multiprocess pick helper environment is incomplete")
+	}
+	directories := []string{usageDir, authDir, filepath.Dir(resultPath)}
+	if mode == "pick" {
+		directories = append(directories, filepath.Dir(readyPath))
+	}
+	for _, dir := range directories {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("create multiprocess helper directory: %v", err)
+		}
+	}
+
+	pluginDir := installCompatPluginLibrary(t, library)
+	host := New()
+	defer host.ShutdownAll()
+	host.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	host.ApplyConfig(ctx, compatRuntimeConfigWithFreeLimit(t, pluginDir, authDir, true, 1))
+	if !host.PluginLoaded("codex-token-usage") || !host.PluginRegistered("codex-token-usage") {
+		t.Fatal("multiprocess helper did not load and register the plugin")
+	}
+	if mode == "inspect" {
+		active := compatActiveReservationCount(t, ctx, host)
+		if err := os.WriteFile(resultPath, []byte(fmt.Sprintf("reservations=%d\n", active)), 0o600); err != nil {
+			t.Fatalf("write multiprocess inspector result: %v", err)
+		}
+		return
+	}
+	if err := os.WriteFile(readyPath, []byte("ready\n"), 0o600); err != nil {
+		t.Fatalf("publish multiprocess helper readiness: %v", err)
+	}
+	for {
+		if _, err := os.Stat(barrierPath); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat multiprocess barrier: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for multiprocess barrier")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	request := pluginapi.SchedulerPickRequest{
+		Provider:  "codex",
+		Providers: []string{"codex"},
+		Model:     "gpt-5.5",
+		Candidates: []pluginapi.SchedulerAuthCandidate{{
+			ID:       "codex-real-loader-shared",
+			Provider: "codex",
+			Priority: 1,
+			Status:   "active",
+			Attributes: map[string]string{
+				"auth_index": "codex-real-loader-shared",
+				"source":     "codex-real-loader-shared.json",
+				"plan_type":  "free",
+			},
+		}},
+	}
+	result := ""
+	got, handled, err := host.PickAuth(ctx, request)
+	if err == nil {
+		if !handled || !got.Handled || got.AuthID != "codex-real-loader-shared" {
+			t.Fatalf("multiprocess successful pick = %#v handled=%v", got, handled)
+		}
+		result = "success\n"
+	} else {
+		var statusError interface{ StatusCode() int }
+		if !handled || !errors.As(err, &statusError) || statusError.StatusCode() != http.StatusServiceUnavailable || strings.TrimSpace(err.Error()) != compatAccountProtectionSaturatedMessage {
+			t.Fatalf("multiprocess rejected pick = %#v handled=%v err=%v", got, handled, err)
+		}
+		result = "saturated\n"
+	}
+	if err := os.WriteFile(resultPath, []byte(result), 0o600); err != nil {
+		t.Fatalf("write multiprocess helper result: %v", err)
+	}
+}
+
+func compatActiveReservationCount(t *testing.T, ctx context.Context, host *Host) int64 {
+	t.Helper()
+	host.RegisterManagementRoutes(ctx, nil)
+	request := httptest.NewRequest(http.MethodGet, "/v0/management/plugins/codex-token-usage/summary?window=24h&limit=50&refresh=true&sync=true", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+	if !host.ServeManagementHTTP(response, request) {
+		t.Fatal("multiprocess inspector could not route the summary request")
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("multiprocess inspector summary status = %d body=%s", response.Code, response.Body.String())
+	}
+	var summary struct {
+		Diagnostics struct {
+			Scheduler struct {
+				ActiveReservations int64 `json:"active_reservations"`
+			} `json:"scheduler"`
+		} `json:"diagnostics"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode multiprocess inspector summary: %v body=%s", err, response.Body.String())
+	}
+	return summary.Diagnostics.Scheduler.ActiveReservations
+}
+
+type compatChildProcess struct {
+	cmd     *exec.Cmd
+	output  bytes.Buffer
+	started bool
+	waited  bool
+}
+
+func (c *compatChildProcess) wait() error {
+	if c == nil || c.cmd == nil || !c.started || c.waited {
+		return nil
+	}
+	err := c.cmd.Wait()
+	c.waited = true
+	return err
+}
+
+func (c *compatChildProcess) stopAndWait() {
+	if c == nil || c.cmd == nil || !c.started || c.waited {
+		return
+	}
+	if c.cmd.Process != nil {
+		_ = c.cmd.Process.Kill()
+	}
+	_ = c.wait()
+}
+
+func stopCompatChildProcesses(cancel context.CancelFunc, children []compatChildProcess) {
+	if cancel != nil {
+		cancel()
+	}
+	for i := range children {
+		children[i].stopAndWait()
+	}
+}
+
+func compatChildProcessOutputs(children []compatChildProcess, limit int) string {
+	parts := make([]string, 0, len(children))
+	for i := range children {
+		parts = append(parts, fmt.Sprintf("worker-%d=%q", i, truncateCompat(children[i].output.String(), limit)))
+	}
+	return strings.Join(parts, " ")
+}
+
+func assertRealLoaderMultiprocessCompatibility(t *testing.T, library string) {
+	t.Helper()
+	root := t.TempDir()
+	usageDir := filepath.Join(root, "usage")
+	authDir := filepath.Join(root, "auth")
+	readyDir := filepath.Join(root, "ready")
+	resultDir := filepath.Join(root, "results")
+	barrierPath := filepath.Join(root, "start")
+	for _, dir := range []string{usageDir, authDir, readyDir, resultDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("create real-loader multiprocess directory: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	children := make([]compatChildProcess, 2)
+	defer stopCompatChildProcesses(cancel, children)
+	for i := range children {
+		readyPath := filepath.Join(readyDir, fmt.Sprintf("worker-%d", i))
+		resultPath := filepath.Join(resultDir, fmt.Sprintf("worker-%d", i))
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCodexTokenUsageMultiprocessHelper$", "-test.v")
+		cmd.Env = append(os.Environ(),
+			"CODEX_TOKEN_USAGE_MULTIPROCESS_HELPER=1",
+			"CODEX_TOKEN_USAGE_MULTIPROCESS_MODE=pick",
+			"CODEX_TOKEN_USAGE_PLUGIN_LIBRARY="+library,
+			"CPA_TOKEN_USAGE_DIR="+usageDir,
+			"CPA_AUTH_DIR="+authDir,
+			"CODEX_TOKEN_USAGE_MULTIPROCESS_READY="+readyPath,
+			"CODEX_TOKEN_USAGE_MULTIPROCESS_BARRIER="+barrierPath,
+			"CODEX_TOKEN_USAGE_MULTIPROCESS_RESULT="+resultPath,
+		)
+		cmd.Stdout = &children[i].output
+		cmd.Stderr = &children[i].output
+		children[i].cmd = cmd
+		if err := cmd.Start(); err != nil {
+			stopCompatChildProcesses(cancel, children)
+			t.Fatalf("start real-loader worker %d: %v outputs=%s", i, err, compatChildProcessOutputs(children, 1000))
+		}
+		children[i].started = true
+	}
+
+	readyDeadline := time.Now().Add(20 * time.Second)
+	var readyErr error
+	for {
+		ready := 0
+		for i := range children {
+			if _, err := os.Stat(filepath.Join(readyDir, fmt.Sprintf("worker-%d", i))); err == nil {
+				ready++
+			} else if !os.IsNotExist(err) {
+				readyErr = fmt.Errorf("stat real-loader worker %d readiness: %w", i, err)
+				break
+			}
+		}
+		if readyErr != nil {
+			break
+		}
+		if ready == len(children) {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			readyErr = errors.New("real-loader workers did not reach barrier")
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if readyErr != nil {
+		stopCompatChildProcesses(cancel, children)
+		t.Fatalf("%v: outputs=%s", readyErr, compatChildProcessOutputs(children, 1000))
+	}
+	if err := os.WriteFile(barrierPath, []byte("start\n"), 0o600); err != nil {
+		stopCompatChildProcesses(cancel, children)
+		t.Fatalf("release real-loader multiprocess barrier: %v outputs=%s", err, compatChildProcessOutputs(children, 1000))
+	}
+	var waitFailures []string
+	for i := range children {
+		if err := children[i].wait(); err != nil {
+			waitFailures = append(waitFailures, fmt.Sprintf("worker-%d: %v", i, err))
+		}
+	}
+	if len(waitFailures) > 0 {
+		t.Fatalf("real-loader workers failed: %s outputs=%s", strings.Join(waitFailures, "; "), compatChildProcessOutputs(children, 2000))
+	}
+
+	successes := 0
+	saturated := 0
+	for i := range children {
+		body, err := os.ReadFile(filepath.Join(resultDir, fmt.Sprintf("worker-%d", i)))
+		if err != nil {
+			t.Fatalf("read real-loader worker %d result: %v", i, err)
+		}
+		switch strings.TrimSpace(string(body)) {
+		case "success":
+			successes++
+		case "saturated":
+			saturated++
+		default:
+			t.Fatalf("real-loader worker %d result = %q", i, body)
+		}
+	}
+	if successes != 1 || saturated != 1 {
+		t.Fatalf("real-loader multiprocess results: success=%d saturated=%d, want 1/1", successes, saturated)
+	}
+
+	inspectorResultPath := filepath.Join(resultDir, "inspector")
+	inspectCtx, inspectCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer inspectCancel()
+	inspector := exec.CommandContext(inspectCtx, os.Args[0], "-test.run=^TestCodexTokenUsageMultiprocessHelper$", "-test.v")
+	inspector.Env = append(os.Environ(),
+		"CODEX_TOKEN_USAGE_MULTIPROCESS_HELPER=1",
+		"CODEX_TOKEN_USAGE_MULTIPROCESS_MODE=inspect",
+		"CODEX_TOKEN_USAGE_PLUGIN_LIBRARY="+library,
+		"CPA_TOKEN_USAGE_DIR="+usageDir,
+		"CPA_AUTH_DIR="+authDir,
+		"CODEX_TOKEN_USAGE_MULTIPROCESS_RESULT="+inspectorResultPath,
+	)
+	inspectorOutput, err := inspector.CombinedOutput()
+	if err != nil {
+		t.Fatalf("real-loader reservation inspector failed: %v output=%s", err, truncateCompat(string(inspectorOutput), 2000))
+	}
+	inspectorResult, err := os.ReadFile(inspectorResultPath)
+	if err != nil {
+		t.Fatalf("read real-loader reservation inspector result: %v output=%s", err, truncateCompat(string(inspectorOutput), 2000))
+	}
+	if got := strings.TrimSpace(string(inspectorResult)); got != "reservations=1" {
+		t.Fatalf("real-loader shared database active reservation result = %q, want reservations=1 output=%s", got, truncateCompat(string(inspectorOutput), 2000))
+	}
+}
+
+func compatActivePlugin(t *testing.T, host *Host) pluginapi.Plugin {
+	t.Helper()
+	records := host.activeRecords()
+	if len(records) != 1 || records[0].id != "codex-token-usage" {
+		t.Fatalf("active CPA plugin records = %#v, want codex-token-usage", records)
+	}
+	return records[0].plugin
+}
+
+func compatLoadedClient(t *testing.T, host *Host) pluginClient {
+	t.Helper()
+	host.mu.Lock()
+	loaded := host.loaded["codex-token-usage"]
+	host.mu.Unlock()
+	if loaded == nil || loaded.client == nil {
+		t.Fatal("real CPA Host.ApplyConfig did not retain a guarded plugin client")
+	}
+	return loaded.client
+}
+
+func compatManagementRouteCounts(host *Host) (int, int) {
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	return len(host.managementRoutes), len(host.resourceRoutes)
 }
 
 func assertCodexTokenUsageRegistration(t *testing.T, plugin pluginapi.Plugin) {
@@ -301,10 +950,9 @@ func assertCodexTokenUsageRegistration(t *testing.T, plugin pluginapi.Plugin) {
 	}
 }
 
-func assertProtectedSchedulerCompatibility(t *testing.T, ctx context.Context, plugin pluginapi.Plugin) {
+func assertProtectedSchedulerCompatibility(t *testing.T, ctx context.Context, host *Host) {
 	t.Helper()
 	request := pluginapi.SchedulerPickRequest{
-		Plugin:    plugin.Metadata,
 		Provider:  "codex",
 		Providers: []string{"codex"},
 		Model:     "gpt-5.5",
@@ -336,36 +984,38 @@ func assertProtectedSchedulerCompatibility(t *testing.T, ctx context.Context, pl
 		},
 	}
 	for _, want := range []string{"codex-affinity-a", "codex-affinity-a", "codex-affinity-b", "codex-affinity-b"} {
-		got, err := plugin.Capabilities.Scheduler.Pick(ctx, request)
+		got, handled, err := host.PickAuth(ctx, request)
 		if err != nil {
-			t.Fatalf("protected scheduler affinity before expected %q through latest CPA: %v", want, err)
+			t.Fatalf("protected Host.PickAuth before expected %q through latest CPA: %v", want, err)
 		}
-		if !got.Handled || got.AuthID != want {
-			t.Fatalf("protected scheduler pick = %#v, want %q", got, want)
+		if !handled || !got.Handled || got.AuthID != want {
+			t.Fatalf("protected Host.PickAuth = %#v handled=%v, want %q", got, handled, want)
 		}
 	}
-	if _, err := plugin.Capabilities.Scheduler.Pick(ctx, request); err == nil {
+	if _, handled, err := host.PickAuth(ctx, request); err == nil {
 		t.Fatal("saturated protected scheduler returned no error")
 	} else {
+		if !handled {
+			t.Fatal("saturated protected scheduler error was not handled by the plugin")
+		}
 		var statusError interface{ StatusCode() int }
 		if !errors.As(err, &statusError) || statusError.StatusCode() != http.StatusServiceUnavailable {
 			t.Fatalf("saturated scheduler error = %T %v, want HTTP 503", err, err)
 		}
 	}
-}
-
-func findManagementRoute(t *testing.T, routes []pluginapi.ManagementRoute, method, suffix string) pluginapi.ManagementRoute {
-	t.Helper()
-	for _, route := range routes {
-		if strings.EqualFold(route.Method, method) && strings.HasSuffix(route.Path, suffix) {
-			if route.Handler == nil {
-				t.Fatalf("route %s %s has nil handler", method, route.Path)
-			}
-			return route
-		}
+	mixedRequest := request
+	mixedRequest.Provider = "mixed"
+	mixedRequest.Providers = []string{"codex", "gemini"}
+	mixedRequest.Candidates = append(append([]pluginapi.SchedulerAuthCandidate(nil), request.Candidates...), pluginapi.SchedulerAuthCandidate{
+		ID:       "gemini-fallback",
+		Provider: "gemini",
+		Priority: 1,
+		Status:   "active",
+	})
+	mixed, handled, err := host.PickAuth(ctx, mixedRequest)
+	if err != nil || !handled || !mixed.Handled || mixed.AuthID != "gemini-fallback" {
+		t.Fatalf("mixed Host.PickAuth did not fall back from saturated Codex: response=%#v handled=%v err=%v", mixed, handled, err)
 	}
-	t.Fatalf("management route %s *%s not found", method, suffix)
-	return pluginapi.ManagementRoute{}
 }
 
 func assertSummaryCompatibility(t *testing.T, body []byte) {
@@ -376,8 +1026,9 @@ func assertSummaryCompatibility(t *testing.T, body []byte) {
 			TotalTokens int64 `json:"total_tokens"`
 		} `json:"totals"`
 		XAIAccounts []struct {
-			Email   string `json:"email"`
-			XAITier string `json:"xai_tier"`
+			Email    string `json:"email"`
+			XAITier  string `json:"xai_tier"`
+			Requests int64  `json:"requests"`
 		} `json:"xai_accounts"`
 		Accounts []struct {
 			AuthID     string `json:"auth_id"`
@@ -386,15 +1037,64 @@ func assertSummaryCompatibility(t *testing.T, body []byte) {
 			Configured bool   `json:"configured"`
 			Requests   int64  `json:"requests"`
 		} `json:"accounts"`
+		Recent []struct {
+			AuthIndex   string `json:"auth_index"`
+			Generate    bool   `json:"generate"`
+			TotalTokens int64  `json:"total_tokens"`
+		} `json:"recent"`
+		Diagnostics struct {
+			Scheduler struct {
+				ActiveReservations               int64 `json:"active_reservations"`
+				LegacyUncorrelatedReleaseMatched int64 `json:"legacy_uncorrelated_release_matched"`
+			} `json:"scheduler"`
+			XAIAuth struct {
+				Source             string `json:"source"`
+				Authoritative      bool   `json:"authoritative"`
+				MetadataReadErrors int    `json:"metadata_read_errors"`
+			} `json:"xai_auth"`
+		} `json:"diagnostics"`
 	}
 	if err := json.Unmarshal(body, &summary); err != nil {
 		t.Fatalf("decode summary: %v body=%s", err, body)
 	}
-	if summary.Totals.Requests < 1 || summary.Totals.TotalTokens < 17 {
+	// The default Summary scope is Codex generation usage only: usageAdapter
+	// explicit true, usageAdapter omitted (normalized to true), raw ABI omitted,
+	// and the two failure callbacks. The xAI row belongs to xAI totals, while
+	// Generate=false remains audit-only.
+	if summary.Totals.Requests != 5 || summary.Totals.TotalTokens != 43 {
 		t.Fatalf("usage.handle was not reflected in summary: %+v", summary.Totals)
 	}
+	foundLifecycleTrue := false
+	foundLifecycleOmitted := false
+	foundRawOmitted := false
+	foundLifecycleFalse := false
+	for _, recent := range summary.Recent {
+		switch {
+		case recent.AuthIndex == "compat-index" && recent.TotalTokens == 17:
+			foundLifecycleTrue = recent.Generate && recent.TotalTokens == 17
+		case recent.AuthIndex == "codex-lifecycle-omitted":
+			foundLifecycleOmitted = recent.Generate && recent.TotalTokens == 3
+		case recent.AuthIndex == "codex-affinity-b" && recent.TotalTokens == 23:
+			foundRawOmitted = recent.Generate && recent.TotalTokens == 23
+		case recent.AuthIndex == "codex-affinity-a" && recent.TotalTokens == 9_000_000:
+			foundLifecycleFalse = !recent.Generate && recent.TotalTokens == 9_000_000
+		}
+	}
+	if !foundLifecycleTrue || !foundLifecycleOmitted || !foundRawOmitted || !foundLifecycleFalse {
+		t.Fatalf("Generate lifecycle rows missing: true=%v omitted=%v raw_omitted=%v false=%v recent=%+v", foundLifecycleTrue, foundLifecycleOmitted, foundRawOmitted, foundLifecycleFalse, summary.Recent)
+	}
+	if summary.Diagnostics.Scheduler.ActiveReservations != 2 || summary.Diagnostics.Scheduler.LegacyUncorrelatedReleaseMatched < 2 {
+		t.Fatalf("reservation release diagnostics = %+v, want two remaining and at least two matched legacy releases", summary.Diagnostics.Scheduler)
+	}
+	// The xAI host list entry deliberately has an empty runtime status and no
+	// tier signal, while CPA_AUTH_DIR points elsewhere. A heavy tier plus zero
+	// metadata errors therefore requires successful host.auth.get_runtime and
+	// host.auth.get calls; filesystem fallback cannot satisfy this assertion.
+	if summary.Diagnostics.XAIAuth.Source != "host_callback" || !summary.Diagnostics.XAIAuth.Authoritative || summary.Diagnostics.XAIAuth.MetadataReadErrors != 0 {
+		t.Fatalf("xAI host callback diagnostics = %+v, want authoritative callbacks with zero read errors", summary.Diagnostics.XAIAuth)
+	}
 	for _, account := range summary.XAIAccounts {
-		if account.Email == "compat-xai@example.com" && account.XAITier == "heavy" {
+		if account.Email == "compat-xai@example.com" && account.XAITier == "heavy" && account.Requests >= 1 {
 			goto codexRuntime
 		}
 	}

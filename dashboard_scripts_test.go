@@ -5,6 +5,19 @@ import (
 	"testing"
 )
 
+func dashboardScriptSection(t *testing.T, startMarker, endMarker string) string {
+	t.Helper()
+	start := strings.Index(dashboardScripts, startMarker)
+	if start < 0 {
+		t.Fatalf("dashboard script section start %q not found", startMarker)
+	}
+	end := strings.Index(dashboardScripts[start:], endMarker)
+	if end < 0 {
+		t.Fatalf("dashboard script section end %q not found after %q", endMarker, startMarker)
+	}
+	return dashboardScripts[start : start+end]
+}
+
 func TestPoolTabSwitchReappliesLocale(t *testing.T) {
 	start := strings.Index(dashboardScripts, "function switchPage(page){")
 	if start < 0 {
@@ -176,7 +189,7 @@ func TestManagementKeyIsNotCopiedIntoWebStorage(t *testing.T) {
 func TestDashboardClearsImportedTokensAndProxyCredentials(t *testing.T) {
 	for _, fragment := range []string{
 		"function wipeAuthImportSecrets(){",
-		"authImportReadGeneration++;\n  authImportTextEl.value='';",
+		"authImportReadGeneration++;\n  authImportReadPending=false;\n  authImportTextEl.value='';",
 		"function closeAuthImportModal(){wipeAuthImportSecrets();authImportModal.hidden=true}",
 		"function clearAuthImport(){\n  wipeAuthImportSecrets();",
 		"wipeAuthImportSecrets();\n    setAuthImportStatus(",
@@ -240,6 +253,156 @@ func TestAuthImportAsyncReadsCannotRestoreWipedSecrets(t *testing.T) {
 	}
 	if count := strings.Count(readFiles, "if(generation!==authImportReadGeneration)return;"); count < 2 {
 		t.Fatalf("auth import reads must recheck cancellation after each file and before final DOM updates; found %d checks", count)
+	}
+}
+
+func TestAuthImportPendingReadBlocksPreviewAndCommit(t *testing.T) {
+	for _, marker := range []string{
+		"let authImportReadPending=false;",
+		"let authImportRequestBusy=false;",
+		"authImportReadPending=files.length>0;",
+		"if(generation===authImportReadGeneration){\n      authImportReadPending=false;",
+		"document.getElementById('auth-import-preview').disabled=authImportRequestBusy||authImportReadPending;",
+		"document.getElementById('auth-import-commit').disabled=authImportRequestBusy||authImportReadPending;",
+		"document.getElementById('auth-import-clear').disabled=authImportRequestBusy;",
+		"document.getElementById('auth-import-files').disabled=authImportRequestBusy;",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("auth import pending-state marker %q not found", marker)
+		}
+	}
+
+	readFiles := dashboardScriptSection(t, "async function readAuthImportFiles(e){", "\nfunction authImportKey(){")
+	pendingAt := strings.Index(readFiles, "authImportReadPending=files.length>0;")
+	awaitAt := strings.Index(readFiles, "await file.text()")
+	finallyAt := strings.Index(readFiles, "}finally{")
+	if pendingAt < 0 || awaitAt < 0 || pendingAt > awaitAt || finallyAt < 0 {
+		t.Fatalf("auth import pending lifecycle markers are missing or misordered: %q", readFiles)
+	}
+	currentAt := strings.Index(readFiles[finallyAt:], "if(generation===authImportReadGeneration){")
+	clearAt := strings.Index(readFiles[finallyAt:], "authImportReadPending=false;")
+	if currentAt < 0 || clearAt < currentAt {
+		t.Fatalf("auth import pending lifecycle is not generation-safe: %q", readFiles)
+	}
+
+	for _, tc := range []struct {
+		start string
+		end   string
+		next  string
+	}{
+		{"async function previewAuthImport(){", "\nasync function commitAuthImport(){", "setAuthImportBusy(true)"},
+		{"async function commitAuthImport(){", "\nfunction renderAuthImportResults(result){", "confirm("},
+	} {
+		section := dashboardScriptSection(t, tc.start, tc.end)
+		guardAt := strings.Index(section, "if(authImportReadPending){")
+		nextAt := strings.Index(section, tc.next)
+		if guardAt < 0 || nextAt < 0 || guardAt > nextAt {
+			t.Fatalf("%s must reject programmatic requests while file reads are pending: %q", tc.start, section)
+		}
+	}
+
+	wipe := dashboardScriptSection(t, "function wipeAuthImportSecrets(){", "\nfunction closeAuthImportModal()")
+	generationAt := strings.Index(wipe, "authImportReadGeneration++;")
+	pendingClearAt := strings.Index(wipe, "authImportReadPending=false;")
+	controlsAt := strings.Index(wipe, "updateAuthImportControls();")
+	if generationAt < 0 || pendingClearAt < generationAt || controlsAt < pendingClearAt {
+		t.Fatalf("wiping imported secrets must cancel pending reads and refresh controls: %q", wipe)
+	}
+}
+
+func TestInvalidAuthOAuthPollingIsSingleFlightAndCancelable(t *testing.T) {
+	for _, marker := range []string{
+		"let invalidAuthOAuthGeneration=0;",
+		"function cancelInvalidAuthOAuth(){",
+		"function closeInvalidAuthModal(){cancelInvalidAuthOAuth();invalidAuthModal.hidden=true}",
+		"invalidAuthOAuthUrlEl.innerHTML='';",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("OAuth cancellation marker %q not found", marker)
+		}
+	}
+
+	start := dashboardScriptSection(t, "async function startInvalidAuthOAuth(key){", "\nfunction pollInvalidAuthOAuth(")
+	for _, marker := range []string{
+		"cancelInvalidAuthOAuth();\n  const generation=invalidAuthOAuthGeneration;",
+		"const before=await fetchAuthFilesForBatch(management);\n    if(generation!==invalidAuthOAuthGeneration)return;",
+		"const res=await fetch(managementCodexAuthUrlApi",
+		"const body=await readResponseBody(res);\n    if(generation!==invalidAuthOAuthGeneration)return;",
+		"pollInvalidAuthOAuth(management,payload.state,row,before,startedAt,oldFile,oldEmail,generation);",
+		"}catch(e){\n    if(generation!==invalidAuthOAuthGeneration)return;\n    cancelInvalidAuthOAuth();",
+	} {
+		if !strings.Contains(start, marker) {
+			t.Fatalf("OAuth start flow missing generation guard %q: %q", marker, start)
+		}
+	}
+	fetchAt := strings.Index(start, "const res=await fetch(managementCodexAuthUrlApi")
+	if fetchAt < 0 {
+		t.Fatalf("OAuth start fetch not found: %q", start)
+	}
+	fetchGuardAt := strings.Index(start[fetchAt:], "if(generation!==invalidAuthOAuthGeneration)return;")
+	bodyAt := strings.Index(start[fetchAt:], "const body=await readResponseBody(res);")
+	if fetchAt < 0 || fetchGuardAt < 0 || bodyAt < 0 || fetchGuardAt > bodyAt {
+		t.Fatalf("OAuth start fetch must be generation-checked before reading its body: %q", start)
+	}
+
+	poll := dashboardScriptSection(t, "function pollInvalidAuthOAuth(", "\nasync function handleInvalidAuthOAuthSuccess(")
+	if strings.Contains(poll, "setInterval(") || strings.Contains(poll, "clearInterval(") {
+		t.Fatalf("OAuth polling must not use overlapping setInterval callbacks: %q", poll)
+	}
+	for _, marker := range []string{
+		"const poll=async()=>{",
+		"if(generation!==invalidAuthOAuthGeneration)return;\n    invalidAuthOAuthTimer=null;",
+		"const res=await fetch(managementAuthStatusApi",
+		"const body=await readResponseBody(res);\n      if(generation!==invalidAuthOAuthGeneration)return;",
+		"invalidAuthOAuthTimer=setTimeout(poll,3000);",
+		"await handleInvalidAuthOAuthSuccess(management,row,before,startedAt,oldFile,oldEmail,generation);\n      if(generation!==invalidAuthOAuthGeneration)return;",
+		"}catch(e){\n      if(generation!==invalidAuthOAuthGeneration)return;\n      cancelInvalidAuthOAuth();",
+	} {
+		if !strings.Contains(poll, marker) {
+			t.Fatalf("OAuth single-flight polling marker %q not found: %q", marker, poll)
+		}
+	}
+	pollFetchAt := strings.Index(poll, "const res=await fetch(managementAuthStatusApi")
+	if pollFetchAt < 0 {
+		t.Fatalf("OAuth status fetch not found: %q", poll)
+	}
+	pollFetchGuardAt := strings.Index(poll[pollFetchAt:], "if(generation!==invalidAuthOAuthGeneration)return;")
+	pollBodyAt := strings.Index(poll[pollFetchAt:], "const body=await readResponseBody(res);")
+	if pollFetchAt < 0 || pollFetchGuardAt < 0 || pollBodyAt < 0 || pollFetchGuardAt > pollBodyAt {
+		t.Fatalf("OAuth poll fetch must be generation-checked before reading its body: %q", poll)
+	}
+
+	success := dashboardScriptSection(t, "async function handleInvalidAuthOAuthSuccess(", "\nfunction findNewAuthForEmail(")
+	for _, marker := range []string{
+		"const after=await fetchAuthFilesForBatch(management);\n  if(generation!==invalidAuthOAuthGeneration)return;",
+		"await load();\n  if(generation!==invalidAuthOAuthGeneration)return;",
+		"if(match&&oldFile){\n    if(generation!==invalidAuthOAuthGeneration)return;",
+		"if(ok){\n      if(generation!==invalidAuthOAuthGeneration)return;",
+		"await deleteSelectedInvalidAuths();\n      if(generation!==invalidAuthOAuthGeneration)return;",
+	} {
+		if !strings.Contains(success, marker) {
+			t.Fatalf("OAuth success flow missing stale-generation guard %q: %q", marker, success)
+		}
+	}
+}
+
+func TestBatchProxyNoFilesClearsCredentialURL(t *testing.T) {
+	writeProxy := dashboardScriptSection(t, "async function writeBatchProxy(", "\nfunction syncLanguageControl()")
+	noFilesAt := strings.Index(writeProxy, "if(!files.length){")
+	if noFilesAt < 0 {
+		t.Fatalf("batch proxy no-file path not found: %q", writeProxy)
+	}
+	clearAt := strings.Index(writeProxy[noFilesAt:], "batchProxyUrlEl.value='';")
+	returnAt := strings.Index(writeProxy[noFilesAt:], "return}")
+	if noFilesAt < 0 || clearAt < 0 || returnAt < 0 || clearAt > returnAt {
+		t.Fatalf("batch proxy no-file path must clear the credential-bearing URL before returning: %q", writeProxy)
+	}
+}
+
+func TestNonGeneratedRecentRowsDoNotReportThroughput(t *testing.T) {
+	throughput := dashboardScriptSection(t, "function reliableThroughputSample(r){", "\nfunction avgThroughput(")
+	if !strings.Contains(throughput, "if(r&&r.generate===false)return false;") {
+		t.Fatalf("non-generated audit rows must not be treated as throughput samples: %q", throughput)
 	}
 }
 

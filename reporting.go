@@ -30,7 +30,7 @@ SELECT strftime(?, requested_at, 'unixepoch', 'localtime') AS bucket,
 COUNT(*), COALESCE(SUM(failed),0), COALESCE(SUM(CASE WHEN status_code=429 THEN 1 ELSE 0 END),0),
 COALESCE(SUM(total_tokens),0), COALESCE(SUM(output_tokens),0)
 FROM usage_events
-WHERE requested_at >= ? AND `+usageScopeSQL(scope)+`
+WHERE requested_at >= ? AND `+generatedUsageScopeSQL(scope)+`
 GROUP BY bucket
 ORDER BY bucket ASC
 LIMIT 240`, format, since)
@@ -52,7 +52,7 @@ LIMIT 240`, format, since)
 func queryRecent(ctx context.Context, db *sql.DB, since int64, limit int, scope string, prices map[string]modelPrice) ([]recentRow, error) {
 	query := `
 SELECT requested_at, ` + cpaProviderSQL() + ` AS provider_key, auth_index, source, model, alias, reasoning_effort, service_tier,
-latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
+generate, latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
 cached_tokens, cache_read_tokens, cache_creation_tokens
 FROM usage_events
 WHERE requested_at >= ? AND ` + usageScopeSQL(scope) + `
@@ -82,14 +82,14 @@ func queryProviderRecent(ctx context.Context, db *sql.DB, since int64, perProvid
 	providerExpr := cpaProviderSQL()
 	query := `
 SELECT requested_at, provider_key, auth_index, source, model, alias, reasoning_effort, service_tier,
-latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
+generate, latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
 cached_tokens, cache_read_tokens, cache_creation_tokens
 FROM (
   SELECT provider_events.*,
   row_number() OVER (PARTITION BY provider_key ORDER BY requested_at DESC, id DESC) AS provider_rank
   FROM (
     SELECT id, requested_at, ` + providerExpr + ` AS provider_key, auth_index, source, model, alias, reasoning_effort, service_tier,
-    latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
+    generate, latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
     cached_tokens, cache_read_tokens, cache_creation_tokens
     FROM usage_events
     WHERE requested_at >= ? AND ` + usageScopeSQL("other") + `
@@ -111,15 +111,16 @@ func scanRecentRows(rows *sql.Rows, prices map[string]modelPrice) ([]recentRow, 
 	for rows.Next() {
 		var r recentRow
 		var ts int64
-		var failed int
+		var generated, failed int
 		if err := rows.Scan(
 			&ts, &r.Provider, &r.AuthIndex, &r.Source, &r.Model, &r.Alias, &r.ReasoningEffort, &r.ServiceTier,
-			&r.LatencyMs, &r.TTFTMs, &r.StatusCode, &failed, &r.TotalTokens, &r.InputTokens, &r.OutputTokens,
+			&generated, &r.LatencyMs, &r.TTFTMs, &r.StatusCode, &failed, &r.TotalTokens, &r.InputTokens, &r.OutputTokens,
 			&r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens,
 		); err != nil {
 			return nil, err
 		}
 		r.Time = unixTime(ts)
+		r.Generate = generated != 0
 		r.Failed = failed != 0
 		r.Source = safeExportLabel(r.Source)
 		costRow := costTokenRow{
@@ -134,27 +135,33 @@ func scanRecentRows(rows *sql.Rows, prices map[string]modelPrice) ([]recentRow, 
 			CacheCreationTokens: r.CacheCreationTokens,
 			TotalTokens:         r.TotalTokens,
 		}
-		if cost, ok := costForTokens(costRow, prices); ok {
-			r.CostUSD = cost
-			r.CostAvailable = true
-			if price, ok := resolveModelPrice(costRow, prices); ok {
-				r.PriceDetail = recentPriceDetail(price)
+		if r.Generate {
+			if cost, ok := costForTokens(costRow, prices); ok {
+				r.CostUSD = cost
+				r.CostAvailable = true
+				if price, ok := resolveModelPrice(costRow, prices); ok {
+					r.PriceDetail = recentPriceDetail(price)
+				}
+			} else if usageTokenInputRequiresPricing(costRow) {
+				r.UnpricedTokens = r.TotalTokens
 			}
-		} else if usageTokenInputRequiresPricing(costRow) {
-			r.UnpricedTokens = r.TotalTokens
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
 }
 
-func queryActiveAutobans(ctx context.Context, db *sql.DB, now int64) ([]autobanRow, error) {
+func queryActiveAutobans(ctx context.Context, db *sql.DB, provider string, now int64) ([]autobanRow, error) {
+	provider, err := requiredCanonicalProvider(provider)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := db.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active, last_status_code,
 primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
 FROM autoban_bans
-WHERE active=1 AND reset_at > ?
-ORDER BY reset_at DESC`, now)
+WHERE provider=? AND active=1 AND reset_at > ?
+ORDER BY reset_at DESC`, provider, now)
 	if err != nil {
 		return nil, err
 	}
@@ -274,16 +281,17 @@ func dedupeAutobanRows(rows []autobanRow) []autobanRow {
 }
 
 func autobanDedupeKey(row autobanRow) string {
+	provider := canonicalProviderOr(row.Provider, providerCodex)
 	for _, value := range []string{row.AuthFile, row.AuthID, row.AuthIndex, row.Source} {
 		if file := fileNameIfJSON(value); file != "" {
-			return "file:" + normalizeAccountAlias(file)
+			return provider + ":file:" + normalizeAccountAlias(file)
 		}
 	}
 	aliases := authStateMatchAliases(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
 	if len(aliases) == 0 {
 		return ""
 	}
-	return "alias:" + aliases[0]
+	return provider + ":alias:" + aliases[0]
 }
 
 func mergeDuplicateAutobanRow(left, right autobanRow) autobanRow {

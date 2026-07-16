@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -12,6 +13,9 @@ import (
 // Provider is empty, Providers contains every eligible provider, and Candidates
 // may contain auths from more than one provider.
 func isMixedSchedulerRequest(req schedulerPickRequest) bool {
+	if req.filter != nil {
+		return req.filter.mixed()
+	}
 	provider := strings.TrimSpace(req.Provider)
 	if provider != "" && !strings.EqualFold(provider, "mixed") {
 		return false
@@ -30,11 +34,6 @@ func isMixedSchedulerRequest(req schedulerPickRequest) bool {
 	}
 	for _, value := range req.Providers {
 		if add(value) {
-			return true
-		}
-	}
-	for _, candidate := range req.Candidates {
-		if add(candidate.Provider) {
 			return true
 		}
 	}
@@ -57,6 +56,10 @@ func (s *store) pickMixedAuthOnce(ctx context.Context, req schedulerPickRequest)
 		}
 	}
 	if !hasCodex && !hasXAI {
+		if req.filter != nil && req.filter.forceHandle() {
+			chosen := pickSchedulerCandidate(schedulerRotationKey(req, "mixed"), schedulerAffinityKey(req, "mixed"), req.Candidates)
+			return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
 
@@ -105,11 +108,11 @@ func (s *store) pickMixedAuthOnce(ctx context.Context, req schedulerPickRequest)
 		if s == globalStore {
 			generation = globalSchedulerState.providerGeneration("codex")
 		}
-		bans, err := queryActiveAutobans(ctx, opened, now)
+		bans, err := queryActiveAutobans(ctx, opened, providerCodex, now)
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
-		invalids, err := queryActiveInvalidAuths(ctx, opened)
+		invalids, err := queryActiveInvalidAuths(ctx, opened, providerCodex)
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
@@ -132,7 +135,7 @@ func (s *store) pickMixedAuthOnce(ctx context.Context, req schedulerPickRequest)
 		if s == globalStore {
 			generation = globalSchedulerState.providerGeneration("xai")
 		}
-		states, err := queryActiveXAIStates(ctx, opened, now)
+		states, err := queryActiveXAIStates(ctx, opened, providerXAI, now)
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
@@ -173,21 +176,31 @@ func (s *store) pickMixedAuthOnce(ctx context.Context, req schedulerPickRequest)
 		globalSchedulerDiagnostics.record(restrictionCount, filteredCodex, maxInt(0, restrictionCount-len(matchedCodexIndexes)))
 	}
 	filtered := filteredCodex+filteredXAI > 0
-	if !filtered && !protectCodex {
+	if !filtered && !protectCodex && (req.filter == nil || !req.filter.forceHandle()) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	if len(available) == 0 {
+		if req.filter != nil {
+			if provider, reason, ok := firstQuarantinedProvider(req.filter.quarantinedProviders); ok {
+				return schedulerPickResponse{}, newSchedulerPrivacyQuarantineError(provider, reason)
+			}
+		}
 		return schedulerPickResponse{}, newNoAvailableMixedAuthError(codexSnapshot, xaiSnapshot, filteredCodex, filteredXAI, now)
 	}
 
-	eligible := highestPrioritySchedulerCandidates(available)
 	rotationKey := schedulerRotationKey(req, "mixed")
 	affinityKey := schedulerAffinityKey(req, "mixed")
-	chosen := pickSchedulerCandidate(rotationKey, affinityKey, eligible)
-	if protectCodex && strings.EqualFold(strings.TrimSpace(chosen.Provider), "codex") {
+	remaining := available
+	var saturatedErr error
+	for len(remaining) > 0 {
+		eligible := highestPrioritySchedulerCandidates(remaining)
+		chosen := pickSchedulerCandidate(rotationKey, affinityKey, eligible)
+		if !protectCodex || canonicalProvider(chosen.Provider) != providerCodex {
+			return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+		}
 		codexEligible := make([]schedulerAuthCandidate, 0, len(eligible))
 		for _, candidate := range eligible {
-			if strings.EqualFold(strings.TrimSpace(candidate.Provider), "codex") {
+			if canonicalProvider(candidate.Provider) == providerCodex {
 				codexEligible = append(codexEligible, candidate)
 			}
 		}
@@ -196,11 +209,37 @@ func (s *store) pickMixedAuthOnce(ctx context.Context, req schedulerPickRequest)
 			return schedulerPickResponse{Handled: false}, err
 		}
 		chosen, err = s.pickProtectedAuth(ctx, opened, codexEligible, protectionCfg, rotationKey+"\x00codex", affinityKey)
-		if err != nil {
+		if err == nil {
+			return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+		}
+		var reject *schedulerRejectError
+		if !errors.As(err, &reject) || reject.Code != "account_protection_saturated" {
 			return schedulerPickResponse{Handled: false}, err
 		}
+		saturatedErr = err
+
+		// Capacity is authoritative only for the Codex candidates in this
+		// highest-priority tier. Remove exactly that tier and re-evaluate the
+		// remaining healthy candidates so a same-tier non-Codex candidate or a
+		// lower-priority protected Codex candidate can still be selected safely.
+		highestPriority := eligible[0].Priority
+		next := make([]schedulerAuthCandidate, 0, len(remaining)-len(codexEligible))
+		for _, candidate := range remaining {
+			if canonicalProvider(candidate.Provider) == providerCodex && candidate.Priority == highestPriority {
+				continue
+			}
+			next = append(next, candidate)
+		}
+		remaining = next
 	}
-	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+	if saturatedErr != nil {
+		return schedulerPickResponse{Handled: false}, saturatedErr
+	}
+	return schedulerPickResponse{Handled: false}, &schedulerRejectError{
+		Code:       "auth_unavailable",
+		Message:    "no healthy scheduler candidates remain",
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
 }
 
 func newNoAvailableMixedAuthError(codex *codexSchedulerSnapshot, xai *xaiSchedulerSnapshot, filteredCodex, filteredXAI int, now int64) error {

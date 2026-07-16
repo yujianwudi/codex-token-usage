@@ -92,6 +92,8 @@ type xaiAuthSourceDiagnostics struct {
 	Authoritative      bool   `json:"authoritative"`
 	Accounts           int    `json:"accounts"`
 	MetadataReadErrors int    `json:"metadata_read_errors"`
+	HostStatus         string `json:"host_status,omitempty"`
+	FallbackStatus     string `json:"fallback_status,omitempty"`
 	LastSuccessAt      string `json:"last_success_at,omitempty"`
 	LastError          string `json:"last_error,omitempty"`
 }
@@ -188,6 +190,7 @@ func (m *xaiAuthSourceManager) hostAccounts() ([]configuredAccount, error) {
 		Authoritative:      true,
 		Accounts:           len(accounts),
 		MetadataReadErrors: metadataErrors,
+		HostStatus:         "ok",
 		LastSuccessAt:      now.Format(time.RFC3339),
 	}
 	m.mu.Unlock()
@@ -222,6 +225,7 @@ func (m *xaiAuthSourceManager) recordHostFailure(failure error) {
 		Source:        "host_callback_error",
 		Authoritative: false,
 		Accounts:      len(m.accounts),
+		HostStatus:    hostAuthDiagnosticStatus(failure),
 		LastSuccessAt: m.diagnostics.LastSuccessAt,
 		LastError:     failure.Error(),
 	}
@@ -322,7 +326,7 @@ func (m *xaiAuthSourceManager) pruneTierCacheLocked(now time.Time) {
 	}
 }
 
-func (m *xaiAuthSourceManager) markFilesystemFallback(accounts []configuredAccount, err error) []configuredAccount {
+func (m *xaiAuthSourceManager) markFilesystemFallback(accounts []configuredAccount, _ error) []configuredAccount {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.callbackErr == nil && m.diagnostics.Source == "host_callback" && m.diagnostics.Authoritative {
@@ -335,13 +339,17 @@ func (m *xaiAuthSourceManager) markFilesystemFallback(accounts []configuredAccou
 	// non-authoritative so missing entries cannot clear active scheduler state.
 	merged := mergeXAIAccountSnapshots(m.hostSnapshot, accounts)
 	m.accounts = cloneConfiguredAccounts(merged)
+	hostStatus := hostAuthDiagnosticStatus(m.callbackErr)
+	fallbackStatus := configuredAuthFilesFallbackStatus()
 	m.diagnostics = xaiAuthSourceDiagnostics{
 		Source:             "filesystem_fallback",
 		Authoritative:      false,
 		Accounts:           len(merged),
 		MetadataReadErrors: 0,
+		HostStatus:         hostStatus,
+		FallbackStatus:     fallbackStatus,
 		LastSuccessAt:      m.diagnostics.LastSuccessAt,
-		LastError:          sanitizeTriggerError(err),
+		LastError:          authSourceFallbackDiagnostic(hostStatus, fallbackStatus),
 	}
 	return cloneConfiguredAccounts(merged)
 }
@@ -475,12 +483,46 @@ func classifyXAITierSignals(signals []xaiTierSignal) xaiTierClassification {
 		if tier == "" {
 			continue
 		}
-		candidate := xaiTierClassification{Tier: tier, Source: signal.Path, Detail: strings.TrimSpace(signal.Value)}
+		candidate := xaiTierClassification{
+			Tier:   tier,
+			Source: safeXAITierSignalSource(signal.Path),
+			Detail: xaiTierDetail(tier),
+		}
 		if xaiTierRank(candidate.Tier) > xaiTierRank(best.Tier) || best.Source == "default" {
 			best = candidate
 		}
 	}
 	return best
+}
+
+func safeXAITierSignalSource(path string) string {
+	path = strings.TrimSpace(path)
+	origin := "metadata"
+	if strings.HasPrefix(strings.ToLower(path), "host.") {
+		origin = "host"
+	}
+	if index := strings.LastIndex(path, "."); index >= 0 {
+		path = path[index+1:]
+	}
+	if index := strings.Index(path, "["); index >= 0 {
+		path = path[:index]
+	}
+	key := normalizeXAITierText(path)
+	if !xaiTierMetadataKey(key) {
+		return origin + ".tier"
+	}
+	return origin + "." + key
+}
+
+func xaiTierDetail(tier string) string {
+	switch tier {
+	case xaiTierHeavy:
+		return "Recognized Heavy xAI tier metadata"
+	case xaiTierSuper:
+		return "Recognized Super xAI tier metadata"
+	default:
+		return "Recognized Free xAI tier metadata"
+	}
 }
 
 func xaiTierFromText(value string) string {

@@ -44,6 +44,14 @@ func TestParseXAIErrorKinds(t *testing.T) {
 		{name: "ordinary rate limit", status: http.StatusTooManyRequests, body: `{"error":"too many requests"}`, want: xaiErrorRateLimited},
 		{name: "model unavailable", status: http.StatusNotFound, body: `{"error":{"code":"model_not_found"}}`, want: xaiErrorModelUnavailable},
 		{name: "upstream transient", status: http.StatusServiceUnavailable, body: `{"message":"temporarily unavailable"}`, want: xaiErrorUpstreamTransient},
+		{name: "401 ignores account marker", status: http.StatusUnauthorized, body: `{"message":"account suspended"}`, want: xaiErrorUnauthorized},
+		{name: "403 ignores token marker", status: http.StatusForbidden, body: `{"message":"token expired"}`, want: xaiErrorPermissionDenied},
+		{name: "404 ignores credential marker", status: http.StatusNotFound, body: `{"message":"invalid token"}`, want: xaiErrorModelUnavailable},
+		{name: "429 ignores credential marker", status: http.StatusTooManyRequests, body: `{"message":"token revoked"}`, want: xaiErrorRateLimited},
+		{name: "5xx ignores credential marker", status: http.StatusBadGateway, body: `{"message":"unauthorized"}`, want: xaiErrorUpstreamTransient},
+		{name: "other status ignores rate marker", status: http.StatusBadRequest, body: `{"message":"rate limited"}`, want: xaiErrorUnknown},
+		{name: "status zero uses body token marker", status: 0, body: `{"message":"token expired"}`, want: xaiErrorTokenExpired},
+		{name: "status zero uses body quota marker", status: 0, body: `{"message":"included free usage exhausted"}`, want: xaiErrorFreeUsageExhausted},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

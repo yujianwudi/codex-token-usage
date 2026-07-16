@@ -79,8 +79,56 @@ func TestXAIStateUsesStructuredErrorEvidence(t *testing.T) {
 		Failed:  true,
 		Failure: usageFailure{StatusCode: http.StatusForbidden, Body: `{"error":{"code":"model_not_found","message":"Model does not exist"}}`},
 	}
-	if state, _, _ := xaiStateForRecord(modelFailure, http.StatusForbidden, now); state != "" {
-		t.Fatalf("state=%q, model errors must not mark the account unavailable", state)
+	if state, _, _ := xaiStateForRecord(modelFailure, http.StatusForbidden, now); state != xaiStateForbidden {
+		t.Fatalf("state=%q, HTTP 403 must remain a permission restriction", state)
+	}
+}
+
+func TestXAIStateIgnoresCredentialMarkersOnServerFailures(t *testing.T) {
+	now := int64(1_700_000_000)
+	for _, body := range []string{
+		`{"error":{"code":"unauthorized","message":"invalid token"}}`,
+		`{"error":{"code":"rate_limited","message":"too many requests"}}`,
+		`{"error":{"code":"free-usage-exhausted","message":"quota exhausted"}}`,
+	} {
+		rec := usageRecord{Failed: true, Failure: usageFailure{StatusCode: http.StatusBadGateway, Body: body}}
+		state, _, resetAt := xaiStateForRecord(rec, http.StatusBadGateway, now)
+		if state != "" || resetAt != 0 {
+			t.Fatalf("server failure body %q produced state=%q resetAt=%d", body, state, resetAt)
+		}
+		if parsed := parseXAIError(http.StatusBadGateway, body); parsed.Kind != xaiErrorUpstreamTransient {
+			t.Fatalf("server failure body %q parsed as %q, want %q", body, parsed.Kind, xaiErrorUpstreamTransient)
+		}
+	}
+}
+
+func TestXAINonGenerationFailureStateMatrix(t *testing.T) {
+	now := int64(1_700_000_000)
+	for _, test := range []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{name: "401 credential signal", status: http.StatusUnauthorized, body: `{"error":"invalid token"}`, want: xaiStateUnauthorized},
+		{name: "402 account signal", status: http.StatusPaymentRequired, body: `{"error":"account suspended"}`, want: xaiStateForbidden},
+		{name: "403 permission signal", status: http.StatusForbidden, body: `{"error":"permission denied"}`, want: xaiStateForbidden},
+		{name: "missing status", status: 0, body: `{"error":"unauthorized"}`},
+		{name: "429 audit only", status: http.StatusTooManyRequests, body: `{"error":"rate limited"}`},
+		{name: "5xx audit only", status: http.StatusInternalServerError, body: `{"error":"invalid token"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rec := usageRecord{
+				Generate:    false,
+				generateSet: true,
+				Failed:      true,
+				Failure:     usageFailure{StatusCode: test.status, Body: test.body},
+			}
+			state, _, _ := xaiStateForRecord(rec, test.status, now)
+			if state != test.want {
+				t.Fatalf("state=%q, want %q", state, test.want)
+			}
+		})
 	}
 }
 
@@ -132,7 +180,7 @@ func TestXAIFreeUsageExhaustedStateSurvivesConcurrentSuccess(t *testing.T) {
 	if err := recordXAIStateIfNeeded(context.Background(), db, failure, http.StatusTooManyRequests); err != nil {
 		t.Fatal(err)
 	}
-	states, err := queryActiveXAIStates(context.Background(), db, now.Unix())
+	states, err := queryActiveXAIStates(context.Background(), db, providerXAI, now.Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +191,7 @@ func TestXAIFreeUsageExhaustedStateSurvivesConcurrentSuccess(t *testing.T) {
 	if err := recordXAIStateIfNeeded(context.Background(), db, success, http.StatusOK); err != nil {
 		t.Fatal(err)
 	}
-	states, err = queryActiveXAIStates(context.Background(), db, now.Add(time.Second).Unix())
+	states, err = queryActiveXAIStates(context.Background(), db, providerXAI, now.Add(time.Second).Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,12 +218,47 @@ func TestXAITransientStateClearsAfterSuccess(t *testing.T) {
 	if err := recordXAIStateIfNeeded(context.Background(), db, success, http.StatusOK); err != nil {
 		t.Fatal(err)
 	}
-	states, err := queryActiveXAIStates(context.Background(), db, now.Add(time.Second).Unix())
+	states, err := queryActiveXAIStates(context.Background(), db, providerXAI, now.Add(time.Second).Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(states) != 0 {
 		t.Fatalf("states=%#v, want transient state cleared after success", states)
+	}
+}
+
+func TestXAINonGenerationSuccessDoesNotClearRestriction(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now()
+	failure := usageRecord{
+		Provider:    providerXAI,
+		AuthID:      "xai-audit-account",
+		AuthIndex:   "xai-audit-account",
+		RequestedAt: now,
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusTooManyRequests},
+	}
+	if err := recordXAIStateIfNeeded(context.Background(), db, failure, http.StatusTooManyRequests); err != nil {
+		t.Fatal(err)
+	}
+
+	auditSuccess := usageRecord{
+		Provider:    providerXAI,
+		AuthID:      "xai-audit-account",
+		AuthIndex:   "xai-audit-account",
+		RequestedAt: now.Add(time.Second),
+		Generate:    false,
+		generateSet: true,
+	}
+	if err := recordXAIStateIfNeeded(context.Background(), db, auditSuccess, http.StatusOK); err != nil {
+		t.Fatal(err)
+	}
+	states, err := queryActiveXAIStates(context.Background(), db, providerXAI, now.Add(time.Second).Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 1 || states[0].State != xaiStateRateLimited {
+		t.Fatalf("states=%#v, want non-generation success to preserve rate-limit state", states)
 	}
 }
 

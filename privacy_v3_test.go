@@ -76,7 +76,7 @@ func TestFingerprintingDoesNotClearUnverifiedBindingFailure(t *testing.T) {
 
 func TestPersistentIdentityScannerReloadsRowsMutatedWithinBatch(t *testing.T) {
 	db := newProtectionTestDB(t)
-	firstResult, err := db.Exec(`INSERT INTO usage_events(requested_at,auth_id) VALUES(1,'first')`)
+	firstResult, err := db.Exec(`INSERT INTO usage_events(requested_at,provider,auth_id) VALUES(1,'codex','first')`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestPersistentIdentityScannerReloadsRowsMutatedWithinBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondResult, err := db.Exec(`INSERT INTO usage_events(requested_at,auth_id) VALUES(2,'stale')`)
+	secondResult, err := db.Exec(`INSERT INTO usage_events(requested_at,provider,auth_id) VALUES(2,'codex','stale')`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,14 +291,14 @@ func TestRecordUsageSanitizesAllDerivedAuthStateTables(t *testing.T) {
 	}
 
 	candidate := schedulerAuthCandidate{ID: raw, Provider: "codex", Attributes: map[string]string{"auth_index": raw, "source": "Bearer " + raw}}
-	invalids, err := queryActiveInvalidAuths(context.Background(), db)
+	invalids, err := queryActiveInvalidAuths(context.Background(), db, providerCodex)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !candidateMatchesInvalidAuth(candidate, invalids) {
 		t.Fatal("sanitized invalid-auth state no longer matches the raw scheduler candidate")
 	}
-	bans, err := queryActiveAutobans(context.Background(), db, time.Now().Unix())
+	bans, err := queryActiveAutobans(context.Background(), db, providerCodex, time.Now().Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +336,7 @@ func TestV3MigrationPreservesSafeActiveStatesAndSanitizesCredentials(t *testing.
 	if _, err := db.Exec(`INSERT INTO invalid_auths(auth_id,auth_index,source,provider,reason,invalidated_at,active) VALUES(?,?,?,?,?,?,1)`, raw, "Bearer "+raw, raw, "codex", "credential", now+1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO usage_events(requested_at,api_key,auth_id,auth_index,source) VALUES(?,'',?,?,?)`, now, raw, "Bearer "+raw, raw); err != nil {
+	if _, err := db.Exec(`INSERT INTO usage_events(requested_at,provider,api_key,auth_id,auth_index,source) VALUES(?,'codex','',?,?,?)`, now, raw, "Bearer "+raw, raw); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO account_protection_reservations(auth_id,auth_index,source,plan_type,created_at,expires_at) VALUES(?,?,?,'plus',?,?)`, raw, "Bearer "+raw, raw, now, now+900); err != nil {
@@ -365,21 +365,21 @@ func TestV3MigrationPreservesSafeActiveStatesAndSanitizesCredentials(t *testing.
 		t.Fatalf("safe active states lost during migration: invalid=%d ban=%d xai=%d", safeInvalid, safeBan, safeXAI)
 	}
 	safeCandidate := schedulerAuthCandidate{ID: "user@example.com", Provider: "codex", Attributes: map[string]string{"auth_index": "account.json", "source": "user@example.com"}}
-	activeInvalids, err := queryActiveInvalidAuths(context.Background(), db)
+	activeInvalids, err := queryActiveInvalidAuths(context.Background(), db, providerCodex)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !candidateMatchesInvalidAuth(safeCandidate, activeInvalids) {
 		t.Fatal("ordinary active invalid-auth state stopped filtering after migration")
 	}
-	activeBans, err := queryActiveAutobans(context.Background(), db, now)
+	activeBans, err := queryActiveAutobans(context.Background(), db, providerCodex, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !candidateMatchesActiveBan(safeCandidate, activeBans) {
 		t.Fatal("ordinary active autoban state stopped filtering after migration")
 	}
-	activeXAI, err := queryActiveXAIStates(context.Background(), db, now)
+	activeXAI, err := queryActiveXAIStates(context.Background(), db, providerXAI, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +422,7 @@ func TestV3MigrationPreservesSafeActiveStatesAndSanitizesCredentials(t *testing.
 		t.Fatalf("summary cache retained %d rows", cacheRows)
 	}
 	candidate := schedulerAuthCandidate{ID: raw, Provider: "codex", Attributes: map[string]string{"auth_index": raw}}
-	invalids, err := queryActiveInvalidAuths(context.Background(), db)
+	invalids, err := queryActiveInvalidAuths(context.Background(), db, providerCodex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,11 +645,11 @@ func TestV3CollisionWinnerKeepsWholeRowAndDiagnosesTies(t *testing.T) {
 	if err := db.QueryRow(`SELECT reason,invalidated_at,active,last_status_code,auth_file,auth_file_mtime FROM invalid_auths WHERE auth_id=?`, tieFingerprint).Scan(&reason, &invalidatedAt, &active, &status, &authFile, &mtime); err != nil {
 		t.Fatal(err)
 	}
-	if reason != "recovered-tie" || invalidatedAt != now+60 || active != 0 || status != 204 || authFile != "recovered-tie.json" || mtime != now+55 {
+	if reason != "active-tie" || invalidatedAt != now+60 || active != 1 || status != 401 || authFile != "active-tie.json" || mtime != now+60 {
 		t.Fatalf("active/inactive tie mixed rows: reason=%q invalidated=%d active=%d status=%d file=%q mtime=%d", reason, invalidatedAt, active, status, authFile, mtime)
 	}
 	statusView := apiKeyFingerprintStatus(context.Background(), db)
-	if statusView.IdentityCollisionTies == 0 || !strings.Contains(statusView.CollisionTiePolicy, "inactive wins") {
+	if statusView.IdentityCollisionTies == 0 || !strings.Contains(statusView.CollisionTiePolicy, "documented total order") {
 		t.Fatalf("tie diagnostics = %+v", statusView)
 	}
 }
@@ -661,8 +661,10 @@ func TestV3MigrationFailsClosedWhenExistingV1SecretIsMissing(t *testing.T) {
 		query string
 		args  []any
 	}{
-		{name: "usage api_key", query: `INSERT INTO usage_events(requested_at,api_key) VALUES(1,?)`, args: []any{existing}},
-		{name: "usage embedded auth_id", query: `INSERT INTO usage_events(requested_at,auth_id) VALUES(1,?)`, args: []any{"codex:apikey:" + existing}},
+		{name: "usage api_key", query: `INSERT INTO usage_events(requested_at,provider,api_key) VALUES(1,'codex',?)`, args: []any{existing}},
+		{name: "usage embedded auth_id", query: `INSERT INTO usage_events(requested_at,provider,auth_id) VALUES(1,'codex',?)`, args: []any{"codex:apikey:" + existing}},
+		{name: "third-party usage api_key", query: `INSERT INTO usage_events(requested_at,provider,api_key) VALUES(1,'anthropic',?)`, args: []any{existing}},
+		{name: "third-party usage embedded auth_id", query: `INSERT INTO usage_events(requested_at,provider,auth_id) VALUES(1,'gemini',?)`, args: []any{"gemini:apikey:" + existing}},
 		{name: "invalid state", query: `INSERT INTO invalid_auths(auth_id,provider,reason,invalidated_at,active) VALUES(?,'codex','test',1,1)`, args: []any{existing}},
 		{name: "autoban state", query: `INSERT INTO autoban_bans(auth_id,provider,window,reason,banned_at,reset_at,active) VALUES(?,'codex','5h','test',1,9999999999,1)`, args: []any{existing}},
 		{name: "xai state", query: `INSERT INTO xai_account_states(state_key,auth_id,provider,state,reason,observed_at,active) VALUES(?,?,'xai','unauthorized','test',1,1)`, args: []any{existing, existing}},
@@ -718,7 +720,7 @@ func TestV3MigrationFailsClosedWhenExistingV1SecretIsCorrupt(t *testing.T) {
 	if _, err := db.Exec(`PRAGMA user_version=2`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO usage_events(requested_at,api_key) VALUES(1,'keyfp:v1:0123456789abcdef0123456789abcdef:ABCD')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO usage_events(requested_at,provider,api_key) VALUES(1,'anthropic','keyfp:v1:0123456789abcdef0123456789abcdef:ABCD')`); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, apiKeyFingerprintSecretFile), []byte("corrupt"), 0o600); err != nil {
@@ -804,7 +806,7 @@ func TestLegacyV0IsLocallyRekeyedAndDiagnosedAsUnlinkable(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacy := "keyfp:v0:0123456789abcdef0123456789abcdef:9Z_-"
-	if _, err := db.Exec(`INSERT INTO usage_events(requested_at,api_key,auth_id) VALUES(1,?,?)`, legacy, legacy); err != nil {
+	if _, err := db.Exec(`INSERT INTO usage_events(requested_at,provider,api_key,auth_id) VALUES(1,'codex',?,?)`, legacy, legacy); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO invalid_auths(auth_id,provider,reason,invalidated_at,active) VALUES(?,'codex','legacy-inactive',1,0)`, legacy); err != nil {
@@ -920,7 +922,7 @@ func TestUnknownActiveV0QuarantinesOnlyItsProviderAndReleaseClearsOnRestart(t *t
 	}
 }
 
-func TestDirtyStoredProviderAliasesCannotBypassTableScopedQuarantine(t *testing.T) {
+func TestExplicitForeignProvidersRemainInertDuringPrivacyMigration(t *testing.T) {
 	isolateAPIKeyPrivacyQuarantineForTest(t)
 	dir := t.TempDir()
 	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
@@ -950,15 +952,68 @@ func TestDirtyStoredProviderAliasesCannotBypassTableScopedQuarantine(t *testing.
 	}
 	s := &store{db: db, dbPath: path}
 	refreshAPIKeyPrivacyQuarantineForTest(t, s, db, path)
-	for _, provider := range []string{"codex", "xai"} {
-		if _, ok := s.apiKeyPrivacyQuarantineReason(provider); !ok {
-			t.Fatalf("table-scoped %s quarantine was bypassed by dirty stored provider", provider)
+	for _, provider := range []string{"codex", "xai", "openai", "grok"} {
+		if _, ok := s.apiKeyPrivacyQuarantineReason(provider); ok {
+			t.Fatalf("explicit foreign Provider %q unexpectedly entered privacy quarantine", provider)
 		}
 	}
-	for _, provider := range []string{"openai", "grok"} {
-		if _, ok := s.apiKeyPrivacyQuarantineReason(provider); ok {
-			t.Fatalf("dirty provider %q was trusted as a scheduler provider", provider)
+	for _, check := range []struct {
+		query string
+		want  string
+	}{
+		{query: `SELECT provider FROM invalid_auths WHERE reason='dirty-provider'`, want: "openai"},
+		{query: `SELECT provider FROM xai_account_states WHERE reason='dirty-provider'`, want: "grok"},
+	} {
+		var got string
+		if err := db.QueryRow(check.query).Scan(&got); err != nil {
+			t.Fatal(err)
 		}
+		if got != check.want {
+			t.Fatalf("foreign Provider after migration = %q, want %q", got, check.want)
+		}
+	}
+}
+
+func TestActiveQuarantineReferencesAreProviderScoped(t *testing.T) {
+	db := newProtectionTestDB(t)
+	now := time.Now().Unix()
+	foreign := legacyV0Fingerprint("foreign-provider-quarantine-reference")
+	codex := legacyV0Fingerprint("codex-provider-quarantine-reference")
+	xai := legacyV0Fingerprint("xai-provider-quarantine-reference")
+	if _, err := db.Exec(`
+INSERT INTO invalid_auths(auth_id,provider,reason,invalidated_at,active)
+VALUES(?, 'openai', 'foreign', ?, 1), (?, 'codex', 'codex', ?, 1);
+INSERT INTO xai_account_states(state_key,provider,state,reason,observed_at,active)
+VALUES(?, 'codex', 'unauthorized', 'wrong-table', ?, 1), (?, 'xai', 'unauthorized', 'xai', ?, 1);`,
+		foreign, now, codex, now, foreign, now, xai, now); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	foreignRefs, err := activeQuarantineReferences(context.Background(), tx, providerCodex, map[string]struct{}{foreign: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(foreignRefs) != 0 {
+		t.Fatalf("foreign/wrong-table rows kept Codex quarantine active: %+v", foreignRefs)
+	}
+	codexRefs, err := activeQuarantineReferences(context.Background(), tx, providerCodex, map[string]struct{}{codex: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := codexRefs[codex]; !ok || len(codexRefs) != 1 {
+		t.Fatalf("Codex quarantine references = %+v", codexRefs)
+	}
+	xaiRefs, err := activeQuarantineReferences(context.Background(), tx, providerXAI, map[string]struct{}{xai: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := xaiRefs[xai]; !ok || len(xaiRefs) != 1 {
+		t.Fatalf("xAI quarantine references = %+v", xaiRefs)
 	}
 }
 
@@ -1002,10 +1057,9 @@ func TestMalformedQuarantineMarkerAndMixedCandidatesRemainFailClosed(t *testing.
 			{ID: "codex-candidate", Provider: "codex"},
 		},
 	}
-	_, err = s.pickAuthOnce(context.Background(), req)
-	var reject *schedulerRejectError
-	if !errors.As(err, &reject) || reject.Code != "privacy_quarantine" {
-		t.Fatalf("mixed quarantine error = %#v / %v", reject, err)
+	resp, err := s.pickAuthOnce(context.Background(), req)
+	if err != nil || !resp.Handled || resp.AuthID != "xai-candidate" {
+		t.Fatalf("mixed quarantine response = %#v / %v, want healthy xAI candidate", resp, err)
 	}
 	var value string
 	if err := db.QueryRow(`SELECT value FROM store_state WHERE key='api_key_privacy_quarantine_codex'`).Scan(&value); err != nil {
@@ -1129,7 +1183,7 @@ func TestRestoringConfiguredKeyRekeysAndClearsV0Quarantine(t *testing.T) {
 		t.Fatalf("restored v0 identity = %q, want %q", authID, want)
 	}
 	candidate := schedulerAuthCandidate{ID: raw, Provider: "codex", Attributes: map[string]string{"api_key": raw}}
-	invalids, err := queryActiveInvalidAuths(context.Background(), db)
+	invalids, err := queryActiveInvalidAuths(context.Background(), db, providerCodex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1328,7 +1382,7 @@ func TestV2UnboundV1ConfiguredProofBindsAndHistoricalOnlyIsDiagnosed(t *testing.
 		if _, err := db.Exec(`PRAGMA user_version=2`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`INSERT INTO usage_events(requested_at,api_key) VALUES(1,?)`, stored); err != nil {
+		if _, err := db.Exec(`INSERT INTO usage_events(requested_at,provider,api_key) VALUES(1,'anthropic',?)`, stored); err != nil {
 			t.Fatal(err)
 		}
 		if err := initializeSQLiteStore(context.Background(), db, path); err != nil {
@@ -1485,7 +1539,7 @@ func TestV3IdentityMigrationUsesMultipleBatches(t *testing.T) {
 	}
 	for i := 0; i < identityMigrationBatchSize+37; i++ {
 		raw := fmt.Sprintf("opaque-provider-key-batch-%04d-SECRET", i)
-		if _, err := tx.Exec(`INSERT INTO usage_events(requested_at,api_key,auth_id,auth_index,source) VALUES(?,'',?,?,?)`, i+1, raw, "Bearer "+raw, raw); err != nil {
+		if _, err := tx.Exec(`INSERT INTO usage_events(requested_at,provider,api_key,auth_id,auth_index,source) VALUES(?,'codex','',?,?,?)`, i+1, raw, "Bearer "+raw, raw); err != nil {
 			_ = tx.Rollback()
 			t.Fatal(err)
 		}

@@ -1,0 +1,103 @@
+//go:build cgo && (linux || darwin)
+
+package pluginhost
+
+/*
+#cgo linux LDFLAGS: -ldl
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef void (*ctu_set_panic_point_fn)(uint32_t);
+typedef uint32_t (*ctu_get_panic_point_fn)(void);
+
+static void* ctu_panic_dlopen(const char* path) {
+	return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+
+static void* ctu_panic_dlsym(void* handle, const char* name) {
+	return dlsym(handle, name);
+}
+
+static const char* ctu_panic_dlerror(void) {
+	return dlerror();
+}
+
+static int ctu_panic_dlclose(void* handle) {
+	return dlclose(handle);
+}
+
+static void ctu_set_panic_point(void* fn, uint32_t point) {
+	((ctu_set_panic_point_fn)fn)(point);
+}
+
+static uint32_t ctu_get_panic_point(void* fn) {
+	return ((ctu_get_panic_point_fn)fn)();
+}
+*/
+import "C"
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+type compatABIPanicControl struct {
+	handle unsafe.Pointer
+	setter unsafe.Pointer
+	getter unsafe.Pointer
+}
+
+func openCompatABIPanicControl(path string) (*compatABIPanicControl, error) {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	handle := C.ctu_panic_dlopen(cPath)
+	if handle == nil {
+		return nil, fmt.Errorf("dlopen panic harness: %s", compatABIPanicDLError())
+	}
+	resolve := func(name string) unsafe.Pointer {
+		cName := C.CString(name)
+		defer C.free(unsafe.Pointer(cName))
+		return C.ctu_panic_dlsym(handle, cName)
+	}
+	setter := resolve("cliproxyTestSetPanicPoint")
+	getter := resolve("cliproxyTestGetPanicPoint")
+	if setter == nil || getter == nil {
+		_ = C.ctu_panic_dlclose(handle)
+		return nil, fmt.Errorf("panic harness control symbols are unavailable: %s", compatABIPanicDLError())
+	}
+	return &compatABIPanicControl{handle: handle, setter: setter, getter: getter}, nil
+}
+
+func (c *compatABIPanicControl) Set(point uint32) error {
+	if c == nil || c.handle == nil || c.setter == nil {
+		return fmt.Errorf("panic harness control is closed")
+	}
+	C.ctu_set_panic_point(c.setter, C.uint32_t(point))
+	return nil
+}
+
+func (c *compatABIPanicControl) Current() uint32 {
+	if c == nil || c.handle == nil || c.getter == nil {
+		return 0
+	}
+	return uint32(C.ctu_get_panic_point(c.getter))
+}
+
+func (c *compatABIPanicControl) Close() {
+	if c == nil || c.handle == nil {
+		return
+	}
+	_ = C.ctu_panic_dlclose(c.handle)
+	c.handle = nil
+	c.setter = nil
+	c.getter = nil
+}
+
+func compatABIPanicDLError() string {
+	value := C.ctu_panic_dlerror()
+	if value == nil {
+		return "unknown dynamic-loader error"
+	}
+	return C.GoString(value)
+}

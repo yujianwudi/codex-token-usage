@@ -4,11 +4,14 @@
 .editorconfig text eol=lf
 LICENSE text eol=lf
 *.go text eol=lf
+*.c text eol=lf
 go.mod text eol=lf
 go.sum text eol=lf
 *.md text eol=lf
 *.json text eol=lf
+*.lock text eol=lf
 *.txt text eol=lf
 *.sh text eol=lf
 *.yml text eol=lf
+testdata/fuzz/** text eol=lf
 *.yaml text eol=lf

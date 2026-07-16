@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,6 +77,88 @@ func TestXAITierClassificationMatchesGrokSignals(t *testing.T) {
 				t.Fatalf("tier=%q want %q (%+v)", got.Tier, test.want, got)
 			}
 		})
+	}
+}
+
+func TestXAITierClassificationDoesNotRetainRawSignalOrPath(t *testing.T) {
+	secret := "sk-proj-tier-canary-1234567890"
+	classification := classifyXAITierSignals([]xaiTierSignal{{
+		Path:  "root." + secret + ".note",
+		Value: "heavy " + secret,
+	}})
+	if classification.Tier != xaiTierHeavy {
+		t.Fatalf("classification=%+v, want heavy", classification)
+	}
+	encoded := fmt.Sprintf("%+v", classification)
+	if strings.Contains(encoded, secret) || classification.Source != "metadata.note" {
+		t.Fatalf("classification retained untrusted metadata: %+v", classification)
+	}
+}
+
+func TestXAITierSignalSecretDoesNotReachSummaryOrCache(t *testing.T) {
+	oldCaller := hostAuthCaller
+	oldSource := globalXAIAuthSource
+	t.Cleanup(func() { hostAuthCaller = oldCaller; globalXAIAuthSource = oldSource })
+	t.Setenv("CPA_AUTH_DIR", filepath.Join(t.TempDir(), "missing-auth"))
+	globalXAIAuthSource = &xaiAuthSourceManager{}
+	secret := "sk-proj-summary-tier-canary-1234567890"
+	listCalled := false
+	hostAuthCaller = func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case "host.auth.list":
+			listCalled = true
+			return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{
+				AuthIndex: "xai-secret-tier", Provider: "xai", Note: "heavy " + secret,
+			}}})
+		default:
+			return nil, os.ErrNotExist
+		}
+	}
+
+	s := newTestStore(t)
+	ctx := context.Background()
+	data, err := s.summary(ctx, "24h", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !listCalled {
+		t.Fatal("summary did not invoke host.auth.list")
+	}
+	accounts, ok := data["xai_accounts"].([]accountRow)
+	if !ok {
+		t.Fatalf("summary xai_accounts type=%T", data["xai_accounts"])
+	}
+	foundHeavy := false
+	for _, account := range accounts {
+		if account.AuthIndex == "xai-secret-tier" && account.XAITier == xaiTierHeavy && account.XAITierDetail == xaiTierDetail(xaiTierHeavy) {
+			foundHeavy = true
+			break
+		}
+	}
+	if !foundHeavy {
+		t.Fatalf("summary accounts do not contain sanitized heavy xAI tier: %+v", accounts)
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), secret) {
+		t.Fatalf("summary retained xAI tier signal secret: %s", payload)
+	}
+	key := normalizeSummaryCacheKey(summaryCacheKey{Window: "24h", Limit: 50})
+	if err := s.saveSummaryCacheEntry(ctx, key, summaryCacheEntry{data: data, cachedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	db, _, err := s.open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cached string
+	if err := db.QueryRowContext(ctx, `SELECT data_json FROM summary_cache WHERE cache_key=?`, summaryCacheStorageKey(key)).Scan(&cached); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cached, secret) {
+		t.Fatalf("summary cache retained xAI tier signal secret: %s", cached)
 	}
 }
 
@@ -255,6 +338,29 @@ func TestXAIHostAuthSourceStaleFallbackCannotOverrideNewHostSuccess(t *testing.T
 	}
 	if len(merged) != 1 || merged[0].AuthID != "fresh" {
 		t.Fatalf("stale fallback reintroduced file-only rows: %+v", merged)
+	}
+}
+
+func TestXAIHostAuthSourceFallbackReportsHostCallbackFailure(t *testing.T) {
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	m := &xaiAuthSourceManager{
+		callbackErr: errXAIHostAuthListInvalid,
+		hostSnapshot: []configuredAccount{{
+			AuthID: "host", AuthIndex: "host.json", AuthFile: "host.json", Provider: providerXAI,
+		}},
+		diagnostics: xaiAuthSourceDiagnostics{LastSuccessAt: "2026-07-16T00:00:00Z"},
+	}
+
+	merged := m.markFilesystemFallback(nil, nil)
+	if len(merged) != 1 || merged[0].AuthID != "host" {
+		t.Fatalf("fallback accounts=%+v, want retained host snapshot", merged)
+	}
+	status := m.status()
+	if status.HostStatus != "invalid_response" {
+		t.Fatalf("fallback host status=%q, want invalid_response", status.HostStatus)
+	}
+	if !strings.Contains(status.LastError, "host_invalid_response") {
+		t.Fatalf("fallback last error=%q, want host callback diagnostic", status.LastError)
 	}
 }
 

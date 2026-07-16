@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,6 +18,25 @@ func benchmarkSchedulerCandidates(count int) []schedulerAuthCandidate {
 			ID:         id,
 			Provider:   "codex",
 			Priority:   1,
+			Attributes: map[string]string{"auth_index": id, "source": id},
+		}
+	}
+	return candidates
+}
+
+func benchmarkMixedSchedulerCandidates(count int) []schedulerAuthCandidate {
+	candidates := make([]schedulerAuthCandidate, count)
+	for i := range candidates {
+		provider := providerCodex
+		if i%2 == 1 {
+			provider = providerXAI
+		}
+		id := fmt.Sprintf("%s-account-%04d", provider, i)
+		candidates[i] = schedulerAuthCandidate{
+			ID:         id,
+			Provider:   provider,
+			Priority:   1,
+			Status:     "active",
 			Attributes: map[string]string{"auth_index": id, "source": id},
 		}
 	}
@@ -96,6 +116,44 @@ func BenchmarkSchedulerHealthyFastPath100Accounts(b *testing.B) {
 	}
 }
 
+func BenchmarkSchedulerHealthyPersistentRevision100Accounts(b *testing.B) {
+	dir := b.TempDir()
+	b.Setenv("CPA_TOKEN_USAGE_DIR", dir)
+	b.Setenv("CPA_AUTH_DIR", filepath.Join(dir, "auth"))
+	b.Setenv("CPA_CONFIG_PATH", filepath.Join(dir, "missing-config.yaml"))
+	previousStore := globalStore
+	previousCfg := globalAccountProtection.config()
+	resetSchedulerStateForTest()
+	globalSchedulerRotation.reset()
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = false
+	globalAccountProtection.configure(cfg)
+	s := &store{}
+	globalStore = s
+	b.Cleanup(func() {
+		s.close()
+		globalStore = previousStore
+		globalAccountProtection.configure(previousCfg)
+		globalSchedulerRotation.reset()
+		resetSchedulerStateForTest()
+	})
+	if _, _, err := s.open(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if !globalSchedulerState.publishCodexIfGeneration(globalSchedulerState.providerGeneration(providerCodex), newCodexSchedulerSnapshot(nil, nil, now)) {
+		b.Fatal("failed to publish Codex benchmark snapshot")
+	}
+	req := schedulerPickRequest{Provider: providerCodex, Providers: []string{providerCodex}, Model: "gpt-5.5", Candidates: benchmarkSchedulerCandidates(100)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := s.pickAuthOnce(context.Background(), req); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkSchedulerRestrictedSnapshot100Accounts(b *testing.B) {
 	dir := b.TempDir()
 	b.Setenv("CPA_TOKEN_USAGE_DIR", dir)
@@ -147,6 +205,75 @@ func BenchmarkSchedulerRestrictedSnapshot100Accounts(b *testing.B) {
 	}
 }
 
+func BenchmarkSchedulerMixedFiltering100Accounts(b *testing.B) {
+	previousStore := globalStore
+	previousCfg := globalAccountProtection.config()
+	resetSchedulerStateForTest()
+	globalSchedulerRotation.reset()
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = false
+	globalAccountProtection.configure(cfg)
+	s := &store{}
+	globalStore = s
+	b.Cleanup(func() {
+		s.close()
+		globalStore = previousStore
+		globalAccountProtection.configure(previousCfg)
+		globalSchedulerRotation.reset()
+		resetSchedulerStateForTest()
+	})
+	now := time.Now().Unix()
+	blocked := autobanRow{AuthID: "codex-account-0000", AuthIndex: "codex-account-0000", Provider: providerCodex, Active: true, ResetAt: now + 3600}
+	if !globalSchedulerState.publishCodexIfGeneration(globalSchedulerState.providerGeneration(providerCodex), newCodexSchedulerSnapshot([]autobanRow{blocked}, nil, now)) {
+		b.Fatal("failed to publish Codex benchmark snapshot")
+	}
+	if !globalSchedulerState.publishXAIIfGeneration(globalSchedulerState.providerGeneration(providerXAI), newXAISchedulerSnapshot(nil, now)) {
+		b.Fatal("failed to publish xAI benchmark snapshot")
+	}
+	req := schedulerPickRequest{Provider: "mixed", Providers: []string{providerCodex, providerXAI}, Model: "shared-model", Candidates: benchmarkMixedSchedulerCandidates(100)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := s.pickAuthOnce(context.Background(), req)
+		if err != nil || !resp.Handled || resp.AuthID == blocked.AuthID {
+			b.Fatalf("response=%+v err=%v", resp, err)
+		}
+	}
+}
+
+func BenchmarkSchedulerProviderQuarantineFiltering100Accounts(b *testing.B) {
+	previousStore := globalStore
+	previousCfg := globalAccountProtection.config()
+	resetSchedulerStateForTest()
+	globalSchedulerRotation.reset()
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = false
+	globalAccountProtection.configure(cfg)
+	s := &store{}
+	s.setAPIKeyPrivacyQuarantineSnapshot("", map[string]string{providerCodex: "legacy identity requires recovery"})
+	globalStore = s
+	b.Cleanup(func() {
+		s.close()
+		globalStore = previousStore
+		globalAccountProtection.configure(previousCfg)
+		globalSchedulerRotation.reset()
+		resetSchedulerStateForTest()
+	})
+	now := time.Now().Unix()
+	if !globalSchedulerState.publishXAIIfGeneration(globalSchedulerState.providerGeneration(providerXAI), newXAISchedulerSnapshot(nil, now)) {
+		b.Fatal("failed to publish xAI benchmark snapshot")
+	}
+	req := schedulerPickRequest{Provider: "mixed", Providers: []string{providerCodex, providerXAI}, Model: "shared-model", Candidates: benchmarkMixedSchedulerCandidates(100)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := s.pickAuthOnce(context.Background(), req)
+		if err != nil || !resp.Handled || !strings.HasPrefix(resp.AuthID, providerXAI+"-") {
+			b.Fatalf("response=%+v err=%v", resp, err)
+		}
+	}
+}
+
 func BenchmarkProtectedPick100Accounts50kEvents(b *testing.B) {
 	dir := b.TempDir()
 	authDir := filepath.Join(dir, "auth")
@@ -159,14 +286,20 @@ func BenchmarkProtectedPick100Accounts50kEvents(b *testing.B) {
 	previousCfg := globalAccountProtection.config()
 	globalSchedulerRotation.reset()
 	b.Cleanup(func() {
-		s.close()
 		globalAccountProtection.configure(previousCfg)
+		s.close()
 		globalSchedulerRotation.reset()
 	})
 	db, _, err := s.open(context.Background())
 	if err != nil {
 		b.Fatal(err)
 	}
+	cfg := defaultPluginConfig()
+	cfg.AccountProtectionEnabled = true
+	// Reservations are part of the measured write path, but this benchmark is
+	// intended to run indefinitely without turning its own samples into an
+	// artificial hard-limit saturation test.
+	cfg.AccountProtectionReservationTTLSeconds = 0
 	candidates := benchmarkSchedulerCandidates(100)
 	tx, err := db.Begin()
 	if err != nil {
@@ -179,9 +312,16 @@ func BenchmarkProtectedPick100Accounts50kEvents(b *testing.B) {
 		b.Fatal(err)
 	}
 	now := time.Now().Unix()
+	eventAgeSpan := int64(cfg.AccountProtectionTokenWindowSeconds / 2)
+	if eventAgeSpan < 1 {
+		eventAgeSpan = 1
+	}
 	for i := 0; i < 50_000; i++ {
 		account := candidates[i%len(candidates)].ID
-		if _, err := stmt.Exec(now-int64(i%300), account, account, account, 1000); err != nil {
+		// Keep every fixture well inside the configured token window. Events on
+		// the exact lower boundary become nondeterministic if wall-clock seconds
+		// advance while the 50k rows are inserted and the async cache is warmed.
+		if _, err := stmt.Exec(now-int64(i)%eventAgeSpan, account, account, account, 1000); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -191,13 +331,29 @@ func BenchmarkProtectedPick100Accounts50kEvents(b *testing.B) {
 	if err := tx.Commit(); err != nil {
 		b.Fatal(err)
 	}
-	cfg := defaultPluginConfig()
-	cfg.AccountProtectionEnabled = true
-	// Reservations are part of the measured write path, but this benchmark is
-	// intended to run indefinitely without turning its own samples into an
-	// artificial hard-limit saturation test.
-	cfg.AccountProtectionReservationTTLSeconds = 0
 	globalAccountProtection.configure(cfg)
+	usageSince := now - int64(cfg.AccountProtectionTokenWindowSeconds)
+	if _, err := globalAccountProtection.loadUsageIndex(context.Background(), db, usageSince); err != nil {
+		b.Fatal(err)
+	}
+	usageDeadline := time.Now().Add(10 * time.Second)
+	for {
+		usage, fresh, _ := globalAccountProtection.cachedUsageIndex(db, usageSince, time.Now())
+		if fresh && usage != nil && len(usage.samples) == len(candidates) {
+			var tokens int64
+			for _, sample := range usage.samples {
+				tokens += sample.Tokens
+			}
+			if tokens != 50_000*1000 {
+				b.Fatalf("warmed usage index tokens=%d, want %d", tokens, 50_000*1000)
+			}
+			break
+		}
+		if time.Now().After(usageDeadline) {
+			b.Fatal("background 50k-event usage index did not become ready before benchmark timing")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

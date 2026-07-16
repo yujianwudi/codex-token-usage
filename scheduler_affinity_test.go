@@ -135,6 +135,35 @@ func TestProtectionAffinityPreservesSessionUntilHardLimit(t *testing.T) {
 	}
 }
 
+func TestSchedulerAffinityCannotPinLowerPriorityCandidate(t *testing.T) {
+	resetSchedulerSelectionState(t)
+	request := affinityTestRequest("priority-session")
+	affinityKey := schedulerAffinityKey(request, "codex")
+	low := protectionTestCandidate("low", "free", 1)
+	high := protectionTestCandidate("high", "free", 10)
+	globalSchedulerAffinity.bind(affinityKey, schedulerCandidateRotationIdentity(low))
+	got := pickSchedulerCandidate(schedulerRotationKey(request, "codex"), affinityKey, []schedulerAuthCandidate{low, high})
+	if got.ID != "high" {
+		t.Fatalf("affinity selected %q, want highest-priority candidate high", got.ID)
+	}
+}
+
+func TestProtectionAffinityCannotPinLowerPriorityCandidate(t *testing.T) {
+	resetSchedulerSelectionState(t)
+	request := affinityTestRequest("protected-priority-session")
+	affinityKey := schedulerAffinityKey(request, "codex")
+	low := protectionCandidate{Candidate: protectionTestCandidate("low", "free", 1), Limit: 2}
+	high := protectionCandidate{Candidate: protectionTestCandidate("high", "free", 10), Limit: 2}
+	globalSchedulerAffinity.bind(affinityKey, schedulerCandidateRotationIdentity(low.Candidate))
+	got, err := chooseProtectedCandidate([]protectionCandidate{low, high}, schedulerRotationKey(request, "codex"), affinityKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Candidate.ID != "high" {
+		t.Fatalf("protected affinity selected %q, want highest-priority candidate high", got.Candidate.ID)
+	}
+}
+
 func TestPickAuthOnceSessionAffinityHonorsProtectionHardLimit(t *testing.T) {
 	resetSchedulerSelectionState(t)
 	t.Setenv("CPA_AUTH_DIR", t.TempDir())

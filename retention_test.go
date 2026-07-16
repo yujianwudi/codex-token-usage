@@ -12,12 +12,12 @@ func TestExecDeleteBatchesDeletesAllMatchingRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 7; i++ {
-		if _, err := db.Exec(`INSERT INTO usage_events (requested_at) VALUES (1)`); err != nil {
+		if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider) VALUES (1, 'codex')`); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for i := 0; i < 2; i++ {
-		if _, err := db.Exec(`INSERT INTO usage_events (requested_at) VALUES (100)`); err != nil {
+		if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider) VALUES (100, 'codex')`); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -48,7 +48,7 @@ func TestExecDeleteBatchesLimitedYieldsWithBacklog(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 10; i++ {
-		if _, err := db.Exec(`INSERT INTO usage_events (requested_at) VALUES (1)`); err != nil {
+		if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider) VALUES (1, 'codex')`); err != nil {
 			t.Fatal(err)
 		}
 	}

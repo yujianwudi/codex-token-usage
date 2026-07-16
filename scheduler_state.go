@@ -456,15 +456,15 @@ func (c *schedulerStateCache) applyRefresh(
 func (c *schedulerStateCache) refresh(ctx context.Context, db *sql.DB) error {
 	generation := c.beginRefresh()
 	now := time.Now().Unix()
-	bans, err := queryActiveAutobans(ctx, db, now)
+	bans, err := queryActiveAutobans(ctx, db, providerCodex, now)
 	if err != nil {
 		return err
 	}
-	invalids, err := queryActiveInvalidAuths(ctx, db)
+	invalids, err := queryActiveInvalidAuths(ctx, db, providerCodex)
 	if err != nil {
 		return err
 	}
-	states, err := queryActiveXAIStates(ctx, db, now)
+	states, err := queryActiveXAIStates(ctx, db, providerXAI, now)
 	if err != nil {
 		return err
 	}

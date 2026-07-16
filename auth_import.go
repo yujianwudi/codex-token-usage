@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -16,6 +17,11 @@ import (
 const (
 	maxAuthImportTextBytes    = 8 << 20
 	maxAuthImportRequestBytes = 24 << 20
+)
+
+var (
+	errAuthImportHostUnavailable = errors.New("host auth service unavailable")
+	errAuthImportHostInvalid     = errors.New("host auth service returned an invalid response")
 )
 
 type authImportRequest struct {
@@ -56,7 +62,7 @@ func handleAuthImportPreviewContext(ctx context.Context, raw []byte) managementR
 	}
 	result, err := previewAuthImportContext(ctx, request.Text)
 	if err != nil {
-		return jsonResponse(httpStatusForAuthImportError(err), map[string]any{"error": "auth_import_preview_failed", "message": err.Error()})
+		return jsonResponse(httpStatusForAuthImportError(err), map[string]any{"error": "auth_import_preview_failed", "message": publicAuthImportError(err)})
 	}
 	return jsonResponse(200, result)
 }
@@ -72,7 +78,7 @@ func handleAuthImportCommitContext(ctx context.Context, raw []byte) managementRe
 	}
 	result, err := commitAuthImportContext(ctx, request.Text, request.Overwrite)
 	if err != nil {
-		return jsonResponse(httpStatusForAuthImportError(err), map[string]any{"error": "auth_import_failed", "message": err.Error()})
+		return jsonResponse(httpStatusForAuthImportError(err), map[string]any{"error": "auth_import_failed", "message": publicAuthImportError(err)})
 	}
 	return jsonResponse(200, result)
 }
@@ -88,7 +94,7 @@ func decodeAuthImportRequest(raw []byte) (authImportRequest, *managementResponse
 		return request, &response
 	}
 	if err := json.Unmarshal(raw, &request); err != nil {
-		response := jsonResponse(400, map[string]any{"error": "bad_request", "message": err.Error()})
+		response := jsonResponse(400, map[string]any{"error": "bad_request", "message": "request body must be valid JSON"})
 		return request, &response
 	}
 	request.Text = strings.TrimSpace(request.Text)
@@ -107,11 +113,20 @@ func httpStatusForAuthImportError(err error) int {
 	if err == nil {
 		return 200
 	}
-	text := strings.ToLower(err.Error())
-	if strings.Contains(text, "host callback") || strings.Contains(text, "host.auth") {
+	if errors.Is(err, errAuthImportHostUnavailable) || errors.Is(err, errAuthImportHostInvalid) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return 503
 	}
 	return 400
+}
+
+func publicAuthImportError(err error) string {
+	if errors.Is(err, errAuthImportHostUnavailable) || errors.Is(err, errAuthImportHostInvalid) {
+		return "host auth service is temporarily unavailable"
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "auth import request was cancelled or timed out"
+	}
+	return "auth import request could not be processed"
 }
 
 func previewAuthImport(text string) (authImportResult, error) {
@@ -176,7 +191,7 @@ func commitAuthImportContext(ctx context.Context, text string, overwrite bool) (
 		_, err = hostAuthCaller("host.auth.save", map[string]any{"name": item.FileName, "json": json.RawMessage(rawJSON)})
 		if err != nil {
 			result.Failed++
-			result.Errors = append(result.Errors, fmt.Sprintf("%s: %s", item.FileName, sanitizeTriggerError(err)))
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: host save failed", item.FileName))
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -200,14 +215,14 @@ func existingHostAuthFileNamesContext(ctx context.Context) (map[string]struct{},
 	// interrupted once entered, so cancellation is enforced at its boundaries.
 	raw, err := hostAuthCaller("host.auth.list", map[string]any{})
 	if err != nil {
-		return nil, err
+		return nil, errAuthImportHostUnavailable
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	var response hostAuthListResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return nil, fmt.Errorf("decode host.auth.list result: %w", err)
+		return nil, errAuthImportHostInvalid
 	}
 	out := make(map[string]struct{}, len(response.Files))
 	for _, entry := range response.Files {

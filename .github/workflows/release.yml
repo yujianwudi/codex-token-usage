@@ -1,31 +1,26 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
       version:
-        description: "SemVer to build, with or without the v prefix"
+        description: "Stable SemVer from an unmerged candidate branch, with or without the v prefix"
         required: true
         type: string
-      publish_prerelease:
-        description: "Publish a prerelease tag from this exact commit"
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event_name == 'push' && github.ref_name || (startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version)) }}
+  group: release-${{ startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version) }}
   cancel-in-progress: false
 
 env:
   GO_VERSION: "1.26.5"
   GOVULNCHECK_VERSION: "v1.6.0"
+  ACTIONLINT_VERSION: "v1.7.7"
+  SHELLCHECK_VERSION: "v0.11.0"
+  SHELLCHECK_LINUX_X86_64_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
   PLUGIN_REPOSITORY: https://github.com/yujianwudi/codex-token-usage
 
 jobs:
@@ -36,8 +31,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
-      publish: ${{ steps.version.outputs.publish }}
-      prerelease: ${{ steps.version.outputs.prerelease }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
       - name: Check out release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -45,73 +39,63 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate version, source, and immutable tag event
+      - name: Validate version, source, and unused release tag
         id: version
         shell: bash
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
-          PUBLISH_PRERELEASE: ${{ inputs.publish_prerelease }}
-          TAG_CREATED: ${{ github.event.created }}
-          TAG_FORCED: ${{ github.event.forced }}
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            if [[ "${TAG_CREATED}" != "true" || "${TAG_FORCED}" == "true" ]]; then
-              echo "Release tags are immutable; tag updates and force-pushes are rejected" >&2
-              exit 1
-            fi
-            release_ref="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" != refs/heads/* ]]; then
+            echo "Release candidates must be dispatched from a branch" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            echo "Release candidates must be dispatched from an unmerged candidate branch" >&2
+            exit 1
+          fi
 
-            git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
-            if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
-              echo "Stable release tags must point to a commit contained in origin/main" >&2
-              exit 1
-            fi
-          else
-            requested="${REQUESTED_VERSION#v}"
-            if [[ -z "${requested}" ]]; then
-              echo "Manual release validation requires an explicit version" >&2
-              exit 1
-            fi
-            release_ref="v${requested}"
+          requested="${REQUESTED_VERSION#v}"
+          if [[ -z "${requested}" ]]; then
+            echo "Manual release validation requires an explicit version" >&2
+            exit 1
+          fi
+          release_ref="v${requested}"
+
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          source_commit="$(git rev-parse HEAD)"
+          main_commit="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "${source_commit}" == "${main_commit}" ]]; then
+            echo "Release candidate commit is already on origin/main; independent acceptance must happen before promotion" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${main_commit}" "${source_commit}"; then
+            echo "Candidate commit must be a fast-forward descendant of the current origin/main" >&2
+            exit 1
           fi
 
           version="$(bash scripts/resolve-release-version.sh "${release_ref}")"
           tag="v${version}"
-          version_without_build="${version%%+*}"
-          prerelease=false
-          if [[ "${version_without_build}" == *-* ]]; then
-            prerelease=true
+          if [[ "${version}" == *[-+]* ]]; then
+            echo "Stable publication requires a plain MAJOR.MINOR.PATCH version without prerelease or build metadata" >&2
+            exit 1
           fi
 
-          publish=false
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            publish=true
-            remote_refs="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}")"
-            remote_commit="$(awk '$2 ~ /\^\{\}$/ { print $1; found=1 } END { if (!found && NR > 0) print first } NR == 1 { first=$1 }' <<< "${remote_refs}" | tail -n 1)"
-            if [[ -z "${remote_commit}" || "${remote_commit}" != "$(git rev-parse HEAD)" ]]; then
-              echo "Remote tag ${tag} no longer resolves to the workflow commit" >&2
-              exit 1
-            fi
-          elif [[ "${PUBLISH_PRERELEASE}" == "true" ]]; then
-            if [[ "${prerelease}" != "true" ]]; then
-              echo "Manual publishing is restricted to prerelease SemVer versions" >&2
-              exit 1
-            fi
-            publish=true
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}")" ]]; then
+            echo "Release tag ${tag} already exists; dispatch a new version" >&2
+            exit 1
           fi
 
           {
             echo "version=${version}"
             echo "tag=${tag}"
-            echo "publish=${publish}"
-            echo "prerelease=${prerelease}"
+            echo "commit=${source_commit}"
           } >> "${GITHUB_OUTPUT}"
 
   source-security:
     name: Source security gate
     needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - name: Check out release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -124,22 +108,123 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Verify module and release compliance
+      - name: Install pinned ShellCheck
+        shell: bash
+        run: |
+          archive="${RUNNER_TEMP}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl --fail --location --silent --show-error \
+            --retry 3 --retry-all-errors \
+            --output "${archive}" \
+            "${url}"
+          printf '%s  %s\n' "${SHELLCHECK_LINUX_X86_64_SHA256}" "${archive}" | sha256sum -c -
+          tar -xJf "${archive}" -C "${RUNNER_TEMP}"
+          shellcheck_dir="${RUNNER_TEMP}/shellcheck-${SHELLCHECK_VERSION}"
+          test -x "${shellcheck_dir}/shellcheck"
+          echo "${shellcheck_dir}" >> "${GITHUB_PATH}"
+
+      - name: Verify module, scripts, and release compliance
         shell: bash
         run: |
           go mod download
           go mod verify
           go mod tidy -diff
+          bash -n build.sh
+          bash -n package-release.sh
+          for script in scripts/*.sh; do
+            bash -n "${script}"
+          done
           bash scripts/check-third-party-notices.sh
           bash scripts/check-version-consistency.sh
+          bash scripts/test-semver.sh
+          bash scripts/test-check-benchmark-budget.sh
+          bash scripts/test-cpa-compat-lock.sh
+          bash scripts/test-release-acceptance-gate.sh
+          bash scripts/test-check-macho.sh
+          bash scripts/test-select-previous-release-tag.sh
+          bash scripts/test-verify-release-assets.sh
+
+      - name: Lint Go, shell, and workflows
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "Go files require gofmt:" >&2
+            echo "${unformatted}" >&2
+            exit 1
+          fi
+          shellcheck -x build.sh package-release.sh scripts/*.sh
+          go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}" \
+            -shellcheck="$(command -v shellcheck)" \
+            .github/workflows/*.yml
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Benchmark scheduler performance budgets
+        id: scheduler_benchmarks
+        shell: bash
+        run: |
+          set -o pipefail
+          results="${RUNNER_TEMP}/release-scheduler-benchmarks.txt"
+          go test -run '^$' -bench '^Benchmark' -benchmem -benchtime=500ms -count=3 . | tee "${results}"
+          bash scripts/check-benchmark-budget.sh "${results}"
+
+      - name: Upload release scheduler benchmark evidence
+        if: ${{ always() && steps.scheduler_benchmarks.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-scheduler-benchmarks-${{ needs.validate.outputs.commit }}
+          path: ${{ runner.temp }}/release-scheduler-benchmarks.txt
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Source vulnerability scan
         shell: bash
         run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" -mode=source ./...
 
-      - name: Verify pinned latest CLIProxyAPI compatibility
+      - name: Fuzz Provider canonicalization and identity aliases
+        run: >-
+          go test -run '^$'
+          -fuzz '^FuzzCanonicalProviderAndAliases$'
+          -fuzztime=10s -parallel=4 -timeout=2m .
+
+      - name: Fuzz mixed scheduler filtering
+        run: >-
+          go test -run '^$'
+          -fuzz '^FuzzMixedSchedulerFiltering$'
+          -fuzztime=15s -parallel=4 -timeout=2m .
+
+      - name: Fuzz SQLite v6 migration fixtures
+        run: >-
+          go test -run '^$'
+          -fuzz '^FuzzSQLiteV6MigrationFixture$'
+          -fuzztime=20s -parallel=2 -timeout=3m .
+
+      - name: Verify cross-process reservation atomicity
+        env:
+          CPA_MULTIPROCESS_STRESS: "1"
+        run: >-
+          go test -count=1 -v
+          -run '^(TestAccountProtectionMultiprocessHardLimit|TestReservationWriterCrashRecovery|TestReservationWriterLockFailsClosedWithinSchedulerBudget)$'
+          ./...
+
+      - name: Verify native C ABI panic boundary and release-hook absence
         shell: bash
+        run: bash scripts/test-abi-panic-boundary.sh
+
+      - name: Verify latest published CLIProxyAPI compatibility
+        shell: bash
+        env:
+          CPA_COMPAT_CHANNEL: latest-release
+          CPA_COMPAT_GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/check-cpa-compat.sh
+
+      - name: Race test
+        run: go test -race -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
 
   build-linux:
     name: Build linux ${{ matrix.goarch }}
@@ -216,7 +301,7 @@ jobs:
           cache: true
 
       - name: Test
-        run: go test ./...
+        run: go test -count=1 ./...
 
       - name: Package
         shell: bash
@@ -246,7 +331,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cpa-plugin-linux-${{ matrix.goarch }}
+          name: cpa-plugin-build-linux-${{ matrix.goarch }}
           path: |
             dist/*.zip
             dist/*.spdx.json
@@ -323,7 +408,7 @@ jobs:
         run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Test
-        run: go test ./...
+        run: go test -count=1 ./...
 
       - name: Package
         shell: bash
@@ -354,7 +439,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cpa-plugin-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: cpa-plugin-build-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
             dist/*.zip
             dist/*.spdx.json
@@ -369,6 +454,8 @@ jobs:
       - build-other
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      bundle_digest: ${{ steps.bundle.outputs.bundle_digest }}
     steps:
       - name: Check out release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -378,12 +465,36 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: cpa-plugin-build-*
           path: release-assets
           merge-multiple: true
 
       - name: Verify release assets and generate checksums
+        id: bundle
         shell: bash
-        run: bash scripts/verify-release-assets.sh "${{ needs.validate.outputs.version }}" release-assets
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          bash scripts/verify-release-assets.sh "${RELEASE_VERSION}" release-assets
+          bundle_digest="$(sha256sum release-assets/checksums.txt | awk '{print tolower($1)}')"
+          if [[ ! "${bundle_digest}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Failed to calculate the candidate bundle digest" >&2
+            exit 1
+          fi
+          acceptance="${RELEASE_TAG}@${RELEASE_COMMIT}@${bundle_digest}"
+          echo "bundle_digest=${bundle_digest}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## Release candidate ready for independent acceptance"
+            echo
+            echo "- Artifact: \`cpa-plugin-release-${RELEASE_VERSION}\`"
+            echo "- Source commit: \`${RELEASE_COMMIT}\`"
+            echo "- Bundle digest (SHA-256 of \`checksums.txt\`): \`${bundle_digest}\`"
+            echo "- Required authorization: \`${acceptance}\`"
+            echo
+            echo "The publish job uses the \`independent-release\` Environment and cannot create the annotated tag until that exact authorization is configured and approved."
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload verified release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -391,7 +502,7 @@ jobs:
           name: cpa-plugin-release-${{ needs.validate.outputs.version }}
           path: release-assets/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
   release:
     name: Publish GitHub Release
@@ -399,8 +510,9 @@ jobs:
       - validate
       - verify-assets
     runs-on: ubuntu-latest
+    environment:
+      name: independent-release
     timeout-minutes: 20
-    if: needs.validate.outputs.publish == 'true'
     concurrency:
       group: publish-${{ needs.validate.outputs.tag }}
       cancel-in-progress: false
@@ -416,6 +528,7 @@ jobs:
           # of the tagged commit. A depth-1 checkout marks the tag commit as a
           # shallow boundary, which makes that valid ancestry check fail.
           fetch-depth: 0
+          ref: ${{ needs.validate.outputs.commit }}
           persist-credentials: false
 
       - name: Download verified release bundle
@@ -424,11 +537,88 @@ jobs:
           name: cpa-plugin-release-${{ needs.validate.outputs.version }}
           path: release-assets
 
-      - name: Refuse tag or release replacement
+      - name: Verify the accepted candidate bundle is unchanged
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          EXPECTED_BUNDLE_DIGEST: ${{ needs.verify-assets.outputs.bundle_digest }}
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "${RELEASE_COMMIT}" ]]; then
+            echo "Publish checkout does not match the candidate source commit" >&2
+            exit 1
+          fi
+          if [[ ! "${EXPECTED_BUNDLE_DIGEST}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Candidate job did not provide a canonical bundle digest" >&2
+            exit 1
+          fi
+          expected_files="${RUNNER_TEMP}/expected-release-files.txt"
+          actual_files="${RUNNER_TEMP}/actual-release-files.txt"
+          awk '{print $2}' release-assets/checksums.txt | LC_ALL=C sort > "${expected_files}"
+          echo checksums.txt >> "${expected_files}"
+          LC_ALL=C sort -o "${expected_files}" "${expected_files}"
+          find release-assets -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "${actual_files}"
+          if ! diff -u "${expected_files}" "${actual_files}"; then
+            echo "Downloaded candidate does not contain the exact finalized 11-file release bundle" >&2
+            exit 1
+          fi
+          while IFS= read -r file; do
+            if [[ -L "release-assets/${file}" || ! -f "release-assets/${file}" ]]; then
+              echo "Candidate bundle entry is not a top-level regular file: ${file}" >&2
+              exit 1
+            fi
+          done < "${expected_files}"
+          actual_bundle_digest="$(sha256sum release-assets/checksums.txt | awk '{print tolower($1)}')"
+          if [[ "${actual_bundle_digest}" != "${EXPECTED_BUNDLE_DIGEST}" ]]; then
+            echo "Downloaded candidate bundle digest changed: expected=${EXPECTED_BUNDLE_DIGEST} actual=${actual_bundle_digest}" >&2
+            exit 1
+          fi
+          (
+            cd release-assets
+            sha256sum --check --strict checksums.txt
+          )
+
+      - name: Require exact-SHA promotion to main
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          main_commit="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "${main_commit}" != "${RELEASE_COMMIT}" ]]; then
+            echo "Accepted candidate must be promoted to origin/main without merge, squash, or rebase SHA changes" >&2
+            echo "accepted=${RELEASE_COMMIT} origin/main=${main_commit}" >&2
+            exit 1
+          fi
+
+      - name: Verify independent second-machine acceptance authorization
+        shell: bash
+        env:
+          CPA_INDEPENDENT_ACCEPTED_RELEASES: ${{ vars.CPA_INDEPENDENT_ACCEPTED_RELEASES }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          RELEASE_BUNDLE_DIGEST: ${{ needs.verify-assets.outputs.bundle_digest }}
+        run: |
+          bash scripts/check-release-acceptance.sh \
+            "${RELEASE_TAG}" \
+            "${RELEASE_COMMIT}" \
+            "${RELEASE_BUNDLE_DIGEST}"
+
+      - name: Revalidate latest published CLIProxyAPI target
+        shell: bash
+        env:
+          CPA_COMPAT_CHANNEL: latest-release
+          CPA_COMPAT_GITHUB_TOKEN: ${{ github.token }}
+          CPA_COMPAT_VALIDATE_ONLY: "true"
+        run: bash scripts/check-cpa-compat.sh
+
+      - name: Inspect resumable publication state
+        id: publication_state
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          RELEASE_BUNDLE_DIGEST: ${{ needs.verify-assets.outputs.bundle_digest }}
         run: |
           github_api_status() {
             local endpoint="$1"
@@ -445,11 +635,60 @@ jobs:
             printf '%s\n' "${status}"
           }
 
+          expected_tag_message="$(printf '%s\n\nSource commit: %s\nCandidate bundle digest: %s\nWorkflow run: %s/%s/actions/runs/%s\n' \
+            "Release ${RELEASE_TAG}" \
+            "${RELEASE_COMMIT}" \
+            "${RELEASE_BUNDLE_DIGEST}" \
+            "${GITHUB_SERVER_URL}" \
+            "${GITHUB_REPOSITORY}" \
+            "${GITHUB_RUN_ID}")"
+          tag_exists=false
+          tag_status="$(github_api_status "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          case "${tag_status}" in
+            200)
+              tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '[.object.type, .object.sha] | @tsv')"
+              IFS=$'\t' read -r object_type tag_object_sha <<< "${tag_ref}"
+              if [[ "${object_type}" != "tag" || ! "${tag_object_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "Existing ${RELEASE_TAG} ref is not an annotated tag" >&2
+                exit 1
+              fi
+              tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}")"
+              if [[ "$(jq -r .tag <<< "${tag_json}")" != "${RELEASE_TAG}" || \
+                    "$(jq -r .message <<< "${tag_json}")" != "${expected_tag_message}" || \
+                    "$(jq -r .object.type <<< "${tag_json}")" != "commit" || \
+                    "$(jq -r .object.sha <<< "${tag_json}")" != "${RELEASE_COMMIT}" ]]; then
+                echo "Existing annotated tag does not match this run's accepted commit and bundle digest" >&2
+                exit 1
+              fi
+              tag_exists=true
+              ;;
+            404) ;;
+            *)
+              echo "Cannot safely determine whether tag ${RELEASE_TAG} exists (HTTP ${tag_status})" >&2
+              exit 1
+              ;;
+          esac
+
+          release_state=none
           release_status="$(github_api_status "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
           case "${release_status}" in
             200)
-              echo "Release ${RELEASE_TAG} already exists; published releases are immutable" >&2
-              exit 1
+              release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+              if [[ "$(jq -r .tag_name <<< "${release_json}")" != "${RELEASE_TAG}" || \
+                    "$(jq -r .name <<< "${release_json}")" != "${RELEASE_TAG}" || \
+                    "$(jq -r .prerelease <<< "${release_json}")" != "false" ]]; then
+                echo "Existing Release metadata does not match the accepted stable tag" >&2
+                exit 1
+              fi
+              if [[ "${tag_exists}" != "true" ]]; then
+                echo "Existing Release has no matching accepted annotated tag" >&2
+                exit 1
+              fi
+              if [[ "$(jq -r .draft <<< "${release_json}")" == "true" ]]; then
+                release_state=draft
+              else
+                release_state=published
+              fi
               ;;
             404) ;;
             *)
@@ -458,40 +697,9 @@ jobs:
               ;;
           esac
 
-          tag_ref_exists=false
-          tag_ref=""
-          tag_status="$(github_api_status "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
-          case "${tag_status}" in
-            200)
-              tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '[.object.type, .object.sha] | @tsv')"
-              tag_ref_exists=true
-              ;;
-            404) ;;
-            *)
-              echo "Cannot safely determine whether tag ${RELEASE_TAG} exists (HTTP ${tag_status})" >&2
-              exit 1
-              ;;
-          esac
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${tag_ref_exists}" == "true" ]]; then
-            echo "Tag ${RELEASE_TAG} already exists; manual prereleases must use a new tag" >&2
-            exit 1
-          fi
-          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${tag_ref_exists}" != "true" ]]; then
-            echo "Release tag ${RELEASE_TAG} disappeared before publication" >&2
-            exit 1
-          fi
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            IFS=$'\t' read -r object_type object_sha <<< "${tag_ref}"
-            for _ in 1 2 3; do
-              [[ "${object_type}" == "tag" ]] || break
-              tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '[.object.type, .object.sha] | @tsv')"
-              IFS=$'\t' read -r object_type object_sha <<< "${tag_object}"
-            done
-            if [[ "${object_type}" != "commit" || "${object_sha}" != "${GITHUB_SHA}" ]]; then
-              echo "Release tag ${RELEASE_TAG} moved away from workflow commit ${GITHUB_SHA}" >&2
-              exit 1
-            fi
-          fi
+          echo "tag_exists=${tag_exists}" >> "${GITHUB_OUTPUT}"
+          echo "release_state=${release_state}" >> "${GITHUB_OUTPUT}"
+          echo "Publication state: tag=${tag_exists} release=${release_state}"
 
       - name: Resolve previous published release
         id: previous-release
@@ -499,7 +707,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-          RELEASE_IS_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          RELEASE_IS_PRERELEASE: "false"
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
         run: |
           previous_tag="$(
             gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
@@ -512,8 +721,8 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${previous_tag}" >/dev/null
             git fetch --force --no-tags origin "refs/tags/${previous_tag}:refs/tags/${previous_tag}"
             previous_commit="$(git rev-list -n 1 "${previous_tag}")"
-            if [[ -z "${previous_commit}" ]] || ! git merge-base --is-ancestor "${previous_commit}" "${GITHUB_SHA}"; then
-              echo "Previous published release ${previous_tag} is not an ancestor of ${GITHUB_SHA}" >&2
+            if [[ -z "${previous_commit}" ]] || ! git merge-base --is-ancestor "${previous_commit}" "${RELEASE_COMMIT}"; then
+              echo "Previous published release ${previous_tag} is not an ancestor of ${RELEASE_COMMIT}" >&2
               exit 1
             fi
             echo "Generating release notes from previous published release ${previous_tag}"
@@ -531,14 +740,145 @@ jobs:
             release-assets/*.spdx.json
             release-assets/checksums.txt
 
-      - name: Create release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          files: release-assets/*
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          previous_tag: ${{ steps.previous-release.outputs.tag }}
-          tag_name: ${{ needs.validate.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          prerelease: ${{ needs.validate.outputs.prerelease }}
-          make_latest: ${{ needs.validate.outputs.prerelease != 'true' }}
+      - name: Create or resume accepted annotated release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          RELEASE_BUNDLE_DIGEST: ${{ needs.verify-assets.outputs.bundle_digest }}
+          TAG_EXISTS: ${{ steps.publication_state.outputs.tag_exists }}
+        run: |
+          expected_tag_message="$(printf '%s\n\nSource commit: %s\nCandidate bundle digest: %s\nWorkflow run: %s/%s/actions/runs/%s\n' \
+            "Release ${RELEASE_TAG}" \
+            "${RELEASE_COMMIT}" \
+            "${RELEASE_BUNDLE_DIGEST}" \
+            "${GITHUB_SERVER_URL}" \
+            "${GITHUB_REPOSITORY}" \
+            "${GITHUB_RUN_ID}")"
+          if [[ "${TAG_EXISTS}" != "true" ]]; then
+            tag_object_sha="$(
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/git/tags" \
+                --raw-field tag="${RELEASE_TAG}" \
+                --raw-field message="${expected_tag_message}" \
+                --raw-field object="${RELEASE_COMMIT}" \
+                --raw-field type=commit \
+                --jq .sha
+            )"
+            if [[ ! "${tag_object_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "GitHub did not return an annotated tag object SHA" >&2
+              exit 1
+            fi
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              --raw-field ref="refs/tags/${RELEASE_TAG}" \
+              --raw-field sha="${tag_object_sha}" >/dev/null
+          else
+            echo "Resuming publication with the annotated tag created by this workflow run"
+          fi
+
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '[.object.type, .object.sha] | @tsv')"
+          IFS=$'\t' read -r object_type object_sha <<< "${tag_ref}"
+          if [[ "${object_type}" != "tag" || ! "${object_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release ref is not an annotated tag object" >&2
+            exit 1
+          fi
+          tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")"
+          if [[ "$(jq -r .tag <<< "${tag_json}")" != "${RELEASE_TAG}" || \
+                "$(jq -r .message <<< "${tag_json}")" != "${expected_tag_message}" || \
+                "$(jq -r .object.type <<< "${tag_json}")" != "commit" || \
+                "$(jq -r .object.sha <<< "${tag_json}")" != "${RELEASE_COMMIT}" ]]; then
+            echo "Annotated release tag does not match this run's accepted commit and bundle digest" >&2
+            exit 1
+          fi
+
+      - name: Create, resume, and verify release publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_STATE: ${{ steps.publication_state.outputs.release_state }}
+          PREVIOUS_TAG: ${{ steps.previous-release.outputs.tag }}
+          EXPECTED_BUNDLE_DIGEST: ${{ needs.verify-assets.outputs.bundle_digest }}
+        run: |
+          release_args=(
+            "${RELEASE_TAG}"
+            release-assets/*
+            --draft
+            --generate-notes
+            --title "${RELEASE_TAG}"
+            --verify-tag
+          )
+          if [[ -n "${PREVIOUS_TAG}" ]]; then
+            release_args+=(--notes-start-tag "${PREVIOUS_TAG}")
+          fi
+
+          case "${RELEASE_STATE}" in
+            none)
+              gh release create "${release_args[@]}"
+              ;;
+            draft)
+              gh release upload "${RELEASE_TAG}" release-assets/* --clobber
+              ;;
+            published)
+              echo "Release already published by this workflow run; verifying exact assets"
+              ;;
+            *)
+              echo "Unknown resumable Release state: ${RELEASE_STATE}" >&2
+              exit 1
+              ;;
+          esac
+
+          published_assets="$(mktemp -d)"
+          trap 'rm -rf "${published_assets}"' EXIT
+          gh release download "${RELEASE_TAG}" --dir "${published_assets}"
+
+          expected_files="${RUNNER_TEMP}/expected-published-files.txt"
+          actual_files="${RUNNER_TEMP}/actual-published-files.txt"
+          awk '{print $2}' release-assets/checksums.txt | LC_ALL=C sort > "${expected_files}"
+          echo checksums.txt >> "${expected_files}"
+          LC_ALL=C sort -o "${expected_files}" "${expected_files}"
+          find "${published_assets}" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "${actual_files}"
+          if ! diff -u "${expected_files}" "${actual_files}"; then
+            echo "GitHub Release does not contain the exact finalized 11-file bundle" >&2
+            if [[ "${RELEASE_STATE}" == "draft" || "${RELEASE_STATE}" == "none" ]]; then
+              echo "Delete only the draft Release, keep the accepted annotated tag, and rerun this job" >&2
+            fi
+            exit 1
+          fi
+          while IFS= read -r file; do
+            if [[ -L "${published_assets}/${file}" || ! -f "${published_assets}/${file}" ]]; then
+              echo "GitHub Release asset is not a top-level regular file: ${file}" >&2
+              exit 1
+            fi
+            if ! cmp --silent "release-assets/${file}" "${published_assets}/${file}"; then
+              echo "GitHub Release asset differs from the accepted candidate: ${file}" >&2
+              exit 1
+            fi
+          done < "${expected_files}"
+          actual_bundle_digest="$(sha256sum "${published_assets}/checksums.txt" | awk '{print tolower($1)}')"
+          if [[ "${actual_bundle_digest}" != "${EXPECTED_BUNDLE_DIGEST}" ]]; then
+            echo "Published bundle digest differs from the accepted candidate" >&2
+            exit 1
+          fi
+          (
+            cd "${published_assets}"
+            sha256sum --check --strict checksums.txt
+          )
+
+          if [[ "${RELEASE_STATE}" != "published" ]]; then
+            gh release edit "${RELEASE_TAG}" \
+              --draft=false \
+              --latest \
+              --prerelease=false \
+              --title "${RELEASE_TAG}" \
+              --verify-tag
+          fi
+
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if [[ "$(jq -r .draft <<< "${release_json}")" != "false" || \
+                "$(jq -r .prerelease <<< "${release_json}")" != "false" || \
+                "$(jq -r .name <<< "${release_json}")" != "${RELEASE_TAG}" || \
+                "$(jq -r .tag_name <<< "${release_json}")" != "${RELEASE_TAG}" ]]; then
+            echo "Final GitHub Release metadata is not the accepted stable publication" >&2
+            exit 1
+          fi

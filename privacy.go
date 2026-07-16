@@ -418,13 +418,18 @@ func validPersistentIdentitySpec(spec persistentIdentitySpec) bool {
 }
 
 type storedIdentityRow struct {
-	rowID  int64
-	values []string
+	rowID    int64
+	provider string
+	values   []string
 }
 
 func scanPersistentIdentityRows(ctx context.Context, store apiKeySecretStateStore, spec persistentIdentitySpec, visit func(storedIdentityRow) error) error {
 	if !validPersistentIdentitySpec(spec) {
 		return fmt.Errorf("unsupported identity migration table %q", spec.table)
+	}
+	hasProvider, err := persistentIdentityTableHasProvider(ctx, store, spec.table)
+	if err != nil {
+		return err
 	}
 	var lastRowID int64
 	for {
@@ -457,11 +462,16 @@ func scanPersistentIdentityRows(ctx context.Context, store apiKeySecretStateStor
 			// Reload each row immediately before visiting it so a stale batch
 			// snapshot cannot resurrect or overwrite the collision winner.
 			row := storedIdentityRow{rowID: rowID, values: make([]string, len(spec.columns))}
-			dest := make([]any, 0, len(spec.columns))
+			dest := make([]any, 0, len(spec.columns)+1)
+			selectColumns := strings.Join(spec.columns, ", ")
+			if hasProvider {
+				selectColumns = "provider, " + selectColumns
+				dest = append(dest, &row.provider)
+			}
 			for i := range row.values {
 				dest = append(dest, &row.values[i])
 			}
-			err := store.QueryRowContext(ctx, `SELECT `+strings.Join(spec.columns, ", ")+` FROM `+spec.table+` WHERE rowid=?`, rowID).Scan(dest...)
+			err := store.QueryRowContext(ctx, `SELECT `+selectColumns+` FROM `+spec.table+` WHERE rowid=?`, rowID).Scan(dest...)
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
@@ -473,6 +483,28 @@ func scanPersistentIdentityRows(ctx context.Context, store apiKeySecretStateStor
 			}
 		}
 	}
+}
+
+func persistentIdentityTableHasProvider(ctx context.Context, store apiKeySecretStateStore, table string) (bool, error) {
+	rows, err := store.QueryContext(ctx, `PRAGMA table_info(`+quoteSQLiteIdentifier(table)+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if strings.EqualFold(name, "provider") {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 const apiKeyFingerprintEncodedLength = len("keyfp:v0:") + 32 + 1 + 4
@@ -509,6 +541,9 @@ func collectStoredFingerprints(ctx context.Context, store apiKeySecretStateStore
 	var rowsWithFingerprint int64
 	for _, spec := range persistentIdentitySpecs() {
 		err := scanPersistentIdentityRows(ctx, store, spec, func(row storedIdentityRow) error {
+			if !fingerprintBindingProviderAllowed(spec.table, row.provider) {
+				return nil
+			}
 			foundInRow := false
 			for _, value := range row.values {
 				for _, fingerprint := range storedIdentityFingerprints(value) {
@@ -530,6 +565,27 @@ func collectStoredFingerprints(ctx context.Context, store apiKeySecretStateStore
 		}
 	}
 	return fingerprints, rowsWithFingerprint, nil
+}
+
+// Fingerprint-secret binding covers every usage Provider because usage
+// analytics accepts third-party Providers and their historical v1 identities
+// must remain stable across upgrades. Scheduler/state tables remain limited to
+// the Providers whose rows can affect this plugin's active restrictions.
+func fingerprintBindingProviderAllowed(table, provider string) bool {
+	provider = canonicalProvider(provider)
+	if provider == "" {
+		return true
+	}
+	switch table {
+	case "usage_events":
+		return true
+	case "xai_account_states":
+		return provider == providerXAI
+	case "invalid_auths", "autoban_bans", "account_protection_reservations", "quota_trigger_runs":
+		return provider == providerCodex
+	default:
+		return false
+	}
 }
 
 func configuredV1FingerprintSet(secret []byte, configuredKeys []string) map[string]struct{} {
@@ -580,9 +636,9 @@ func activeRestrictionDependsOnlyOnUnprovenFingerprint(ctx context.Context, stor
 		name  string
 		query string
 	}{
-		{name: "invalid_auths", query: `SELECT auth_id,auth_index,source,auth_file FROM invalid_auths WHERE active=1`},
-		{name: "autoban_bans", query: `SELECT auth_id,auth_index,source FROM autoban_bans WHERE active=1 AND reset_at>?`},
-		{name: "xai_account_states", query: `SELECT state_key,auth_id,auth_index,source,auth_file FROM xai_account_states WHERE active=1 AND (reset_at=0 OR reset_at>?)`},
+		{name: "invalid_auths", query: `SELECT auth_id,auth_index,source,auth_file FROM invalid_auths WHERE active=1 AND lower(trim(COALESCE(provider,''))) IN ('','codex')`},
+		{name: "autoban_bans", query: `SELECT auth_id,auth_index,source FROM autoban_bans WHERE active=1 AND reset_at>? AND lower(trim(COALESCE(provider,''))) IN ('','codex')`},
+		{name: "xai_account_states", query: `SELECT state_key,auth_id,auth_index,source,auth_file FROM xai_account_states WHERE active=1 AND (reset_at=0 OR reset_at>?) AND lower(trim(COALESCE(provider,''))) IN ('','xai')`},
 	}
 	for _, check := range queries {
 		args := []any{}
@@ -640,9 +696,12 @@ func unprovenActiveV0Quarantines(ctx context.Context, store apiKeySecretStateSto
 		columnCount int
 		args        []any
 	}{
-		{table: "invalid_auths", query: `SELECT provider,auth_id,auth_index,source,auth_file FROM invalid_auths WHERE active=1`, columnCount: 4},
-		{table: "autoban_bans", query: `SELECT provider,auth_id,auth_index,source FROM autoban_bans WHERE active=1 AND reset_at>?`, columnCount: 3, args: []any{now}},
-		{table: "xai_account_states", query: `SELECT provider,state_key,auth_id,auth_index,source,auth_file FROM xai_account_states WHERE active=1 AND (reset_at=0 OR reset_at>?)`, columnCount: 5, args: []any{now}},
+		// Blank Provider values are the only legacy rows whose table identifies
+		// the Provider. Explicit foreign Providers remain inert and must not
+		// quarantine Codex or xAI merely because they live in a historical table.
+		{table: "invalid_auths", query: `SELECT provider,auth_id,auth_index,source,auth_file FROM invalid_auths WHERE active=1 AND lower(trim(COALESCE(provider,''))) IN ('','codex')`, columnCount: 4},
+		{table: "autoban_bans", query: `SELECT provider,auth_id,auth_index,source FROM autoban_bans WHERE active=1 AND reset_at>? AND lower(trim(COALESCE(provider,''))) IN ('','codex')`, columnCount: 3, args: []any{now}},
+		{table: "xai_account_states", query: `SELECT provider,state_key,auth_id,auth_index,source,auth_file FROM xai_account_states WHERE active=1 AND (reset_at=0 OR reset_at>?) AND lower(trim(COALESCE(provider,''))) IN ('','xai')`, columnCount: 5, args: []any{now}},
 	}
 	out := map[string]map[string]struct{}{}
 	for _, check := range queries {
@@ -710,17 +769,16 @@ func upsertStoreState(ctx context.Context, store apiKeySecretStateStore, key, va
 const apiKeyPrivacyQuarantinePrefix = "api_key_privacy_quarantine_"
 
 func normalizedPrivacyQuarantineProvider(provider, table string) string {
-	switch table {
-	case "xai_account_states":
-		return "xai"
-	case "invalid_auths", "autoban_bans":
-		return "codex"
-	}
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	if provider != "" {
+	if provider = canonicalProvider(provider); provider != "" {
 		return provider
 	}
-	return "codex"
+	switch table {
+	case "xai_account_states":
+		return providerXAI
+	case "invalid_auths", "autoban_bans":
+		return providerCodex
+	}
+	return canonicalProviderOr(provider, providerCodex)
 }
 
 func newAPIKeyPrivacyQuarantineSnapshot(dbPath string, providers map[string]string) *apiKeyPrivacyQuarantineSnapshot {
@@ -910,7 +968,7 @@ func rewriteQuarantinedIdentityRows(ctx context.Context, tx *sql.Tx, dbPath stri
 			}
 			if stateTables[spec.table] && protected[0] != row.values[0] {
 				var collisionRowID int64
-				collisionErr := tx.QueryRowContext(ctx, `SELECT rowid FROM `+spec.table+` WHERE `+spec.columns[0]+`=? AND rowid<>? LIMIT 1`, protected[0], row.rowID).Scan(&collisionRowID)
+				collisionErr := tx.QueryRowContext(ctx, `SELECT rowid FROM `+spec.table+` WHERE `+spec.columns[0]+`=? AND provider=(SELECT provider FROM `+spec.table+` WHERE rowid=?) AND rowid<>? ORDER BY rowid DESC LIMIT 1`, protected[0], row.rowID, row.rowID).Scan(&collisionRowID)
 				if collisionErr == nil {
 					return mergeAuthStateCollisionV3(ctx, tx, dbPath, spec, protected, row.rowID, collisionRowID, configuredKeys, resolver)
 				}
@@ -939,33 +997,50 @@ func activeQuarantineReferences(ctx context.Context, tx *sql.Tx, provider string
 		return map[string]struct{}{}, nil
 	}
 	now := time.Now().Unix()
+	provider = canonicalProvider(provider)
 	queries := []struct {
 		query       string
 		columnCount int
 		args        []any
 	}{}
 	switch provider {
-	case "codex":
+	case providerCodex:
 		queries = append(queries,
 			struct {
 				query       string
 				columnCount int
 				args        []any
-			}{query: `SELECT auth_id,auth_index,source,auth_file FROM invalid_auths WHERE active=1`, columnCount: 4},
+			}{query: `SELECT auth_id,auth_index,source,auth_file FROM invalid_auths WHERE provider='codex' AND active=1`, columnCount: 4},
 			struct {
 				query       string
 				columnCount int
 				args        []any
-			}{query: `SELECT auth_id,auth_index,source FROM autoban_bans WHERE active=1 AND reset_at>?`, columnCount: 3, args: []any{now}},
+			}{query: `SELECT auth_id,auth_index,source FROM autoban_bans WHERE provider='codex' AND active=1 AND reset_at>?`, columnCount: 3, args: []any{now}},
 		)
-	case "xai":
+	case providerXAI:
 		queries = append(queries, struct {
 			query       string
 			columnCount int
 			args        []any
-		}{query: `SELECT state_key,auth_id,auth_index,source,auth_file FROM xai_account_states WHERE active=1 AND (reset_at=0 OR reset_at>?)`, columnCount: 5, args: []any{now}})
+		}{query: `SELECT state_key,auth_id,auth_index,source,auth_file FROM xai_account_states WHERE provider='xai' AND active=1 AND (reset_at=0 OR reset_at>?)`, columnCount: 5, args: []any{now}})
 	default:
-		return tracked, nil
+		queries = append(queries,
+			struct {
+				query       string
+				columnCount int
+				args        []any
+			}{query: `SELECT auth_id,auth_index,source,auth_file FROM invalid_auths WHERE provider=? AND active=1`, columnCount: 4, args: []any{provider}},
+			struct {
+				query       string
+				columnCount int
+				args        []any
+			}{query: `SELECT auth_id,auth_index,source FROM autoban_bans WHERE provider=? AND active=1 AND reset_at>?`, columnCount: 3, args: []any{provider, now}},
+			struct {
+				query       string
+				columnCount int
+				args        []any
+			}{query: `SELECT state_key,auth_id,auth_index,source,auth_file FROM xai_account_states WHERE provider=? AND active=1 AND (reset_at=0 OR reset_at>?)`, columnCount: 5, args: []any{provider, now}},
+		)
 	}
 	found := map[string]struct{}{}
 	for _, check := range queries {
@@ -1272,7 +1347,7 @@ func apiKeyFingerprintStatus(ctx context.Context, db *sql.DB, dbPaths ...string)
 		}
 	}
 	if out.IdentityCollisionTies > 0 {
-		out.CollisionTiePolicy = "equal-time conflicts preserve one complete row; inactive wins active/inactive ties"
+		out.CollisionTiePolicy = "equal-time conflicts preserve one complete row using the documented total order; original rowid is the final tiebreak"
 	}
 	if reasons, _, err := loadAPIKeyPrivacyQuarantine(ctx, db); err == nil {
 		for provider := range reasons {
@@ -1820,6 +1895,9 @@ func migrateStoredIdentitiesV3(ctx context.Context, tx *sql.Tx, dbPath string) (
 		if err := upsertStoreState(ctx, tx, apiKeyPrivacyQuarantinePrefix+provider, strings.Join(stored, ",")); err != nil {
 			return 0, err
 		}
+		if err := sqliteMigrationV6Checkpoint(ctx, tx, "privacy-quarantine-markers"); err != nil {
+			return 0, err
+		}
 	}
 	return legacyRows, nil
 }
@@ -1891,8 +1969,13 @@ func migrateUsageIdentitiesV3(ctx context.Context, tx *sql.Tx, dbPath string, co
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `DELETE FROM summary_cache`)
-	return err
+	if err := sqliteMigrationV6Checkpoint(ctx, tx, "privacy-usage-events"); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM summary_cache`); err != nil {
+		return err
+	}
+	return sqliteMigrationV6Checkpoint(ctx, tx, "privacy-summary-cache")
 }
 
 func protectIdentityValuesV3(dbPath string, values, configuredKeys []string, resolver *legacyFingerprintResolver) ([]string, bool, error) {
@@ -1918,12 +2001,18 @@ func migrateAuthStateIdentitiesV3(ctx context.Context, tx *sql.Tx, dbPath string
 		if err := migrateAuthStateTableV3(ctx, tx, dbPath, spec, configuredKeys, resolver); err != nil {
 			return err
 		}
+		if err := sqliteMigrationV6Checkpoint(ctx, tx, "privacy-"+strings.ReplaceAll(spec.table, "_", "-")); err != nil {
+			return err
+		}
 	}
 	for _, spec := range []persistentIdentitySpec{
 		{table: "account_protection_reservations", columns: []string{"auth_id", "auth_index", "source", "auth_file"}},
 		{table: "quota_trigger_runs", columns: []string{"auth_id", "auth_index", "source", "auth_file"}},
 	} {
 		if err := migrateNonUniqueIdentityTableV3(ctx, tx, dbPath, spec, configuredKeys, resolver); err != nil {
+			return err
+		}
+		if err := sqliteMigrationV6Checkpoint(ctx, tx, "privacy-"+strings.ReplaceAll(spec.table, "_", "-")); err != nil {
 			return err
 		}
 	}
@@ -1961,7 +2050,7 @@ func migrateAuthStateTableV3(ctx context.Context, tx *sql.Tx, dbPath string, spe
 			return err
 		}
 		var collisionRowID int64
-		collisionErr := tx.QueryRowContext(ctx, `SELECT rowid FROM `+spec.table+` WHERE `+spec.columns[0]+`=? AND rowid<>? LIMIT 1`, protectedValues[0], row.rowID).Scan(&collisionRowID)
+		collisionErr := tx.QueryRowContext(ctx, `SELECT rowid FROM `+spec.table+` WHERE `+spec.columns[0]+`=? AND provider=(SELECT provider FROM `+spec.table+` WHERE rowid=?) AND rowid<>? ORDER BY rowid DESC LIMIT 1`, protectedValues[0], row.rowID, row.rowID).Scan(&collisionRowID)
 		if collisionErr == nil {
 			return mergeAuthStateCollisionV3(ctx, tx, dbPath, spec, protectedValues, row.rowID, collisionRowID, configuredKeys, resolver)
 		}
@@ -1982,6 +2071,7 @@ type invalidAuthMigrationRow struct {
 	AuthID, AuthIndex, Source, Provider, Reason, AuthFile string
 	InvalidatedAt, AuthFileMTime                          int64
 	Active, LastStatusCode                                int
+	RowID                                                 int64
 }
 
 func loadInvalidAuthMigrationRow(ctx context.Context, tx *sql.Tx, rowID int64) (invalidAuthMigrationRow, error) {
@@ -1989,22 +2079,37 @@ func loadInvalidAuthMigrationRow(ctx context.Context, tx *sql.Tx, rowID int64) (
 	err := tx.QueryRowContext(ctx, `SELECT auth_id,auth_index,source,provider,reason,invalidated_at,active,last_status_code,auth_file,auth_file_mtime FROM invalid_auths WHERE rowid=?`, rowID).Scan(
 		&row.AuthID, &row.AuthIndex, &row.Source, &row.Provider, &row.Reason, &row.InvalidatedAt, &row.Active, &row.LastStatusCode, &row.AuthFile, &row.AuthFileMTime,
 	)
+	row.RowID = rowID
 	return row, err
 }
 
 func sourceWinsInvalidCollision(source, target invalidAuthMigrationRow) (bool, bool) {
-	if source.InvalidatedAt != target.InvalidatedAt {
-		return source.InvalidatedAt > target.InvalidatedAt, false
-	}
+	equalEventTime := source.InvalidatedAt == target.InvalidatedAt
 	if source.Active != target.Active {
-		// Older schemas did not record recovery time. For equal event timestamps,
-		// prefer the cleared row so migration never resurrects a known recovery.
-		return source.Active == 0, true
+		return source.Active > target.Active, equalEventTime
+	}
+	if source.InvalidatedAt != target.InvalidatedAt {
+		return source.InvalidatedAt > target.InvalidatedAt, equalEventTime
+	}
+	if source.LastStatusCode != target.LastStatusCode {
+		return source.LastStatusCode > target.LastStatusCode, equalEventTime
 	}
 	if source.AuthFileMTime != target.AuthFileMTime {
-		return source.AuthFileMTime > target.AuthFileMTime, false
+		return source.AuthFileMTime > target.AuthFileMTime, equalEventTime
 	}
-	return false, true
+	if source.AuthFile != target.AuthFile {
+		return source.AuthFile > target.AuthFile, equalEventTime
+	}
+	if source.Reason != target.Reason {
+		return source.Reason > target.Reason, equalEventTime
+	}
+	if source.AuthIndex != target.AuthIndex {
+		return source.AuthIndex > target.AuthIndex, equalEventTime
+	}
+	if source.Source != target.Source {
+		return source.Source > target.Source, equalEventTime
+	}
+	return source.RowID > target.RowID, equalEventTime
 }
 
 type autobanMigrationRow struct {
@@ -2013,6 +2118,7 @@ type autobanMigrationRow struct {
 	Active, LastStatusCode                                             int
 	PrimaryUsedPercent, SecondaryUsedPercent                           sql.NullFloat64
 	PrimaryResetAt, SecondaryResetAt                                   sql.NullInt64
+	RowID                                                              int64
 }
 
 func loadAutobanMigrationRow(ctx context.Context, tx *sql.Tx, rowID int64) (autobanMigrationRow, error) {
@@ -2021,6 +2127,7 @@ func loadAutobanMigrationRow(ctx context.Context, tx *sql.Tx, rowID int64) (auto
 		&row.AuthID, &row.AuthIndex, &row.Source, &row.Provider, &row.Window, &row.Reason, &row.BannedAt, &row.ResetAt, &row.Active, &row.LastStatusCode,
 		&row.PrimaryUsedPercent, &row.PrimaryResetAt, &row.SecondaryUsedPercent, &row.SecondaryResetAt, &row.ReleasedAt, &row.ReleaseReason,
 	)
+	row.RowID = rowID
 	return row, err
 }
 
@@ -2034,25 +2141,48 @@ func autobanStateEventAt(row autobanMigrationRow) int64 {
 
 func sourceWinsAutobanCollision(source, target autobanMigrationRow) (bool, bool) {
 	sourceEvent, targetEvent := autobanStateEventAt(source), autobanStateEventAt(target)
+	equalEventTime := sourceEvent == targetEvent
 	if sourceEvent != targetEvent {
-		return sourceEvent > targetEvent, false
+		return sourceEvent > targetEvent, equalEventTime
 	}
 	if source.Active != target.Active {
-		return source.Active == 0, true
+		return source.Active < target.Active, equalEventTime
 	}
-	if source.Active != 0 && source.ResetAt != target.ResetAt {
-		return source.ResetAt > target.ResetAt, false
+	if source.ResetAt != target.ResetAt {
+		return source.ResetAt > target.ResetAt, equalEventTime
 	}
 	if source.BannedAt != target.BannedAt {
-		return source.BannedAt > target.BannedAt, false
+		return source.BannedAt > target.BannedAt, equalEventTime
 	}
-	return false, true
+	if source.ReleasedAt != target.ReleasedAt {
+		return source.ReleasedAt > target.ReleasedAt, equalEventTime
+	}
+	if source.LastStatusCode != target.LastStatusCode {
+		return source.LastStatusCode > target.LastStatusCode, equalEventTime
+	}
+	if source.ReleaseReason != target.ReleaseReason {
+		return source.ReleaseReason > target.ReleaseReason, equalEventTime
+	}
+	if source.Reason != target.Reason {
+		return source.Reason > target.Reason, equalEventTime
+	}
+	if source.Window != target.Window {
+		return source.Window > target.Window, equalEventTime
+	}
+	if source.AuthIndex != target.AuthIndex {
+		return source.AuthIndex > target.AuthIndex, equalEventTime
+	}
+	if source.Source != target.Source {
+		return source.Source > target.Source, equalEventTime
+	}
+	return source.RowID > target.RowID, equalEventTime
 }
 
 type xaiMigrationRow struct {
 	StateKey, AuthID, AuthIndex, Source, Provider, State, Reason, AuthFile string
 	ObservedAt, ResetAt, AuthFileMTime                                     int64
 	Active, LastStatusCode                                                 int
+	RowID                                                                  int64
 }
 
 func loadXAIMigrationRow(ctx context.Context, tx *sql.Tx, rowID int64) (xaiMigrationRow, error) {
@@ -2060,26 +2190,46 @@ func loadXAIMigrationRow(ctx context.Context, tx *sql.Tx, rowID int64) (xaiMigra
 	err := tx.QueryRowContext(ctx, `SELECT state_key,auth_id,auth_index,source,provider,state,reason,observed_at,reset_at,active,last_status_code,auth_file,auth_file_mtime FROM xai_account_states WHERE rowid=?`, rowID).Scan(
 		&row.StateKey, &row.AuthID, &row.AuthIndex, &row.Source, &row.Provider, &row.State, &row.Reason, &row.ObservedAt, &row.ResetAt, &row.Active, &row.LastStatusCode, &row.AuthFile, &row.AuthFileMTime,
 	)
+	row.RowID = rowID
 	return row, err
 }
 
 func sourceWinsXAICollision(source, target xaiMigrationRow) (bool, bool) {
-	if source.ObservedAt != target.ObservedAt {
-		return source.ObservedAt > target.ObservedAt, false
-	}
+	equalEventTime := source.ObservedAt == target.ObservedAt
 	if source.Active != target.Active {
-		return source.Active == 0, true
+		return source.Active > target.Active, equalEventTime
 	}
-	if source.Active != 0 && source.ResetAt != target.ResetAt {
-		if source.ResetAt == 0 {
-			return true, false
-		}
-		if target.ResetAt == 0 {
-			return false, false
-		}
-		return source.ResetAt > target.ResetAt, false
+	if source.ObservedAt != target.ObservedAt {
+		return source.ObservedAt > target.ObservedAt, equalEventTime
 	}
-	return false, true
+	if source.ResetAt != target.ResetAt {
+		return source.ResetAt > target.ResetAt, equalEventTime
+	}
+	if source.LastStatusCode != target.LastStatusCode {
+		return source.LastStatusCode > target.LastStatusCode, equalEventTime
+	}
+	if source.AuthFileMTime != target.AuthFileMTime {
+		return source.AuthFileMTime > target.AuthFileMTime, equalEventTime
+	}
+	if source.State != target.State {
+		return source.State > target.State, equalEventTime
+	}
+	if source.Reason != target.Reason {
+		return source.Reason > target.Reason, equalEventTime
+	}
+	if source.AuthFile != target.AuthFile {
+		return source.AuthFile > target.AuthFile, equalEventTime
+	}
+	if source.AuthID != target.AuthID {
+		return source.AuthID > target.AuthID, equalEventTime
+	}
+	if source.AuthIndex != target.AuthIndex {
+		return source.AuthIndex > target.AuthIndex, equalEventTime
+	}
+	if source.Source != target.Source {
+		return source.Source > target.Source, equalEventTime
+	}
+	return source.RowID > target.RowID, equalEventTime
 }
 
 func recordMigrationTieDiagnostic(ctx context.Context, tx *sql.Tx, table string) error {
@@ -2135,12 +2285,15 @@ func mergeAuthStateCollisionV3(ctx context.Context, tx *sql.Tx, dbPath string, s
 				return err
 			}
 		}
-		winner := target
+		winner, winnerRowID, loserRowID := target, targetRowID, sourceRowID
 		if sourceWins {
-			winner = source
+			winner, winnerRowID, loserRowID = source, sourceRowID, targetRowID
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM invalid_auths WHERE rowid=?`, loserRowID); err != nil {
+			return err
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE invalid_auths SET auth_id=?,auth_index=?,source=?,provider=?,reason=?,invalidated_at=?,active=?,last_status_code=?,auth_file=?,auth_file_mtime=? WHERE rowid=?`,
-			winner.AuthID, winner.AuthIndex, winner.Source, winner.Provider, winner.Reason, winner.InvalidatedAt, winner.Active, winner.LastStatusCode, winner.AuthFile, winner.AuthFileMTime, targetRowID)
+			winner.AuthID, winner.AuthIndex, winner.Source, winner.Provider, winner.Reason, winner.InvalidatedAt, winner.Active, winner.LastStatusCode, winner.AuthFile, winner.AuthFileMTime, winnerRowID)
 		if err != nil {
 			return err
 		}
@@ -2163,13 +2316,16 @@ func mergeAuthStateCollisionV3(ctx context.Context, tx *sql.Tx, dbPath string, s
 				return err
 			}
 		}
-		winner := target
+		winner, winnerRowID, loserRowID := target, targetRowID, sourceRowID
 		if sourceWins {
-			winner = source
+			winner, winnerRowID, loserRowID = source, sourceRowID, targetRowID
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM autoban_bans WHERE rowid=?`, loserRowID); err != nil {
+			return err
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE autoban_bans SET auth_id=?,auth_index=?,source=?,provider=?,window=?,reason=?,banned_at=?,reset_at=?,active=?,last_status_code=?,primary_used_percent=?,primary_reset_at=?,secondary_used_percent=?,secondary_reset_at=?,released_at=?,release_reason=? WHERE rowid=?`,
 			winner.AuthID, winner.AuthIndex, winner.Source, winner.Provider, winner.Window, winner.Reason, winner.BannedAt, winner.ResetAt, winner.Active, winner.LastStatusCode,
-			winner.PrimaryUsedPercent, winner.PrimaryResetAt, winner.SecondaryUsedPercent, winner.SecondaryResetAt, winner.ReleasedAt, winner.ReleaseReason, targetRowID)
+			winner.PrimaryUsedPercent, winner.PrimaryResetAt, winner.SecondaryUsedPercent, winner.SecondaryResetAt, winner.ReleasedAt, winner.ReleaseReason, winnerRowID)
 		if err != nil {
 			return err
 		}
@@ -2192,18 +2348,20 @@ func mergeAuthStateCollisionV3(ctx context.Context, tx *sql.Tx, dbPath string, s
 				return err
 			}
 		}
-		winner := target
+		winner, winnerRowID, loserRowID := target, targetRowID, sourceRowID
 		if sourceWins {
-			winner = source
+			winner, winnerRowID, loserRowID = source, sourceRowID, targetRowID
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM xai_account_states WHERE rowid=?`, loserRowID); err != nil {
+			return err
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE xai_account_states SET state_key=?,auth_id=?,auth_index=?,source=?,provider=?,state=?,reason=?,observed_at=?,reset_at=?,active=?,last_status_code=?,auth_file=?,auth_file_mtime=? WHERE rowid=?`,
-			winner.StateKey, winner.AuthID, winner.AuthIndex, winner.Source, winner.Provider, winner.State, winner.Reason, winner.ObservedAt, winner.ResetAt, winner.Active, winner.LastStatusCode, winner.AuthFile, winner.AuthFileMTime, targetRowID)
+			winner.StateKey, winner.AuthID, winner.AuthIndex, winner.Source, winner.Provider, winner.State, winner.Reason, winner.ObservedAt, winner.ResetAt, winner.Active, winner.LastStatusCode, winner.AuthFile, winner.AuthFileMTime, winnerRowID)
 		if err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("unsupported auth-state migration table %q", spec.table)
 	}
-	_, err := tx.ExecContext(ctx, `DELETE FROM `+spec.table+` WHERE rowid=?`, sourceRowID)
-	return err
+	return nil
 }

@@ -149,6 +149,15 @@ func TestSanitizeTriggerErrorRejectsCredentialVariants(t *testing.T) {
 	if got := sanitizeTriggerError("temporary upstream timeout"); got != "temporary upstream timeout" {
 		t.Fatalf("benign diagnostic = %q", got)
 	}
+	for _, value := range []string{
+		`open C:\Users\private\usage.db: access denied`,
+		`read /home/private/auth.json: permission denied`,
+		`no such column: generate`,
+	} {
+		if got := sanitizeTriggerError(value); got != "trigger failed" {
+			t.Fatalf("sensitive diagnostic detail was not replaced: input=%q got=%q", value, got)
+		}
+	}
 }
 
 func TestUsageHandleReportsStoredWhenDerivedStateFails(t *testing.T) {

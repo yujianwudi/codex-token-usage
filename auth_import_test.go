@@ -69,6 +69,56 @@ func TestAuthImportRejectsOversizedEnvelopeBeforeJSONDecode(t *testing.T) {
 	}
 }
 
+func TestAuthImportManagementErrorsDoNotExposeHostDetails(t *testing.T) {
+	oldCaller := hostAuthCaller
+	t.Cleanup(func() { hostAuthCaller = oldCaller })
+	secret := "sk-proj-auth-import-canary-1234567890"
+	hostAuthCaller = func(method string, payload any) (json.RawMessage, error) {
+		return nil, errors.New(`open C:\Users\sensitive\usage.db: ` + secret)
+	}
+	response := handleAuthImportPreviewContext(context.Background(), []byte(`{"text":"{}"}`))
+	if response.StatusCode != 503 {
+		t.Fatalf("status=%d, want 503", response.StatusCode)
+	}
+	body := string(response.Body)
+	if strings.Contains(body, secret) || strings.Contains(body, `C:\Users\sensitive`) {
+		t.Fatalf("auth import response exposed host details: %s", body)
+	}
+	if !strings.Contains(body, "host auth service is temporarily unavailable") {
+		t.Fatalf("auth import response missing stable public message: %s", body)
+	}
+}
+
+func TestAuthImportSaveErrorsAreFixedAndLowSensitivity(t *testing.T) {
+	oldCaller := hostAuthCaller
+	t.Cleanup(func() { hostAuthCaller = oldCaller })
+	secret := "sk-proj-auth-save-canary-1234567890"
+	hostAuthCaller = func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case "host.auth.list":
+			return json.Marshal(hostAuthListResponse{})
+		case "host.auth.save":
+			return nil, errors.New(`/home/private/auth.json: ` + secret)
+		default:
+			return nil, errors.New("unexpected host method")
+		}
+	}
+	token := importTestJWT(map[string]any{"exp": float64(time.Now().Add(time.Hour).Unix())})
+	record, _ := json.Marshal(map[string]any{"email": "safe@example.com", "access_token": token, "account_id": "safe-account"})
+	request, _ := json.Marshal(authImportRequest{Text: string(record), Overwrite: true})
+	response := handleAuthImportCommitContext(context.Background(), request)
+	if response.StatusCode != 200 {
+		t.Fatalf("status=%d body=%s", response.StatusCode, response.Body)
+	}
+	body := string(response.Body)
+	if strings.Contains(body, secret) || strings.Contains(body, "/home/private") {
+		t.Fatalf("auth import save result exposed host details: %s", body)
+	}
+	if !strings.Contains(body, "host save failed") {
+		t.Fatalf("auth import save result missing fixed error: %s", body)
+	}
+}
+
 func importTestJWT(payload map[string]any) string {
 	header, _ := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
 	body, _ := json.Marshal(payload)

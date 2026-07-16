@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 	"time"
 )
@@ -60,7 +59,7 @@ func TestUsageHandleHonorsCanceledPluginOperationContext(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &result); err != nil {
 		t.Fatal(err)
 	}
-	if result["stored"] != false || !strings.Contains(strings.ToLower(stringFromAny(result["error"])), "context canceled") {
+	if result["stored"] != false || stringFromAny(result["error"]) != publicErrorMessage("usage_store_failed") {
 		t.Fatalf("usage.handle result = %#v, want canceled stored=false", result)
 	}
 }

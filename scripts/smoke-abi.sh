@@ -59,6 +59,16 @@ case "${target_os}" in
     ;;
 esac
 
+# The tagged panic-injection build is test-only. Check the exact library that
+# will be packaged, on every release platform, so a harness symbol or marker
+# cannot slip into an uploaded asset after the separate Linux harness test.
+for forbidden in CODEX_TOKEN_USAGE_ABI_PANIC ABI_PANIC_HARNESS_SECRET cliproxyTestSetPanicPoint cliproxyTestGetPanicPoint; do
+  if strings "${library}" | grep -Fq "${forbidden}"; then
+    echo "Release shared library contains panic harness marker: ${forbidden}" >&2
+    exit 1
+  fi
+done
+
 python_bin=""
 for candidate in python3 python; do
   if command -v "${candidate}" >/dev/null 2>&1; then

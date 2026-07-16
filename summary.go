@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -194,7 +195,7 @@ func (m *summaryPrecomputeManager) refresh(ctx context.Context, store *store, cf
 			revision:   revision.Revision,
 		}
 		if err != nil {
-			entry.err = sanitizeTriggerError(err)
+			entry.err = summaryCacheErrorCode(err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -572,7 +573,7 @@ WHERE cache_key=?`, summaryCacheStorageKey(key)).Scan(&raw, &cachedAt, &duration
 				data:       data,
 				cachedAt:   time.Unix(cachedAt, 0),
 				durationMs: durationMs,
-				err:        lastError,
+				err:        normalizeSummaryCacheError(lastError),
 				revision:   revision,
 			},
 			ok: true,
@@ -592,6 +593,7 @@ func (s *store) saveSummaryCacheEntry(ctx context.Context, key summaryCacheKey, 
 	if entry.cachedAt.IsZero() {
 		entry.cachedAt = time.Now()
 	}
+	entry.err = normalizeSummaryCacheError(entry.err)
 	payload, err := json.Marshal(entry.data)
 	if err != nil {
 		return err
@@ -706,7 +708,7 @@ func cloneCachedSummaryForRevision(entry summaryCacheEntry, key summaryCacheKey,
 		AgeSeconds:   int64(age.Seconds()),
 		DurationMs:   entry.durationMs,
 		IntervalSecs: cfg.SummaryPrecomputeIntervalSeconds,
-		LastError:    entry.err,
+		LastError:    normalizeSummaryCacheError(entry.err),
 		Precomputed:  true,
 		Synchronous:  false,
 		Stale:        stale,
@@ -714,6 +716,31 @@ func cloneCachedSummaryForRevision(entry summaryCacheEntry, key summaryCacheKey,
 	}
 	attachSummaryRevision(out, storeRevision, entry.revision)
 	return out
+}
+
+func summaryCacheErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "summary_refresh_cancelled"
+	}
+	return "summary_refresh_failed"
+}
+
+func normalizeSummaryCacheError(value string) string {
+	switch strings.TrimSpace(value) {
+	case "":
+		return ""
+	case "summary_refresh_cancelled":
+		return "summary_refresh_cancelled"
+	case "summary_refresh_failed":
+		return "summary_refresh_failed"
+	default:
+		// Older versions persisted sanitized-but-still-free-form errors. Do not
+		// re-expose legacy filesystem, SQL, or host callback details.
+		return "summary_refresh_failed"
+	}
 }
 
 func summaryPrecomputeStale(data map[string]any) bool {
@@ -739,13 +766,13 @@ func (s *store) currentRevision(ctx context.Context) (storeRevision, error) {
 	if err := db.QueryRowContext(ctx, `
 SELECT COUNT(*), COALESCE(MAX(invalidated_at),0)
 FROM invalid_auths
-WHERE active=1`).Scan(&r.InvalidActive, &r.InvalidMaxChanged); err != nil {
+WHERE provider='codex' AND active=1`).Scan(&r.InvalidActive, &r.InvalidMaxChanged); err != nil {
 		return storeRevision{}, err
 	}
 	if err := db.QueryRowContext(ctx, `
 SELECT COUNT(*), COALESCE(MAX(observed_at),0), COALESCE(MIN(CASE WHEN active=1 AND reset_at>0 THEN reset_at END),0)
 FROM xai_account_states
-WHERE active=1`).Scan(&r.XAIStateActive, &r.XAIStateChanged, &r.NextXAIResetAt); err != nil {
+WHERE provider='xai' AND active=1`).Scan(&r.XAIStateActive, &r.XAIStateChanged, &r.NextXAIResetAt); err != nil {
 		return storeRevision{}, err
 	}
 	if err := db.QueryRowContext(ctx, `
@@ -753,7 +780,7 @@ SELECT COUNT(*),
   COALESCE(MAX(CASE WHEN released_at > banned_at THEN released_at ELSE banned_at END),0),
   COALESCE(MIN(CASE WHEN active=1 THEN reset_at END),0)
 FROM autoban_bans
-WHERE active=1 OR released_at > 0`).Scan(&r.BanActive, &r.BanMaxChanged, &r.NextBanResetAt); err != nil {
+WHERE provider='codex' AND (active=1 OR released_at > 0)`).Scan(&r.BanActive, &r.BanMaxChanged, &r.NextBanResetAt); err != nil {
 		return storeRevision{}, err
 	}
 	r.AuthFilesRevision = authFilesRevision()
@@ -882,7 +909,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	}
 	xaiAccounts = mergeConfiguredAccounts(xaiAccounts, configuredXAIAccounts)
 	xaiAccounts = filterCurrentConfiguredAccounts(xaiAccounts, configuredXAIAccounts, globalXAIAuthSource.authoritative())
-	xaiStates, err := queryActiveXAIStates(ctx, db, now)
+	xaiStates, err := queryActiveXAIStates(ctx, db, providerXAI, now)
 	if err != nil {
 		return nil, err
 	}
@@ -891,7 +918,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	quotaSince := time.Now().Add(-35 * 24 * time.Hour).Unix()
 	applyLatestQuotaSnapshots(ctx, db, accounts, quotaSince)
 	applySecondaryQuotaEstimates(ctx, db, accounts, &totals, quotaSince)
-	invalidAuths, err := queryActiveInvalidAuths(ctx, db)
+	invalidAuths, err := queryActiveInvalidAuths(ctx, db, providerCodex)
 	if err != nil {
 		return nil, err
 	}
@@ -978,7 +1005,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 			return nil, err
 		}
 	}
-	autobans, err := queryActiveAutobans(ctx, db, now)
+	autobans, err := queryActiveAutobans(ctx, db, providerCodex, now)
 	if err != nil {
 		return nil, err
 	}
@@ -1395,6 +1422,7 @@ type recentRow struct {
 	Alias               string  `json:"alias"`
 	ReasoningEffort     string  `json:"reasoning_effort"`
 	ServiceTier         string  `json:"service_tier"`
+	Generate            bool    `json:"generate"`
 	LatencyMs           int64   `json:"latency_ms"`
 	TTFTMs              int64   `json:"ttft_ms"`
 	StatusCode          int     `json:"status_code"`
@@ -1467,6 +1495,10 @@ func usageScopeSQL(scope string) string {
 	return usageScopeSQLWithEntries(scope, readConfiguredProviderEntries())
 }
 
+func generatedUsageScopeSQL(scope string) string {
+	return "(generate=1 AND " + usageScopeSQL(scope) + ")"
+}
+
 func usageScopeSQLWithEntries(scope string, entries []providerConfigEntry) string {
 	codexAccount := `((LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%codex%')
 AND LOWER(COALESCE(NULLIF(auth_type,''), '')) NOT IN ('apikey', 'api_key', 'key')
@@ -1507,7 +1539,7 @@ func codexAPIKeyProviderScopeSQL(entries []providerConfigEntry) string {
 
 func throughputSQL() string {
 	duration := `max(latency_ms, ttft_ms)`
-	valid := `output_tokens > 0 AND ` + duration + ` >= 1000 AND NOT (latency_ms = ttft_ms AND output_tokens >= 1000 AND ` + duration + ` < 5000)`
+	valid := `generate=1 AND output_tokens > 0 AND ` + duration + ` >= 1000 AND NOT (latency_ms = ttft_ms AND output_tokens >= 1000 AND ` + duration + ` < 5000)`
 	return `COALESCE(SUM(CASE WHEN ` + valid + ` THEN output_tokens ELSE 0 END) * 1000.0 / NULLIF(SUM(CASE WHEN ` + valid + ` THEN ` + duration + ` ELSE 0 END),0),0)`
 }
 
@@ -1523,7 +1555,7 @@ COALESCE(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END),0),
 ` + throughputSQL() + `,
 COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
 COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0)
-FROM usage_events WHERE requested_at >= ? AND ` + usageScopeSQL(scope)
+FROM usage_events WHERE requested_at >= ? AND ` + generatedUsageScopeSQL(scope)
 	err := db.QueryRowContext(ctx, query, since).Scan(
 		&row.Requests, &row.Failed, &row.RateLimited, &row.InputTokens, &row.OutputTokens, &row.ReasoningTokens,
 		&row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.TotalTokens,
@@ -1537,7 +1569,7 @@ func queryHasXAIUsage(ctx context.Context, db *sql.DB, since int64) (bool, error
 	err := db.QueryRowContext(ctx, `
 SELECT 1
 FROM usage_events INDEXED BY idx_usage_events_provider_requested
-WHERE provider IN ('xai','XAI') AND requested_at >= ?
+WHERE provider IN ('xai','XAI') AND generate=1 AND requested_at >= ?
 LIMIT 1`, since).Scan(&found)
 	if err == sql.ErrNoRows {
 		return false, nil
@@ -1560,7 +1592,7 @@ COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
 COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0),
 MAX(requested_at)
 FROM usage_events
-WHERE requested_at >= ? AND `+usageScopeSQL(scope)+` AND (auth_index <> '' OR auth_id <> '' OR source <> '')
+WHERE requested_at >= ? AND `+generatedUsageScopeSQL(scope)+` AND (auth_index <> '' OR auth_id <> '' OR source <> '')
 GROUP BY account_key
 ORDER BY SUM(total_tokens) DESC
 LIMIT ?`, since, limit)
@@ -1622,11 +1654,12 @@ func readConfiguredXAIAccounts() []configuredAccount {
 }
 
 type configuredAuthFilesCacheState struct {
-	mu            sync.Mutex
-	dir           string
-	revision      string
-	accounts      []configuredAccount
-	authoritative bool
+	mu             sync.Mutex
+	dir            string
+	revision       string
+	accounts       []configuredAccount
+	authoritative  bool
+	fallbackStatus string
 }
 
 var configuredAuthFilesCache configuredAuthFilesCacheState
@@ -1640,10 +1673,12 @@ const (
 func readConfiguredAuthFiles() []configuredAccount {
 	authDir := configuredAuthDir()
 	if authDir == "" {
+		setConfiguredAuthFilesFallbackStatus("not_configured")
 		return nil
 	}
 	entries, revision, err := configuredAuthDirectorySnapshot(authDir)
 	if err != nil {
+		setConfiguredAuthFilesFallbackStatus("directory_unreadable")
 		return nil
 	}
 	configuredAuthFilesCache.mu.Lock()
@@ -1669,6 +1704,7 @@ func readConfiguredAuthFiles() []configuredAccount {
 			configuredAuthFilesCache.revision = revision
 			configuredAuthFilesCache.accounts = nil
 			configuredAuthFilesCache.authoritative = false
+			configuredAuthFilesCache.fallbackStatus = "file_unreadable"
 			configuredAuthFilesCache.mu.Unlock()
 			return nil
 		}
@@ -1679,6 +1715,7 @@ func readConfiguredAuthFiles() []configuredAccount {
 			configuredAuthFilesCache.revision = revision
 			configuredAuthFilesCache.accounts = nil
 			configuredAuthFilesCache.authoritative = false
+			configuredAuthFilesCache.fallbackStatus = "size_limit_exceeded"
 			configuredAuthFilesCache.mu.Unlock()
 			return nil
 		}
@@ -1689,6 +1726,7 @@ func readConfiguredAuthFiles() []configuredAccount {
 			configuredAuthFilesCache.revision = revision
 			configuredAuthFilesCache.accounts = nil
 			configuredAuthFilesCache.authoritative = false
+			configuredAuthFilesCache.fallbackStatus = "invalid_json"
 			configuredAuthFilesCache.mu.Unlock()
 			return nil
 		}
@@ -1744,8 +1782,24 @@ func readConfiguredAuthFiles() []configuredAccount {
 	configuredAuthFilesCache.revision = revision
 	configuredAuthFilesCache.accounts = cloneConfiguredAccounts(out)
 	configuredAuthFilesCache.authoritative = true
+	configuredAuthFilesCache.fallbackStatus = "ok"
 	configuredAuthFilesCache.mu.Unlock()
 	return cloneConfiguredAccounts(out)
+}
+
+func setConfiguredAuthFilesFallbackStatus(status string) {
+	configuredAuthFilesCache.mu.Lock()
+	configuredAuthFilesCache.fallbackStatus = status
+	configuredAuthFilesCache.mu.Unlock()
+}
+
+func configuredAuthFilesFallbackStatus() string {
+	configuredAuthFilesCache.mu.Lock()
+	defer configuredAuthFilesCache.mu.Unlock()
+	if configuredAuthFilesCache.fallbackStatus == "" {
+		return "unknown"
+	}
+	return configuredAuthFilesCache.fallbackStatus
 }
 
 func readConfiguredAuthJSONFile(path string) ([]byte, os.FileInfo, error) {
@@ -2489,39 +2543,7 @@ func accountIdentityAliases(identity accountIdentity) []string {
 }
 
 func normalizeAccountAliases(values ...string) []string {
-	seen := make(map[string]bool, len(values)*3)
-	out := make([]string, 0, len(values)*3)
-	add := func(value string) {
-		alias := normalizeAccountAlias(value)
-		if alias == "" || seen[alias] {
-			return
-		}
-		seen[alias] = true
-		out = append(out, alias)
-	}
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
-		add(value)
-		base := filepath.Base(value)
-		if base != value {
-			add(base)
-		}
-		for _, candidate := range []string{value, base} {
-			lower := strings.ToLower(candidate)
-			if strings.HasSuffix(lower, ".cpa.json") {
-				add(candidate[:len(candidate)-len(".cpa.json")])
-				add(candidate[:len(candidate)-len(".json")])
-				continue
-			}
-			if strings.HasSuffix(lower, ".json") {
-				add(candidate[:len(candidate)-len(".json")])
-			}
-		}
-	}
-	return out
+	return expandAccountAliases(values, true)
 }
 
 func normalizeAccountAlias(value string) string {
@@ -2572,12 +2594,13 @@ FROM (
   SELECT 'usage' AS source_type, id, requested_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, '' AS auth_file, ` + percentColumn + `, ` + resetColumn + `
   FROM usage_events
   WHERE requested_at >= ?
+  AND provider='codex'
   AND (` + trustedUsageQuotaSnapshotSQL() + `)
   AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
   UNION ALL
   SELECT 'trigger' AS source_type, id, finished_at AS observed_at, lower(auth_index) AS auth_index, lower(auth_id) AS auth_id, lower(source) AS source, lower(auth_file) AS auth_file, ` + percentColumn + `, ` + resetColumn + `
   FROM quota_trigger_runs
-  WHERE finished_at >= ? AND status='success' AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
+  WHERE finished_at >= ? AND provider='codex' AND status='success' AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
 ) snapshots
 ORDER BY observed_at DESC, id DESC`
 	rows, err := db.QueryContext(ctx, query, since, since)
@@ -2664,26 +2687,41 @@ func accountQuotaAliasSets(accounts []accountRow) [][]string {
 }
 
 func strictFileIdentityAliases(values ...string) []string {
-	var out []string
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
+	return expandAccountAliases(values, false)
+}
+
+// expandAccountAliases computes the closure of path-base and JSON-suffix
+// transformations. Applying normalization to its own output is therefore
+// stable even for unusual but legal strings such as "dir/.json" or a path
+// ending in a separator.
+func expandAccountAliases(values []string, includeCPAStem bool) []string {
+	queue := append([]string(nil), values...)
+	processed := make(map[string]bool, len(queue)*3)
+	seen := make(map[string]bool, len(queue)*3)
+	out := make([]string, 0, len(queue)*3)
+	for len(queue) > 0 {
+		value := strings.TrimSpace(queue[0])
+		queue = queue[1:]
+		if value == "" || processed[value] {
 			continue
 		}
-		base := filepath.Base(value)
-		for _, candidate := range []string{value, base} {
-			alias := normalizeAccountAlias(candidate)
-			if alias == "" {
-				continue
-			}
+		processed[value] = true
+		if alias := normalizeAccountAlias(value); alias != "" && !seen[alias] {
+			seen[alias] = true
 			out = append(out, alias)
-			lower := strings.ToLower(candidate)
-			if strings.HasSuffix(lower, ".json") {
-				out = append(out, normalizeAccountAlias(candidate[:len(candidate)-len(".json")]))
-			}
+		}
+		if base := filepath.Base(value); base != "" && base != value {
+			queue = append(queue, base)
+		}
+		lower := strings.ToLower(value)
+		if includeCPAStem && strings.HasSuffix(lower, ".cpa.json") {
+			queue = append(queue, value[:len(value)-len(".cpa.json")])
+		}
+		if strings.HasSuffix(lower, ".json") {
+			queue = append(queue, value[:len(value)-len(".json")])
 		}
 	}
-	return uniqueNonEmptyAliases(out)
+	return out
 }
 
 func uniqueNonEmptyAliases(values []string) []string {
@@ -2847,7 +2885,7 @@ func queryAccountWindowTokensBatch(ctx context.Context, db *sql.DB, windows []ac
 		rows, err := db.QueryContext(ctx, `
 SELECT requested_at, total_tokens, lower(auth_index), lower(auth_id), lower(source)
 FROM usage_events
-WHERE requested_at >= ? AND requested_at <= ?
+WHERE provider='codex' AND generate=1 AND requested_at >= ? AND requested_at <= ?
 AND (
   (auth_index <> '' AND lower(auth_index) IN (`+placeholders+`))
   OR (auth_id <> '' AND lower(auth_id) IN (`+placeholders+`))
@@ -2910,7 +2948,7 @@ func queryAccountTokensBetween(ctx context.Context, db *sql.DB, account accountR
 	_ = db.QueryRowContext(ctx, `
 SELECT COALESCE(SUM(total_tokens),0)
 FROM usage_events
-WHERE requested_at >= ? AND requested_at <= ?
+WHERE provider='codex' AND generate=1 AND requested_at >= ? AND requested_at <= ?
 AND (
   (auth_index <> '' AND lower(auth_index) IN (`+placeholders+`))
   OR (auth_id <> '' AND lower(auth_id) IN (`+placeholders+`))
@@ -2997,7 +3035,8 @@ func queryExternalUseAlerts(ctx context.Context, db *sql.DB, since int64) ([]ext
 SELECT requested_at, provider, auth_id, auth_index, source, total_tokens,
 primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
 FROM (
-  SELECT id, requested_at, provider, auth_id, auth_index, source, total_tokens,
+  SELECT id, requested_at, provider, auth_id, auth_index, source,
+  CASE WHEN generate=1 THEN total_tokens ELSE 0 END AS total_tokens,
   primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
   FROM usage_events
   WHERE requested_at >= ?
@@ -3324,6 +3363,7 @@ func queryRecentQuotaTriggerRuns(ctx context.Context, db *sql.DB, limit int) ([]
 	rows, err := db.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, auth_file, mode, status, http_status, error, finished_at
 FROM quota_trigger_runs
+WHERE provider='codex'
 ORDER BY finished_at DESC, id DESC
 LIMIT ?`, limit)
 	if err != nil {
@@ -3473,6 +3513,7 @@ func latestSecondaryQuotaTriggerCapacities(ctx context.Context, db *sql.DB, acco
 SELECT auth_index, auth_id, source, auth_file, secondary_limit_tokens, secondary_remaining_tokens, secondary_reset_at, finished_at
 FROM quota_trigger_runs
 WHERE finished_at >= ?
+AND provider='codex'
 AND status='success'
 AND (secondary_limit_tokens IS NOT NULL OR secondary_remaining_tokens IS NOT NULL)
 ORDER BY finished_at DESC, id DESC`, since)
@@ -3586,7 +3627,7 @@ COUNT(DISTINCT NULLIF(COALESCE(NULLIF(auth_index,''), NULLIF(auth_id,''), NULLIF
 COUNT(DISTINCT NULLIF(model,'')),
 MAX(requested_at)
 FROM usage_events
-WHERE requested_at >= ? AND ` + usageScopeSQL(scope) + `
+WHERE requested_at >= ? AND ` + generatedUsageScopeSQL(scope) + `
 GROUP BY provider_key
 ORDER BY SUM(total_tokens) DESC
 LIMIT ?`
@@ -3630,11 +3671,11 @@ COUNT(DISTINCT NULLIF(model,'')),
 MAX(requested_at)
 FROM (
   SELECT api_key AS raw_key, ` + keyProtocolSQL() + ` AS protocol_key, ` + cpaProviderSQL() + ` AS provider_key,
-    requested_at, failed, status_code, input_tokens, output_tokens, reasoning_tokens,
+    requested_at, generate, failed, status_code, input_tokens, output_tokens, reasoning_tokens,
     cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
     latency_ms, ttft_ms, output_tokens, model
   FROM usage_events
-  WHERE requested_at >= ? AND api_key <> ''
+  WHERE generate=1 AND requested_at >= ? AND api_key <> ''
 ) keyed
 GROUP BY raw_key, protocol_key
 ORDER BY SUM(total_tokens) DESC, COUNT(*) DESC
@@ -3810,7 +3851,7 @@ COALESCE(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END),0),
 COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
 COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0)
 FROM usage_events
-WHERE requested_at >= ? AND ` + usageScopeSQL(scope) + `
+WHERE requested_at >= ? AND ` + generatedUsageScopeSQL(scope) + `
 GROUP BY model, alias, provider_key
 ORDER BY SUM(total_tokens) DESC
 LIMIT ?`

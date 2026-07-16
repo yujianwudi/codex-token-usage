@@ -62,18 +62,37 @@ for platform in "${platforms[@]}"; do
     echo "README.md is missing release asset: ${asset}" >&2
     exit 1
   fi
+  sbom="codex-token-usage_${version}_${platform}.spdx.json"
+  if ! grep -Fq "${sbom}" README.md; then
+    echo "README.md is missing release SBOM: ${sbom}" >&2
+    exit 1
+  fi
 done
 
-mapfile -t documented_asset_versions < <(
-  sed -n 's/^codex-token-usage_\([^_]*\)_\(linux\|windows\|darwin\)_.*/\1/p' README.md
+mapfile -t documented_archive_versions < <(
+  sed -n 's/^codex-token-usage_\([^_]*\)_\(linux\|windows\|darwin\)_.*\.zip$/\1/p' README.md
 )
-if (( ${#documented_asset_versions[@]} != ${#platforms[@]} )); then
-  echo "Expected ${#platforms[@]} documented release archives; found ${#documented_asset_versions[@]}" >&2
+if (( ${#documented_archive_versions[@]} != ${#platforms[@]} )); then
+  echo "Expected ${#platforms[@]} documented release archives; found ${#documented_archive_versions[@]}" >&2
   exit 1
 fi
-for candidate in "${documented_asset_versions[@]}"; do
+for candidate in "${documented_archive_versions[@]}"; do
   if [[ "${candidate}" != "${version}" ]]; then
     echo "README.md contains a stale release asset version: ${candidate}" >&2
+    exit 1
+  fi
+done
+
+mapfile -t documented_sbom_versions < <(
+  sed -n 's/^codex-token-usage_\([^_]*\)_\(linux\|windows\|darwin\)_.*\.spdx\.json$/\1/p' README.md
+)
+if (( ${#documented_sbom_versions[@]} != ${#platforms[@]} )); then
+  echo "Expected ${#platforms[@]} documented release SBOMs; found ${#documented_sbom_versions[@]}" >&2
+  exit 1
+fi
+for candidate in "${documented_sbom_versions[@]}"; do
+  if [[ "${candidate}" != "${version}" ]]; then
+    echo "README.md contains a stale release SBOM version: ${candidate}" >&2
     exit 1
   fi
 done
@@ -88,18 +107,22 @@ if [[ -z "${go_version}" ]]; then
   echo "Cannot determine Go version from go.mod" >&2
   exit 1
 fi
-mapfile -t workflow_go_versions < <(
-  sed -n 's/^[[:space:]]*GO_VERSION:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    .github/workflows/ci.yml .github/workflows/release.yml |
-    tr -d '\r'
+workflow_go_files=(
+  .github/workflows/ci.yml
+  .github/workflows/release.yml
+  .github/workflows/cpa-compat.yml
 )
-if (( ${#workflow_go_versions[@]} != 2 )); then
-  echo "Expected GO_VERSION in both workflows; found ${#workflow_go_versions[@]}" >&2
-  exit 1
-fi
-for candidate in "${workflow_go_versions[@]}"; do
-  if [[ "${candidate}" != "${go_version}" ]]; then
-    echo "Go version mismatch: go.mod=${go_version} workflow=${candidate}" >&2
+for workflow in "${workflow_go_files[@]}"; do
+  mapfile -t workflow_go_versions < <(
+    sed -n 's/^[[:space:]]*GO_VERSION:[[:space:]]*"\([^"]*\)".*/\1/p' "${workflow}" |
+      tr -d '\r'
+  )
+  if (( ${#workflow_go_versions[@]} != 1 )); then
+    echo "Expected exactly one GO_VERSION in ${workflow}; found ${#workflow_go_versions[@]}" >&2
+    exit 1
+  fi
+  if [[ "${workflow_go_versions[0]}" != "${go_version}" ]]; then
+    echo "Go version mismatch: go.mod=${go_version} ${workflow}=${workflow_go_versions[0]}" >&2
     exit 1
   fi
 done

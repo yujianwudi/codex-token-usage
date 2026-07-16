@@ -112,8 +112,8 @@ func TestSQLiteMigrationFingerprintsLegacyAPIKeysAndClearsSummaryCache(t *testin
 	db, path := openLegacyHardeningDB(t)
 	raw := "tenant-secret-1234567890"
 	if _, err := db.Exec(`INSERT INTO usage_events
-		(requested_at, api_key, auth_id, auth_index, source)
-		VALUES (1, ?, ?, ?, ?)`, raw, "prefix:"+raw, raw, "Bearer "+raw); err != nil {
+		(requested_at, provider, api_key, auth_id, auth_index, source)
+		VALUES (1, 'codex', ?, ?, ?, ?)`, raw, "prefix:"+raw, raw, "Bearer "+raw); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO summary_cache
@@ -163,7 +163,7 @@ func TestSQLiteMigrationFingerprintsLegacyAPIKeysAndClearsSummaryCache(t *testin
 
 func TestSQLiteInitializationPreservesLegitimateSlowLatency(t *testing.T) {
 	db, path := openLegacyHardeningDB(t)
-	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, latency_ms, ttft_ms) VALUES (1, 12000, 30000)`); err != nil {
+	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, latency_ms, ttft_ms) VALUES (1, 'codex', 12000, 30000)`); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {

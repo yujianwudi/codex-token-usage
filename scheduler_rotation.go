@@ -45,8 +45,9 @@ func schedulerRotationKey(req schedulerPickRequest, provider string) string {
 
 func (m *schedulerRotationManager) pick(key string, candidates []schedulerAuthCandidate) schedulerAuthCandidate {
 	rotationKey, affinityKey := splitSchedulerSelectionKey(key)
-	return globalSchedulerAffinity.pickOrBind(affinityKey, candidates, func() schedulerAuthCandidate {
-		return m.pickRotated(rotationKey, candidates)
+	eligible := highestPrioritySchedulerCandidates(candidates)
+	return globalSchedulerAffinity.pickOrBind(affinityKey, eligible, func() schedulerAuthCandidate {
+		return m.pickRotated(rotationKey, eligible)
 	})
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -126,6 +127,30 @@ func TestCodexHostAuthSourceCachesInvalidResponseClassification(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("host callback calls = %d, want cached invalid result", got)
+	}
+}
+
+func TestCodexFallbackDiagnosticsSeparateHostAndFilesystemStatus(t *testing.T) {
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	t.Setenv("CPA_CONFIG_PATH", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	if err := os.WriteFile(filepath.Join(authDir, "broken.json"), []byte(`{"type":"codex"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCaller := hostAuthCaller
+	oldSource := globalCodexAuthSource
+	t.Cleanup(func() { hostAuthCaller = oldCaller; globalCodexAuthSource = oldSource })
+	globalCodexAuthSource = &codexAuthSourceManager{}
+	hostAuthCaller = func(string, any) (json.RawMessage, error) {
+		return json.RawMessage(`{"files":`), nil
+	}
+	_ = readConfiguredAuthAccounts()
+	status := globalCodexAuthSource.status()
+	if status.HostStatus != "invalid_response" || status.FallbackStatus != "invalid_json" {
+		t.Fatalf("fallback diagnostics=%+v, want invalid_response/invalid_json", status)
+	}
+	if status.LastError != "host_invalid_response;filesystem_invalid_json" {
+		t.Fatalf("fallback last_error=%q", status.LastError)
 	}
 }
 

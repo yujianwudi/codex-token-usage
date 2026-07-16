@@ -118,6 +118,7 @@ func (m *codexAuthSourceManager) hostAccounts() ([]configuredAccount, error) {
 		Source:        "host_callback",
 		Authoritative: true,
 		Accounts:      len(accounts),
+		HostStatus:    "ok",
 		LastSuccessAt: now.Format(time.RFC3339),
 	}
 	m.mu.Lock()
@@ -159,6 +160,7 @@ func (m *codexAuthSourceManager) recordHostFailure(failure error) {
 		Source:        "host_callback_error",
 		Authoritative: false,
 		Accounts:      len(m.accounts),
+		HostStatus:    hostAuthDiagnosticStatus(failure),
 		LastSuccessAt: m.diagnostics.LastSuccessAt,
 		LastError:     failure.Error(),
 	}
@@ -168,7 +170,7 @@ func (m *codexAuthSourceManager) recordHostFailure(failure error) {
 // markFilesystemFallback records the caller-selected fallback without making
 // it authoritative. The host can expose runtime-only credentials, so a local
 // directory cannot prove that absent host entries were removed.
-func (m *codexAuthSourceManager) markFilesystemFallback(accounts []configuredAccount, _ error) []configuredAccount {
+func (m *codexAuthSourceManager) markFilesystemFallback(accounts []configuredAccount, hostErr error) []configuredAccount {
 	m.mu.Lock()
 	if m.callbackErr == nil && m.diagnostics.Source == "host_callback" && m.diagnostics.Authoritative {
 		// A filesystem read that started after an older callback failure must not
@@ -181,12 +183,16 @@ func (m *codexAuthSourceManager) markFilesystemFallback(accounts []configuredAcc
 	merged := mergeCodexAccountSnapshots(m.hostSnapshot, accounts)
 	m.accounts = cloneConfiguredAccounts(merged)
 	m.revision = configuredAccountListRevision(merged)
+	hostStatus := hostAuthDiagnosticStatus(hostErr)
+	fallbackStatus := configuredAuthFilesFallbackStatus()
 	m.diagnostics = xaiAuthSourceDiagnostics{
-		Source:        "filesystem_fallback",
-		Authoritative: false,
-		Accounts:      len(merged),
-		LastSuccessAt: m.diagnostics.LastSuccessAt,
-		LastError:     errCodexHostAuthListUnavailable.Error(),
+		Source:         "filesystem_fallback",
+		Authoritative:  false,
+		Accounts:       len(merged),
+		HostStatus:     hostStatus,
+		FallbackStatus: fallbackStatus,
+		LastSuccessAt:  m.diagnostics.LastSuccessAt,
+		LastError:      authSourceFallbackDiagnostic(hostStatus, fallbackStatus),
 	}
 	m.mu.Unlock()
 	return cloneConfiguredAccounts(merged)

@@ -119,8 +119,8 @@ func TestExecuteQuotaTriggerReportsAuthStateWriteErrors(t *testing.T) {
 			if run.Status != "failed" {
 				t.Fatalf("run status = %q, want failed after auth-state write error", run.Status)
 			}
-			if !strings.Contains(run.Error, "quota auth state write failed") || !strings.Contains(run.Error, "invalid_auths") {
-				t.Fatalf("run error = %q, want surfaced invalid_auths write failure", run.Error)
+			if run.Error != "quota auth state write failed: trigger failed" {
+				t.Fatalf("run error = %q, want fixed low-sensitivity write failure", run.Error)
 			}
 		})
 	}

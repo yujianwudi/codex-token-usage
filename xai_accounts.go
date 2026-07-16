@@ -47,6 +47,16 @@ func xaiStateForRecord(rec usageRecord, status int, now int64) (state, reason st
 	if !rec.Failed {
 		return "", "", 0
 	}
+	if !rec.isGenerated() {
+		// Non-generation callbacks are audit/authentication signals, not model
+		// quota traffic. Only explicit credential HTTP statuses may change xAI
+		// auth state; status-less, 429, and server failures stay audit-only.
+		switch status {
+		case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+		default:
+			return "", "", 0
+		}
+	}
 	parsed := parseXAIError(status, rec.Failure.Body)
 	switch parsed.Kind {
 	case xaiErrorUnauthorized, xaiErrorTokenExpired, xaiErrorTokenRevoked:
@@ -139,7 +149,7 @@ func recordXAIStateIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, st
 	if now <= 0 {
 		now = time.Now().Unix()
 	}
-	if !rec.Failed && successfulStatusCode(status) {
+	if rec.isGenerated() && !rec.Failed && successfulStatusCode(status) {
 		changed, err := clearRecoveredXAIState(ctx, db, rec)
 		if err != nil {
 			return err
@@ -165,7 +175,7 @@ INSERT INTO xai_account_states (
   state_key, auth_id, auth_index, source, provider, state, reason, observed_at,
   reset_at, active, last_status_code, auth_file, auth_file_mtime
 ) VALUES (?, ?, ?, ?, 'xai', ?, ?, ?, ?, 1, ?, ?, ?)
-ON CONFLICT(state_key) DO UPDATE SET
+ON CONFLICT(provider, state_key) DO UPDATE SET
   auth_id=excluded.auth_id,
   auth_index=excluded.auth_index,
   source=excluded.source,
@@ -193,7 +203,8 @@ func clearRecoveredXAIState(ctx context.Context, db *sql.DB, rec usageRecord) (b
 	for _, alias := range aliases {
 		result, err := db.ExecContext(ctx, `
 UPDATE xai_account_states SET active=0
-WHERE active=1
+WHERE provider='xai'
+AND active=1
 AND state IN (?, ?, ?)
 AND observed_at <= ?
 AND (lower(state_key)=? OR lower(auth_id)=? OR lower(auth_index)=? OR lower(source)=? OR lower(auth_file)=?)`,
@@ -210,7 +221,7 @@ AND (lower(state_key)=? OR lower(auth_id)=? OR lower(auth_index)=? OR lower(sour
 }
 
 func expireXAIStates(ctx context.Context, db *sql.DB, now int64) error {
-	result, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE active=1 AND reset_at>0 AND reset_at<=?`, now)
+	result, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE provider='xai' AND active=1 AND reset_at>0 AND reset_at<=?`, now)
 	if err != nil {
 		return err
 	}
@@ -220,13 +231,17 @@ func expireXAIStates(ctx context.Context, db *sql.DB, now int64) error {
 	return nil
 }
 
-func queryActiveXAIStates(ctx context.Context, db *sql.DB, now int64) ([]xaiAccountStateRow, error) {
+func queryActiveXAIStates(ctx context.Context, db *sql.DB, provider string, now int64) ([]xaiAccountStateRow, error) {
+	provider, err := requiredCanonicalProvider(provider)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := db.QueryContext(ctx, `
 SELECT state_key, auth_id, auth_index, source, provider, state, reason, observed_at, reset_at,
 active, last_status_code, auth_file, auth_file_mtime
 FROM xai_account_states
-WHERE active=1 AND (reset_at=0 OR reset_at>?)
-ORDER BY CASE WHEN reset_at=0 THEN 1 ELSE 0 END, reset_at, observed_at DESC`, now)
+WHERE provider=? AND active=1 AND (reset_at=0 OR reset_at>?)
+ORDER BY CASE WHEN reset_at=0 THEN 1 ELSE 0 END, reset_at, observed_at DESC`, provider, now)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +316,7 @@ func clearReplacedOrMissingXAIStates(ctx context.Context, db *sql.DB) error {
 	configured := readConfiguredXAIAccounts()
 	changed := false
 	if globalXAIAuthSource.authoritative() {
-		states, err := queryActiveXAIStates(ctx, db, time.Now().Unix())
+		states, err := queryActiveXAIStates(ctx, db, providerXAI, time.Now().Unix())
 		if err != nil {
 			return err
 		}
@@ -314,7 +329,7 @@ func clearReplacedOrMissingXAIStates(ctx context.Context, db *sql.DB) error {
 			if _, ok := keep[state.StateKey]; ok {
 				continue
 			}
-			result, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE state_key=?`, state.StateKey)
+			result, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE provider='xai' AND state_key=?`, state.StateKey)
 			if err != nil {
 				return err
 			}
@@ -327,7 +342,7 @@ func clearReplacedOrMissingXAIStates(ctx context.Context, db *sql.DB) error {
 		if cfg.AuthFileMTime <= 0 {
 			continue
 		}
-		result, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE active=1 AND auth_file=? AND ?>observed_at`, cfg.AuthFile, cfg.AuthFileMTime)
+		result, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE provider='xai' AND active=1 AND auth_file=? AND ?>observed_at`, cfg.AuthFile, cfg.AuthFileMTime)
 		if err != nil {
 			return err
 		}

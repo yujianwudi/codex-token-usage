@@ -242,7 +242,7 @@ SELECT model, alias, provider, service_tier,
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cached_tokens),0),
 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(total_tokens),0)
 FROM usage_events
-WHERE requested_at >= ? AND `+usageScopeSQL(scope)+`
+WHERE requested_at >= ? AND `+generatedUsageScopeSQL(scope)+`
 GROUP BY model, alias, provider, service_tier`, since)
 	if err != nil {
 		return err
@@ -265,7 +265,7 @@ model, alias, provider, service_tier,
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cached_tokens),0),
 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(total_tokens),0)
 FROM usage_events
-WHERE requested_at >= ? AND `+usageScopeSQL(scope)+` AND (auth_index <> '' OR auth_id <> '' OR source <> '')
+WHERE requested_at >= ? AND `+generatedUsageScopeSQL(scope)+` AND (auth_index <> '' OR auth_id <> '' OR source <> '')
 GROUP BY account_key, model, alias, provider, service_tier`, since)
 	if err != nil {
 		return err
@@ -305,7 +305,7 @@ SELECT `+cpaProviderSQL()+` AS provider_key, model, alias, provider, service_tie
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cached_tokens),0),
 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(total_tokens),0)
 FROM usage_events
-WHERE requested_at >= ? AND `+usageScopeSQL(scope)+`
+WHERE requested_at >= ? AND `+generatedUsageScopeSQL(scope)+`
 GROUP BY provider_key, model, alias, provider, service_tier`, since)
 	if err != nil {
 		return err
@@ -344,7 +344,7 @@ SELECT api_key, `+keyProtocolSQL()+` AS protocol_key, model, alias, `+cpaProvide
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cached_tokens),0),
 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(total_tokens),0)
 FROM usage_events
-WHERE requested_at >= ? AND api_key <> ''
+WHERE generate=1 AND requested_at >= ? AND api_key <> ''
 GROUP BY api_key, protocol_key, model, alias, provider_key, service_tier`, since)
 	if err != nil {
 		return err
@@ -380,7 +380,7 @@ SELECT model, alias, `+cpaProviderSQL()+` AS provider_key, service_tier,
 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cached_tokens),0),
 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(total_tokens),0)
 FROM usage_events
-WHERE requested_at >= ? AND `+usageScopeSQL(scope)+`
+WHERE requested_at >= ? AND `+generatedUsageScopeSQL(scope)+`
 GROUP BY model, alias, provider_key, service_tier`, since)
 	if err != nil {
 		return err

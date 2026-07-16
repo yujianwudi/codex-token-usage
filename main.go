@@ -3,6 +3,7 @@ package main
 /*
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
 	void* ptr;
@@ -38,6 +39,12 @@ static const cliproxy_host_api* stored_host;
 
 static void store_host_api(const cliproxy_host_api* host) {
 	stored_host = host;
+}
+
+static void clear_plugin_api(cliproxy_plugin_api* plugin) {
+	if (plugin != NULL) {
+		memset(plugin, 0, sizeof(*plugin));
+	}
 }
 
 static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
@@ -87,7 +94,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.38"
+	pluginVersion    = "0.1.39"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/yujianwudi/codex-token-usage"
 )
@@ -237,6 +244,7 @@ type schedulerPickRequest struct {
 	Stream     bool                     `json:"Stream"`
 	Options    schedulerOptions         `json:"Options"`
 	Candidates []schedulerAuthCandidate `json:"Candidates"`
+	filter     *schedulerRequestFilter  `json:"-"`
 }
 
 type schedulerOptions struct {
@@ -288,6 +296,7 @@ type usageRecord struct {
 	Source          string              `json:"Source"`
 	ReasoningEffort string              `json:"ReasoningEffort"`
 	ServiceTier     string              `json:"ServiceTier"`
+	Generate        bool                `json:"Generate"`
 	RequestedAt     time.Time           `json:"RequestedAt"`
 	Latency         int64               `json:"Latency"`
 	TTFT            int64               `json:"TTFT"`
@@ -295,6 +304,33 @@ type usageRecord struct {
 	Failure         usageFailure        `json:"Failure"`
 	Detail          usageDetail         `json:"Detail"`
 	ResponseHeaders map[string][]string `json:"ResponseHeaders"`
+	generateSet     bool
+}
+
+func (r *usageRecord) UnmarshalJSON(data []byte) error {
+	type usageRecordAlias usageRecord
+	var decoded usageRecordAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var presence struct {
+		Generate *bool `json:"Generate"`
+	}
+	if err := json.Unmarshal(data, &presence); err != nil {
+		return err
+	}
+	*r = usageRecord(decoded)
+	if presence.Generate == nil {
+		r.Generate = true
+		return nil
+	}
+	r.Generate = *presence.Generate
+	r.generateSet = true
+	return nil
+}
+
+func (r usageRecord) isGenerated() bool {
+	return !r.generateSet || r.Generate
 }
 
 type usageFailure struct {
@@ -336,7 +372,27 @@ const forbiddenInvalidAuthThreshold = 3
 func main() {}
 
 //export cliproxy_plugin_init
-func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) (code C.int) {
+	code = 1
+	defer func() {
+		if recover() == nil {
+			return
+		}
+		code = 1
+		abiBestEffort(func() {
+			C.clear_plugin_api(plugin)
+			C.store_host_api((*C.cliproxy_host_api)(nil))
+		})
+	}()
+	// A failed init must never leave the host with partially initialized
+	// function pointers. Clear the output before any Go hook, lock, or callback
+	// can panic, and clear it again from the recovery path.
+	C.clear_plugin_api(plugin)
+	runABIPanicHook(abiPanicInit)
+	return cliproxyPluginInit(host, plugin)
+}
+
+func cliproxyPluginInit(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
 	pluginLifecycleGate.Lock()
 	defer pluginLifecycleGate.Unlock()
 	if plugin == nil {
@@ -347,13 +403,28 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
 	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
+	runABIPanicHook(abiPanicInitAfterPublish)
 	resetPluginOperationContext()
 	pluginLifecycleStopped = false
 	return 0
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (code C.int) {
+	code = 1
+	defer func() {
+		if recover() == nil {
+			return
+		}
+		code = 1
+		writeABIPanicResponse(response)
+	}()
+	clearABIResponseBuffer(response)
+	runABIPanicHook(abiPanicCall)
+	return cliproxyPluginCallBody(method, request, requestLen, response)
+}
+
+func cliproxyPluginCallBody(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
@@ -382,15 +453,23 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	raw, err := handleMethod(methodName, req)
 	if err != nil {
-		writeResponse(response, errorEnvelope("plugin_error", err.Error()))
+		writeResponse(response, errorEnvelope("plugin_error", publicErrorMessage("plugin_error")))
 		return 1
 	}
 	writeResponse(response, raw)
+	runABIPanicHook(abiPanicCallAfterResponse)
 	return 0
 }
 
 //export cliproxyPluginFree
 func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
+	defer func() {
+		_ = recover()
+	}()
+	// The harness hook is deliberately before C.free. This lets the native test
+	// retry the same real plugin-owned pointer after the recovered panic instead
+	// of manufacturing an unsafe pointer solely to exercise this boundary.
+	runABIPanicHook(abiPanicFree)
 	if ptr != nil {
 		C.free(ptr)
 	}
@@ -399,24 +478,55 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
-	cancelPluginOperationContext()
+	defer func() {
+		_ = recover()
+	}()
+	cliproxyPluginShutdownBestEffort()
+	// Exercise the final top-level boundary only after all cleanup attempts have
+	// run. The production hook compiles to a no-op.
+	runABIPanicHook(abiPanicShutdownBoundary)
+}
+
+func cliproxyPluginShutdownBestEffort() {
+	abiShutdownStep(abiPanicShutdownCancelOperations, cancelPluginOperationContext)
 	pluginLifecycleGate.Lock()
 	defer pluginLifecycleGate.Unlock()
 	pluginLifecycleStopped = true
-	globalSchedulerStateRefresher.stop()
-	globalAccountProtection.stop()
-	globalQuotaTrigger.stop()
-	globalModelPriceUpdater.stop()
-	globalRetentionCleaner.stop()
-	globalDBHealth.stop()
-	globalSummaryMaintenance.stop()
-	globalSummaryPrecomputer.stop()
+	abiShutdownStep(abiPanicShutdownSchedulerState, globalSchedulerStateRefresher.stop)
+	abiShutdownStep(abiPanicShutdownAccountProtection, globalAccountProtection.stop)
+	abiShutdownStep(abiPanicShutdownQuotaTrigger, globalQuotaTrigger.stop)
+	abiShutdownStep(abiPanicShutdownModelPrices, globalModelPriceUpdater.stop)
+	abiShutdownStep(abiPanicShutdownRetention, globalRetentionCleaner.stop)
+	abiShutdownStep(abiPanicShutdownDBHealth, globalDBHealth.stop)
+	abiShutdownStep(abiPanicShutdownSummaryMaintenance, globalSummaryMaintenance.stop)
+	abiShutdownStep(abiPanicShutdownSummaryPrecompute, globalSummaryPrecomputer.stop)
 	// Invalidate only after every background publisher has stopped. Otherwise a
 	// maintenance pass that was already in flight can republish a snapshot after
 	// the earlier invalidation while shutdown is still joining other workers.
-	globalSchedulerState.invalidate()
-	globalSchedulerAffinity.reset()
-	globalStore.close()
+	abiShutdownStep(abiPanicShutdownSchedulerInvalidate, globalSchedulerState.invalidate)
+	abiShutdownStep(abiPanicShutdownAffinity, globalSchedulerAffinity.reset)
+	abiShutdownStep(abiPanicShutdownStore, globalStore.close)
+}
+
+func clearABIResponseBuffer(response *C.cliproxy_buffer) {
+	if response == nil {
+		return
+	}
+	response.ptr = nil
+	response.len = 0
+}
+
+func writeABIPanicResponse(response *C.cliproxy_buffer) {
+	abiBestEffort(func() {
+		if response == nil {
+			return
+		}
+		if response.ptr != nil {
+			C.free(response.ptr)
+		}
+		clearABIResponseBuffer(response)
+		writeResponse(response, abiPluginPanicEnvelope())
+	})
 }
 
 func callHost(method string, payload any) (json.RawMessage, error) {
@@ -453,7 +563,7 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 	}
 	if !env.OK {
 		if env.Error != nil {
-			return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+			return nil, fmt.Errorf("host callback %s failed: %s", method, safeHostErrorCode(env.Error.Code))
 		}
 		return nil, fmt.Errorf("host callback %s failed", method)
 	}
@@ -461,6 +571,20 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("host callback %s returned code=%d", method, int(code))
 	}
 	return append(json.RawMessage(nil), env.Result...), nil
+}
+
+func safeHostErrorCode(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || len(value) > 64 || looksLikeCredentialToken(value) {
+		return "host_error"
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			continue
+		}
+		return "host_error"
+	}
+	return value
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
@@ -497,13 +621,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case "management.handle":
 		var req managementRequest
 		if err := json.Unmarshal(request, &req); err != nil {
-			return okJSON(jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()}))
+			return okJSON(jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": publicErrorMessage("bad_request")}))
 		}
 		return okJSON(handleManagement(req))
 	case "usage.handle":
 		var rec usageRecord
 		if err := json.Unmarshal(request, &rec); err != nil {
-			return okJSON(map[string]any{"ignored": true, "error": err.Error()})
+			return okJSON(map[string]any{"ignored": true, "error": publicErrorMessage("usage_invalid")})
 		}
 		if err := globalStore.recordUsage(currentPluginOperationContext(), rec); err != nil {
 			var postProcessErr *usagePostProcessError
@@ -513,7 +637,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 					"warning": "usage stored; derived account state update failed",
 				})
 			}
-			return okJSON(map[string]any{"stored": false, "error": err.Error()})
+			return okJSON(map[string]any{"stored": false, "error": publicErrorMessage("usage_store_failed")})
 		}
 		return okJSON(map[string]any{"stored": true})
 	case "scheduler.pick":
@@ -604,7 +728,7 @@ func handleManagement(req managementRequest) managementResponse {
 		var err error
 		if syncRefresh {
 			if err := globalStore.runSummaryMaintenance(ctx); err != nil {
-				return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
+				return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": publicErrorMessage("summary_failed")})
 			}
 			data, err = globalSummaryPrecomputer.summarySync(ctx, globalStore, window, limit)
 		} else if forceRefresh {
@@ -613,7 +737,7 @@ func handleManagement(req managementRequest) managementResponse {
 			data, err = globalSummaryPrecomputer.summary(ctx, globalStore, window, limit)
 		}
 		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": publicErrorMessage("summary_failed")})
 		}
 		truncateSummaryResponse(data, requestedLimit)
 		return jsonResponse(http.StatusOK, data)
@@ -635,16 +759,16 @@ func handleManagement(req managementRequest) managementResponse {
 		var body autobanReleaseRequest
 		if len(req.Body) > 0 {
 			if err := json.Unmarshal(req.Body, &body); err != nil {
-				return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()})
+				return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": publicErrorMessage("bad_request")})
 			}
 		}
 		db, _, err := globalStore.open(ctx)
 		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "release_failed", "message": err.Error()})
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "release_failed", "message": publicErrorMessage("release_failed")})
 		}
 		result, err := releaseAutobans(ctx, db, body)
 		if err != nil {
-			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "release_failed", "message": err.Error()})
+			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "release_failed", "message": publicErrorMessage("release_failed")})
 		}
 		return jsonResponse(http.StatusOK, result)
 	}
@@ -1017,7 +1141,10 @@ type store struct {
 	repairMu          sync.Mutex
 	db                *sql.DB
 	dbPath            string
+	reservationDB     *sql.DB
+	reservationDBPath string
 	privacyQuarantine apiKeyPrivacyQuarantineStoreState
+	providerRevisions persistentSchedulerRevisionState
 }
 
 func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
@@ -1046,7 +1173,24 @@ func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
 		_ = db.Close()
 		return nil, "", err
 	}
-	if err := s.refreshAPIKeyPrivacyQuarantine(ctx, db, path); err != nil {
+	_, err = func() (persistentSchedulerRevisions, error) {
+		s.providerRevisions.privacyRefreshMu.Lock()
+		defer s.providerRevisions.privacyRefreshMu.Unlock()
+		stable, err := stabilizePrivacySnapshot(
+			ctx,
+			func(ctx context.Context) (persistentSchedulerRevisions, error) {
+				return queryPersistentSchedulerRevisions(ctx, db)
+			},
+			func(ctx context.Context) error {
+				return s.refreshAPIKeyPrivacyQuarantine(ctx, db, path)
+			},
+		)
+		if err == nil {
+			s.providerRevisions.reset(stable)
+		}
+		return stable, err
+	}()
+	if err != nil {
 		_ = db.Close()
 		return nil, "", err
 	}
@@ -1097,21 +1241,6 @@ func openSQLiteDB(path string) (*sql.DB, error) {
 }
 
 func initializeSQLiteStore(ctx context.Context, db *sql.DB, path string) error {
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
-		return err
-	}
-	if err := ensureSummaryCacheColumns(ctx, db); err != nil {
-		return err
-	}
-	if err := ensureUsageEventColumns(ctx, db); err != nil {
-		return err
-	}
-	if err := ensureQuotaTriggerRunColumns(ctx, db); err != nil {
-		return err
-	}
-	if err := ensureAutobanBanColumns(ctx, db); err != nil {
-		return err
-	}
 	if err := migrateSQLiteStore(ctx, db, path); err != nil {
 		return err
 	}
@@ -1192,10 +1321,16 @@ func ensureAccountProtectionReservationColumns(ctx context.Context, db *sql.DB) 
 func (s *store) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.reservationDB != nil {
+		_ = s.reservationDB.Close()
+		s.reservationDB = nil
+		s.reservationDBPath = ""
+	}
 	if s.db != nil {
 		_ = s.db.Close()
 		s.db = nil
 	}
+	s.providerRevisions.clear()
 	s.privacyQuarantine.snapshot.Store(nil)
 }
 
@@ -1895,6 +2030,11 @@ func (m *quotaTriggerManager) runRound(ctx context.Context, cfg pluginConfig) {
 }
 
 func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
+	provider := canonicalProvider(rec.Provider)
+	if provider == "" {
+		return errors.New("usage provider is required")
+	}
+	rec.Provider = provider
 	db, dbPath, err := s.open(ctx)
 	if err != nil {
 		return err
@@ -1928,11 +2068,16 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.ExecContext(ctx, insertSQL,
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, insertSQL,
 		rec.RequestedAt.Unix(),
-		trim(rec.Provider), trim(rec.ExecutorType), trim(rec.Model), trim(rec.Alias),
+		rec.Provider, trim(rec.ExecutorType), trim(rec.Model), trim(rec.Alias),
 		trim(storedRec.APIKey), trim(storedRec.AuthID), trim(storedRec.AuthIndex), trim(rec.AuthType), trim(storedRec.Source),
-		trim(rec.ReasoningEffort), trim(rec.ServiceTier), latencyMs, ttftMs, boolInt(rec.Failed), status,
+		trim(rec.ReasoningEffort), trim(rec.ServiceTier), boolInt(rec.isGenerated()), latencyMs, ttftMs, boolInt(rec.Failed), status,
 		rec.Detail.InputTokens, rec.Detail.OutputTokens, rec.Detail.ReasoningTokens, rec.Detail.CachedTokens,
 		rec.Detail.CacheReadTokens, rec.Detail.CacheCreationTokens, total,
 		primaryPct, primaryReset, secondaryPct, secondaryReset,
@@ -1940,8 +2085,15 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err != nil {
 		return err
 	}
+	reservationMatched, err := releaseProtectionReservation(ctx, tx, storedRec)
+	if err != nil {
+		return fmt.Errorf("release protection reservation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	globalSchedulerDiagnostics.recordLegacyReservationRelease(reservationMatched)
 	var postProcessErrors []error
-	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "release protection reservation", releaseProtectionReservation(ctx, db, storedRec))
 	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "record xAI state", recordXAIStateIfNeeded(ctx, db, storedRec, status))
 	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "record invalid auth", recordInvalidAuthIfNeeded(ctx, db, storedRec, status))
 	postProcessErrors = appendUsagePostProcessError(postProcessErrors, "record repeated forbidden", recordRepeatedForbiddenIfNeeded(ctx, db, storedRec, status))
@@ -1981,7 +2133,7 @@ INSERT INTO invalid_auths (
   auth_id, auth_index, source, provider, reason, invalidated_at, active,
   last_status_code, auth_file, auth_file_mtime
 ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-ON CONFLICT(auth_id) DO UPDATE SET
+ON CONFLICT(provider, auth_id) DO UPDATE SET
   auth_index=excluded.auth_index,
   source=excluded.source,
   provider=excluded.provider,
@@ -1991,7 +2143,7 @@ ON CONFLICT(auth_id) DO UPDATE SET
 	last_status_code=excluded.last_status_code,
   auth_file=excluded.auth_file,
   auth_file_mtime=excluded.auth_file_mtime`,
-		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider),
+		trim(authID), trim(rec.AuthIndex), trim(rec.Source), canonicalProviderOr(rec.Provider, providerCodex),
 		reason, invalidatedAt, status, authFile, authFileMTime,
 	)
 	return err
@@ -2020,6 +2172,9 @@ func shouldUseStrictAuthFileIdentity(rec usageRecord, authFile string) bool {
 
 func recordRepeatedForbiddenIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, status int) error {
 	if !strings.EqualFold(trim(rec.Provider), "codex") {
+		return nil
+	}
+	if !rec.isGenerated() {
 		return nil
 	}
 	if !rec.Failed || status != http.StatusForbidden {
@@ -2058,7 +2213,7 @@ func clearRecoveredAuthStateIfNeeded(ctx context.Context, db *sql.DB, rec usageR
 	if !strings.EqualFold(trim(rec.Provider), "codex") {
 		return nil
 	}
-	if rec.Failed || !successfulStatusCode(status) {
+	if !rec.isGenerated() || rec.Failed || !successfulStatusCode(status) {
 		return nil
 	}
 	aliases, strict := recoveryMatchAliasesForRecord(rec)
@@ -2073,6 +2228,7 @@ func clearRecoveredAuthStateIfNeeded(ctx context.Context, db *sql.DB, rec usageR
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
+AND provider='codex'
 AND invalidated_at <= ?
 AND (
   lower(auth_file)=?
@@ -2089,6 +2245,7 @@ AND (
 UPDATE autoban_bans
 SET active=0
 WHERE active=1
+AND provider='codex'
 AND banned_at <= ?
 AND (
   lower(auth_id)=?
@@ -2106,6 +2263,7 @@ AND (
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
+AND provider='codex'
 AND invalidated_at <= ?
 AND (
   lower(auth_id)=?
@@ -2123,6 +2281,7 @@ AND (
 UPDATE autoban_bans
 SET active=0
 WHERE active=1
+AND provider='codex'
 AND banned_at <= ?
 AND (
   lower(auth_id)=?
@@ -2171,6 +2330,9 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 	if !rec.Failed || status != http.StatusTooManyRequests {
 		return nil
 	}
+	if !rec.isGenerated() && primaryPct == nil && primaryReset == nil && secondaryPct == nil && secondaryReset == nil {
+		return nil
+	}
 	authFile, _ := authFileStateForRecord(rec)
 	authID := firstNonEmptyString(authFile, fileNameIfJSON(rec.AuthIndex), fileNameIfJSON(rec.AuthID), rec.AuthID, rec.AuthIndex, rec.Source)
 	if authID == "" {
@@ -2188,7 +2350,7 @@ INSERT INTO autoban_bans (
   last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
   released_at, release_reason
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, '')
-ON CONFLICT(auth_id) DO UPDATE SET
+ON CONFLICT(provider, auth_id) DO UPDATE SET
   auth_index=excluded.auth_index,
   source=excluded.source,
   provider=excluded.provider,
@@ -2204,7 +2366,7 @@ ON CONFLICT(auth_id) DO UPDATE SET
   secondary_reset_at=excluded.secondary_reset_at,
   released_at=0,
   release_reason=''`,
-		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider), window, reason, now, resetAt, status,
+		trim(authID), trim(rec.AuthIndex), trim(rec.Source), canonicalProviderOr(rec.Provider, providerCodex), window, reason, now, resetAt, status,
 		primaryPct, primaryReset, secondaryPct, secondaryReset,
 	)
 	return err
@@ -2243,19 +2405,35 @@ func releaseAutobans(ctx context.Context, db *sql.DB, req autobanReleaseRequest)
 	if scope == "" {
 		scope = "selected"
 	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return autobanReleaseResult{}, err
+	}
+	defer tx.Rollback()
 	now := time.Now().Unix()
+	var result autobanReleaseResult
 	switch scope {
 	case "all429":
-		return releaseAll429Autobans(ctx, db, now)
+		result, err = releaseAll429Autobans(ctx, tx, now)
 	case "selected":
-		return releaseSelectedAutobans(ctx, db, req.Items, now)
+		result, err = releaseSelectedAutobans(ctx, tx, req.Items, now)
 	default:
 		return autobanReleaseResult{}, fmt.Errorf("unsupported release scope %q", req.Scope)
 	}
+	if err != nil {
+		return result, err
+	}
+	if err := tx.Commit(); err != nil {
+		return result, err
+	}
+	if result.Released > 0 {
+		globalSchedulerState.invalidateProvider(providerCodex)
+	}
+	return result, nil
 }
 
-func releaseAll429Autobans(ctx context.Context, db *sql.DB, now int64) (autobanReleaseResult, error) {
-	rows, err := queryActiveAutobanReleaseRows(ctx, db)
+func releaseAll429Autobans(ctx context.Context, tx *sql.Tx, now int64) (autobanReleaseResult, error) {
+	rows, err := queryActiveAutobanReleaseRows(ctx, tx)
 	if err != nil {
 		return autobanReleaseResult{}, err
 	}
@@ -2274,7 +2452,7 @@ func releaseAll429Autobans(ctx context.Context, db *sql.DB, now int64) (autobanR
 			result.Items = append(result.Items, detail)
 			continue
 		}
-		ok, err := markAutobanReleased(ctx, db, row.AuthID, now)
+		ok, err := markAutobanReleasedInBatch(ctx, tx, row.AuthID, now)
 		if err != nil {
 			return result, err
 		}
@@ -2290,8 +2468,8 @@ func releaseAll429Autobans(ctx context.Context, db *sql.DB, now int64) (autobanR
 	return result, nil
 }
 
-func releaseSelectedAutobans(ctx context.Context, db *sql.DB, items []autobanReleaseItem, now int64) (autobanReleaseResult, error) {
-	rows, err := queryActiveAutobanReleaseRows(ctx, db)
+func releaseSelectedAutobans(ctx context.Context, tx *sql.Tx, items []autobanReleaseItem, now int64) (autobanReleaseResult, error) {
+	rows, err := queryActiveAutobanReleaseRows(ctx, tx)
 	if err != nil {
 		return autobanReleaseResult{}, err
 	}
@@ -2332,7 +2510,7 @@ func releaseSelectedAutobans(ctx context.Context, db *sql.DB, items []autobanRel
 			result.Items = append(result.Items, detail)
 			continue
 		}
-		ok, err := markAutobanReleased(ctx, db, row.AuthID, now)
+		ok, err := markAutobanReleasedInBatch(ctx, tx, row.AuthID, now)
 		if err != nil {
 			return result, err
 		}
@@ -2349,15 +2527,12 @@ func releaseSelectedAutobans(ctx context.Context, db *sql.DB, items []autobanRel
 	return result, nil
 }
 
-func queryActiveAutobanReleaseRows(ctx context.Context, db *sql.DB) ([]autobanRow, error) {
-	if err := normalizeStoredResetColumns(ctx, db); err != nil {
-		return nil, err
-	}
-	rows, err := db.QueryContext(ctx, `
+func queryActiveAutobanReleaseRows(ctx context.Context, tx *sql.Tx) ([]autobanRow, error) {
+	rows, err := tx.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active, last_status_code,
 primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at
 FROM autoban_bans
-WHERE active=1`)
+WHERE provider='codex' AND active=1`)
 	if err != nil {
 		return nil, err
 	}
@@ -2441,19 +2616,28 @@ func autobanReleaseItemMatchesRow(item autobanReleaseItem, row autobanRow) bool 
 }
 
 func markAutobanReleased(ctx context.Context, db *sql.DB, authID string, now int64) (bool, error) {
-	res, err := db.ExecContext(ctx, `
+	changed, err := markAutobanReleasedWithExec(ctx, db, authID, now)
+	if err == nil && changed {
+		globalSchedulerState.invalidateProvider(providerCodex)
+	}
+	return changed, err
+}
+
+func markAutobanReleasedInBatch(ctx context.Context, tx *sql.Tx, authID string, now int64) (bool, error) {
+	return markAutobanReleasedWithExec(ctx, tx, authID, now)
+}
+
+func markAutobanReleasedWithExec(ctx context.Context, exec sqliteStoreExecer, authID string, now int64) (bool, error) {
+	res, err := exec.ExecContext(ctx, `
 UPDATE autoban_bans
 SET active=0, released_at=?, release_reason='manual'
-WHERE active=1 AND auth_id=?`, now, strings.TrimSpace(authID))
+WHERE provider='codex' AND active=1 AND auth_id=?`, now, strings.TrimSpace(authID))
 	if err != nil {
 		return false, err
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return false, err
-	}
-	if affected > 0 {
-		globalSchedulerState.invalidateProvider("codex")
 	}
 	return affected > 0, nil
 }
@@ -2591,11 +2775,11 @@ func selectQuotaTriggerCandidates(ctx context.Context, db *sql.DB, cfg pluginCon
 	if len(accounts) == 0 {
 		return nil, 0, nil
 	}
-	invalids, err := queryActiveInvalidAuths(ctx, db)
+	invalids, err := queryActiveInvalidAuths(ctx, db, providerCodex)
 	if err != nil {
 		return nil, 0, err
 	}
-	bans, err := queryActiveAutobans(ctx, db, time.Now().Unix())
+	bans, err := queryActiveAutobans(ctx, db, providerCodex, time.Now().Unix())
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2984,7 +3168,7 @@ INSERT INTO quota_trigger_runs (
   primary_used_tokens, primary_remaining_tokens, primary_limit_tokens,
   secondary_used_tokens, secondary_remaining_tokens, secondary_limit_tokens
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		trim(run.AuthID), trim(run.AuthIndex), trim(run.Source), trim(run.Provider), trim(run.AuthFile),
+		trim(run.AuthID), trim(run.AuthIndex), trim(run.Source), canonicalProviderOr(run.Provider, providerCodex), trim(run.AuthFile),
 		trim(run.Mode), trim(run.Status), run.HTTPStatus, trim(run.Error), run.StartedAt, run.FinishedAt,
 		run.PrimaryUsedPercent, run.PrimaryResetAt, run.SecondaryUsedPercent, run.SecondaryResetAt,
 		run.PrimaryUsedTokens, run.PrimaryRemaining, run.PrimaryLimit, run.SecondaryUsedTokens, run.SecondaryRemaining, run.SecondaryLimit,
@@ -3088,7 +3272,8 @@ func latestQuotaTriggerFinishedAt(ctx context.Context, db *sql.DB, cfg configure
 		_ = db.QueryRowContext(ctx, `
 SELECT MAX(finished_at)
 FROM quota_trigger_runs
-WHERE lower(auth_id)=? OR lower(auth_index)=? OR lower(source)=? OR lower(auth_file)=?`, alias, alias, alias, alias).Scan(&value)
+WHERE provider='codex'
+AND (lower(auth_id)=? OR lower(auth_index)=? OR lower(source)=? OR lower(auth_file)=?)`, alias, alias, alias, alias).Scan(&value)
 		if value.Valid && value.Int64 > latest {
 			latest = value.Int64
 		}
@@ -3277,6 +3462,9 @@ func sanitizeTriggerError(value any) string {
 		return ""
 	}
 	lower := strings.ToLower(text)
+	if containsSensitiveDiagnosticDetails(text, lower) {
+		return "trigger failed"
+	}
 	if containsAuthorizationHeader(lower) {
 		return "trigger failed"
 	}
@@ -3299,6 +3487,30 @@ func sanitizeTriggerError(value any) string {
 		text = text[:220]
 	}
 	return text
+}
+
+func containsSensitiveDiagnosticDetails(text, lower string) bool {
+	for _, marker := range []string{
+		"sqlite", "no such table", "no such column", "sql logic error",
+		"database disk image", "quick_check", ".db-wal", ".db-shm", ".db:",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	for _, field := range strings.Fields(text) {
+		field = strings.Trim(field, "\"'`[]{}(),;:=<>")
+		if strings.HasPrefix(field, `\\`) || strings.HasPrefix(field, "file://") {
+			return true
+		}
+		if len(field) >= 3 && ((field[0] >= 'A' && field[0] <= 'Z') || (field[0] >= 'a' && field[0] <= 'z')) && field[1] == ':' && (field[2] == '\\' || field[2] == '/') {
+			return true
+		}
+		if strings.HasPrefix(field, "/") && !strings.HasPrefix(field, "//") {
+			return true
+		}
+	}
+	return false
 }
 
 func containsAuthorizationHeader(lower string) bool {
@@ -3374,11 +3586,14 @@ func retrySchedulerStateChange(ctx context.Context, pick func() (schedulerPickRe
 }
 
 func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
-	if len(req.Candidates) > 0 {
-		if provider, reason, quarantined := s.schedulerRequestPrivacyQuarantine(req); quarantined {
-			return schedulerPickResponse{}, &schedulerRejectError{Code: "privacy_quarantine", Message: provider + ": " + reason + "; restore the configured API key or release the legacy restriction, then restart", HTTPStatus: http.StatusServiceUnavailable}
-		}
+	if err := s.reconcilePersistentSchedulerRevisions(ctx); err != nil {
+		return schedulerPickResponse{Handled: false}, err
 	}
+	prepared, err := s.prepareSchedulerRequest(req)
+	if err != nil {
+		return schedulerPickResponse{}, err
+	}
+	req = prepared
 	if isMixedSchedulerRequest(req) {
 		return s.pickMixedAuthOnce(ctx, req)
 	}
@@ -3386,6 +3601,10 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		return s.pickXAIAuthOnce(ctx, req)
 	}
 	if !isCodexSchedulerRequest(req) {
+		if req.filter != nil && req.filter.forceHandle() && len(req.Candidates) > 0 {
+			chosen := pickSchedulerCandidate(schedulerRotationKey(req, req.Candidates[0].Provider), schedulerAffinityKey(req, req.Candidates[0].Provider), req.Candidates)
+			return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+		}
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	if len(req.Candidates) == 0 {
@@ -3402,7 +3621,7 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 			globalSchedulerStateRefresher.requestRefresh()
 		}
 	}
-	if snapshotReady && restrictionSnapshot.empty() && !protectionCfg.AccountProtectionEnabled {
+	if snapshotReady && restrictionSnapshot.empty() && !protectionCfg.AccountProtectionEnabled && (req.filter == nil || !req.filter.forceHandle()) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	var db *sql.DB
@@ -3418,11 +3637,11 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 		if s == globalStore {
 			codexGeneration = globalSchedulerState.providerGeneration("codex")
 		}
-		bans, err := queryActiveAutobans(ctx, db, now)
+		bans, err := queryActiveAutobans(ctx, db, providerCodex, now)
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
-		invalids, err := queryActiveInvalidAuths(ctx, db)
+		invalids, err := queryActiveInvalidAuths(ctx, db, providerCodex)
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
@@ -3435,7 +3654,7 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 			}
 		}
 	}
-	if restrictionSnapshot.empty() && !protectionCfg.AccountProtectionEnabled {
+	if restrictionSnapshot.empty() && !protectionCfg.AccountProtectionEnabled && (req.filter == nil || !req.filter.forceHandle()) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	effectiveBans := restrictionSnapshot.restrictions
@@ -3461,7 +3680,7 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if banFilteredCandidates > 0 {
 		globalSchedulerDiagnostics.record(len(effectiveBans), banFilteredCandidates, maxInt(0, len(effectiveBans)-len(matchedBanIndexes)))
 	}
-	if !filtered && !protectionCfg.AccountProtectionEnabled {
+	if !filtered && !protectionCfg.AccountProtectionEnabled && (req.filter == nil || !req.filter.forceHandle()) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	if len(available) == 0 {
@@ -3494,7 +3713,7 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 			globalSchedulerStateRefresher.requestRefresh()
 		}
 	}
-	if snapshotReady && (stateSnapshot == nil || len(stateSnapshot.states) == 0) {
+	if snapshotReady && (stateSnapshot == nil || len(stateSnapshot.states) == 0) && (req.filter == nil || !req.filter.forceHandle()) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	if !snapshotReady {
@@ -3506,7 +3725,7 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 		if s == globalStore {
 			xaiGeneration = globalSchedulerState.providerGeneration("xai")
 		}
-		states, err := queryActiveXAIStates(ctx, db, now)
+		states, err := queryActiveXAIStates(ctx, db, providerXAI, now)
 		if err != nil {
 			return schedulerPickResponse{Handled: false}, err
 		}
@@ -3520,7 +3739,7 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 		}
 	}
 	states := stateSnapshot.states
-	if len(states) == 0 {
+	if len(states) == 0 && (req.filter == nil || !req.filter.forceHandle()) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
@@ -3536,7 +3755,7 @@ func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (
 		}
 		available = append(available, candidate)
 	}
-	if !filtered {
+	if !filtered && (req.filter == nil || !req.filter.forceHandle()) {
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	if len(available) == 0 {
@@ -3586,7 +3805,7 @@ func isCodexSchedulerRequest(req schedulerPickRequest) bool {
 }
 
 func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
-	result, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND reset_at <= ?`, now)
+	result, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE provider='codex' AND active=1 AND reset_at <= ?`, now)
 	if err != nil {
 		return err
 	}
@@ -3597,7 +3816,7 @@ func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
 }
 
 func reconcileAutobansWithQuotaSnapshots(ctx context.Context, db *sql.DB, now int64) error {
-	bans, err := queryActiveAutobans(ctx, db, now)
+	bans, err := queryActiveAutobans(ctx, db, providerCodex, now)
 	if err != nil {
 		return err
 	}
@@ -3636,7 +3855,7 @@ SET active=0,
   primary_reset_at=?,
   secondary_used_percent=?,
   secondary_reset_at=?
-WHERE active=1 AND auth_id=?`, nullFloatPtr(primary.Percent), nullIntPtr(primary.ResetAt), nullFloatPtr(secondary.Percent), nullIntPtr(secondary.ResetAt), ban.AuthID)
+WHERE provider='codex' AND active=1 AND auth_id=?`, nullFloatPtr(primary.Percent), nullIntPtr(primary.ResetAt), nullFloatPtr(secondary.Percent), nullIntPtr(secondary.ResetAt), ban.AuthID)
 		if err != nil {
 			return err
 		}
@@ -3660,7 +3879,7 @@ WITH latest AS (
       ORDER BY requested_at DESC, id DESC
     ) AS rn
   FROM usage_events
-  WHERE provider='codex'
+  WHERE lower(trim(provider))='codex'
     AND COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,'')) <> ''
 )
 SELECT auth_id, auth_index, source, provider, requested_at, status_code,
@@ -3703,7 +3922,7 @@ LIMIT 1000`, now, now)
 			continue
 		}
 		rec := usageRecord{
-			Provider:  provider,
+			Provider:  providerCodex,
 			AuthID:    authID,
 			AuthIndex: authIndex,
 			Source:    source,
@@ -3721,7 +3940,7 @@ INSERT INTO autoban_bans (
   last_status_code, primary_used_percent, primary_reset_at, secondary_used_percent, secondary_reset_at,
   released_at, release_reason
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, '')
-ON CONFLICT(auth_id) DO UPDATE SET
+ON CONFLICT(provider, auth_id) DO UPDATE SET
   auth_index=excluded.auth_index,
   source=excluded.source,
   provider=excluded.provider,
@@ -3742,7 +3961,7 @@ ON CONFLICT(auth_id) DO UPDATE SET
   release_reason=CASE WHEN excluded.banned_at > COALESCE(autoban_bans.released_at,0) THEN '' ELSE autoban_bans.release_reason END
 WHERE (autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at)
   AND (COALESCE(autoban_bans.released_at,0)=0 OR excluded.banned_at > COALESCE(autoban_bans.released_at,0) OR autoban_bans.active=1)`,
-			key, authIndex, source, provider, window, reason, requestedAt, resetAt, status,
+			key, authIndex, source, providerCodex, window, reason, requestedAt, resetAt, status,
 			nullFloatPtr(pp), nullIntPtr(pr), nullFloatPtr(sp), nullIntPtr(sr), now,
 		)
 		if err != nil {
@@ -3769,7 +3988,7 @@ WITH latest AS (
       ORDER BY requested_at DESC, id DESC
     ) AS rn
   FROM usage_events
-  WHERE provider='codex'
+  WHERE lower(trim(provider))='codex'
     AND COALESCE(NULLIF(auth_id,''), NULLIF(source,''), NULLIF(auth_index,'')) <> ''
 )
 SELECT auth_id, auth_index, source, provider, requested_at, status_code
@@ -3822,7 +4041,7 @@ WITH latest AS (
       ORDER BY finished_at DESC, id DESC
     ) AS rn
   FROM quota_trigger_runs
-  WHERE provider='codex'
+  WHERE lower(trim(provider))='codex'
     AND COALESCE(NULLIF(auth_file,''), NULLIF(auth_id,''), NULLIF(auth_index,''), NULLIF(source,'')) <> ''
 )
 SELECT auth_id, auth_index, source, provider, auth_file, finished_at, http_status, error
@@ -3960,7 +4179,7 @@ WHERE provider='codex'
 }
 
 func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
-	invalids, err := queryActiveInvalidAuths(ctx, db)
+	invalids, err := queryActiveInvalidAuths(ctx, db, providerCodex)
 	if err != nil {
 		return err
 	}
@@ -3975,11 +4194,11 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 		if !hasLaterSuccessfulUsage(ctx, db, rec, invalid.InvalidatedAt) {
 			continue
 		}
-		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE invalid_auths SET active=0 WHERE provider='codex' AND active=1 AND auth_id=?`, invalid.AuthID); err != nil {
 			return err
 		}
 	}
-	bans, err := queryActiveAutobans(ctx, db, time.Now().Unix())
+	bans, err := queryActiveAutobans(ctx, db, providerCodex, time.Now().Unix())
 	if err != nil {
 		return err
 	}
@@ -3994,7 +4213,7 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 		if !hasLaterSuccessfulUsage(ctx, db, rec, ban.BannedAt) {
 			continue
 		}
-		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
+		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE autoban_bans SET active=0 WHERE provider='codex' AND active=1 AND auth_id=?`, ban.AuthID); err != nil {
 			return err
 		}
 	}
@@ -4039,6 +4258,7 @@ func clearReplacedInvalidAuths(ctx context.Context, db *sql.DB) error {
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
+AND provider='codex'
 AND auth_file <> ''
 AND auth_file = ?
 AND ? > invalidated_at`, cfg.AuthFile, cfg.AuthFileMTime)
@@ -4053,6 +4273,7 @@ AND ? > invalidated_at`, cfg.AuthFile, cfg.AuthFileMTime)
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
+AND provider='codex'
 AND ? > invalidated_at
 AND (auth_file='' OR lower(auth_file)=lower(?))
 AND (
@@ -4127,7 +4348,7 @@ func aliasesAllContained(aliases map[string]struct{}, values ...string) bool {
 }
 
 func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases map[string]struct{}, configuredStrictAliases map[string]struct{}) error {
-	invalids, err := queryActiveInvalidAuths(ctx, db)
+	invalids, err := queryActiveInvalidAuths(ctx, db, providerCodex)
 	if err != nil {
 		return err
 	}
@@ -4137,7 +4358,7 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 			if aliasesContainAny(configuredStrictAliases, cleanupAliases...) {
 				continue
 			}
-			if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+			if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE invalid_auths SET active=0 WHERE provider='codex' AND active=1 AND auth_id=?`, invalid.AuthID); err != nil {
 				return err
 			}
 			continue
@@ -4153,7 +4374,7 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 		} else if aliasesContainAny(configuredAliases, invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
 			continue
 		}
-		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE invalid_auths SET active=0 WHERE provider='codex' AND active=1 AND auth_id=?`, invalid.AuthID); err != nil {
 			return err
 		}
 	}
@@ -4161,7 +4382,7 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 }
 
 func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map[string]struct{}, configuredStrictAliases map[string]struct{}) error {
-	bans, err := queryActiveAutobans(ctx, db, time.Now().Unix())
+	bans, err := queryActiveAutobans(ctx, db, providerCodex, time.Now().Unix())
 	if err != nil {
 		return err
 	}
@@ -4171,7 +4392,7 @@ func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map
 			if aliasesContainAny(configuredStrictAliases, cleanupAliases...) {
 				continue
 			}
-			if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
+			if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE autoban_bans SET active=0 WHERE provider='codex' AND active=1 AND auth_id=?`, ban.AuthID); err != nil {
 				return err
 			}
 			continue
@@ -4187,7 +4408,7 @@ func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map
 		} else if aliasesContainAny(configuredAliases, ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
 			continue
 		}
-		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
+		if _, err := execCodexSchedulerStateMutation(ctx, db, `UPDATE autoban_bans SET active=0 WHERE provider='codex' AND active=1 AND auth_id=?`, ban.AuthID); err != nil {
 			return err
 		}
 	}
@@ -4245,7 +4466,7 @@ SELECT status_code, failed
 FROM (
   SELECT requested_at AS ts, id AS seq, status_code, failed
   FROM usage_events
-  WHERE provider='codex' AND ` + usageCond + `
+  WHERE provider='codex' AND generate=1 AND ` + usageCond + `
   UNION ALL
   SELECT finished_at AS ts, id + 1000000000 AS seq, http_status AS status_code,
     CASE WHEN status='success' THEN 0 ELSE 1 END AS failed
@@ -4303,12 +4524,16 @@ func sqlLowerInCondition(columns []string, aliases []string) (string, []any) {
 	return "(" + strings.Join(parts, " OR ") + ")", args
 }
 
-func queryActiveInvalidAuths(ctx context.Context, db *sql.DB) ([]invalidAuthRow, error) {
+func queryActiveInvalidAuths(ctx context.Context, db *sql.DB, provider string) ([]invalidAuthRow, error) {
+	provider, err := requiredCanonicalProvider(provider)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := db.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, provider, reason, invalidated_at, active, last_status_code, auth_file, auth_file_mtime
 FROM invalid_auths
-WHERE active=1
-ORDER BY invalidated_at DESC`)
+WHERE provider=? AND active=1
+ORDER BY invalidated_at DESC`, provider)
 	if err != nil {
 		return nil, err
 	}

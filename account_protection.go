@@ -46,7 +46,7 @@ const (
 	accountProtectionPlanRefreshStopTimeout     = 100 * time.Millisecond
 	accountProtectionReservationCleanupInterval = 30 * time.Second
 	accountProtectionUsageRefreshInterval       = 500 * time.Millisecond
-	accountProtectionUsageMaxStaleness          = 5 * time.Second
+	accountProtectionUsageMaxWindowAdvance      = 5 * time.Second
 	accountProtectionUsageRefreshTimeout        = 2 * time.Second
 	accountProtectionUsageRefreshStopTimeout    = 100 * time.Millisecond
 )
@@ -385,19 +385,34 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		return schedulerAuthCandidate{}, err
 	}
 	defer globalAccountProtection.pickMu.unlock()
-	tx, err := db.BeginTx(ctx, nil)
+	reservationDB, closeReservationDB, err := s.reservationTransactionDB(ctx, db)
 	if err != nil {
+		return schedulerAuthCandidate{}, err
+	}
+	defer closeReservationDB()
+	lockStarted := time.Now()
+	tx, err := reservationDB.BeginTx(ctx, nil)
+	lockWait := time.Since(lockStarted)
+	if err != nil {
+		globalSchedulerDiagnostics.recordReservationTiming(lockWait, 0, err)
 		return schedulerAuthCandidate{}, err
 	}
 	defer tx.Rollback()
 	cleanupExpired := globalAccountProtection.reservationCleanupDB != db || now-globalAccountProtection.reservationCleanupAt >= int64(accountProtectionReservationCleanupInterval/time.Second)
+	var expiredReservations int64
 	if cleanupExpired {
-		if _, err = tx.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE expires_at <= ?`, now); err != nil {
-			return schedulerAuthCandidate{}, err
+		result, cleanupErr := tx.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE provider=? AND expires_at <= ?`, providerCodex, now)
+		if cleanupErr != nil {
+			globalSchedulerDiagnostics.recordReservationTiming(lockWait, 0, cleanupErr)
+			return schedulerAuthCandidate{}, cleanupErr
+		}
+		if deleted, rowsErr := result.RowsAffected(); rowsErr == nil {
+			expiredReservations = deleted
 		}
 	}
-	reservations, err := loadProtectionReservationSnapshot(ctx, tx, now)
+	reservations, err := loadProtectionReservationSnapshot(ctx, tx, providerCodex, now)
 	if err != nil {
+		globalSchedulerDiagnostics.recordReservationTiming(lockWait, 0, err)
 		return schedulerAuthCandidate{}, err
 	}
 	snapshot := newProtectionSnapshotWithUsageIndex(reservations, usage)
@@ -409,6 +424,20 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 	}
 	chosen, err := chooseProtectedCandidate(states, rotationKey, affinityKeys...)
 	if err != nil {
+		// A saturated decision is authoritative only after the IMMEDIATE
+		// transaction commits. This also makes any expired-reservation cleanup
+		// durable; a commit failure must override the semantic rejection and fail
+		// closed as scheduler_unavailable.
+		if commitErr := tx.Commit(); commitErr != nil {
+			globalSchedulerDiagnostics.recordReservationTiming(lockWait, 0, commitErr)
+			return schedulerAuthCandidate{}, commitErr
+		}
+		globalSchedulerDiagnostics.recordReservationTiming(lockWait, 0, nil)
+		if cleanupExpired {
+			globalSchedulerDiagnostics.recordExpiredReservations(expiredReservations)
+			globalAccountProtection.reservationCleanupDB = db
+			globalAccountProtection.reservationCleanupAt = now
+		}
 		return schedulerAuthCandidate{}, err
 	}
 	chosenIdentity := schedulerCandidateIdentity(chosen.Candidate)
@@ -416,17 +445,26 @@ func (s *store) pickProtectedAuth(ctx context.Context, db *sql.DB, candidates []
 		s.privacyDatabasePath(), chosen.Candidate, chosen.AuthID, chosen.AuthIndex, chosen.Source, chosenIdentity.AuthFile,
 	)
 	if err != nil {
+		globalSchedulerDiagnostics.recordReservationTiming(lockWait, 0, err)
 		return schedulerAuthCandidate{}, err
 	}
+	insertStarted := time.Now()
 	if _, err = tx.ExecContext(ctx, `
-INSERT INTO account_protection_reservations (auth_id, auth_index, source, auth_file, plan_type, created_at, expires_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`, storedAuthID, storedAuthIndex, storedSource, storedAuthFile, chosen.PlanType, now, now+int64(cfg.AccountProtectionReservationTTLSeconds)); err != nil {
+INSERT INTO account_protection_reservations (provider, auth_id, auth_index, source, auth_file, plan_type, created_at, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, providerCodex, storedAuthID, storedAuthIndex, storedSource, storedAuthFile, chosen.PlanType, now, now+int64(cfg.AccountProtectionReservationTTLSeconds)); err != nil {
+		globalSchedulerDiagnostics.recordReservationTiming(lockWait, time.Since(insertStarted), err)
 		return schedulerAuthCandidate{}, err
 	}
+	insertLatency := time.Since(insertStarted)
+	// The successful INSERT while this IMMEDIATE transaction owns the writer
+	// lock is the linearization point for the global concurrency decision.
 	if err = tx.Commit(); err != nil {
+		globalSchedulerDiagnostics.recordReservationTiming(lockWait, insertLatency, err)
 		return schedulerAuthCandidate{}, err
 	}
+	globalSchedulerDiagnostics.recordReservationTiming(lockWait, insertLatency, nil)
 	if cleanupExpired {
+		globalSchedulerDiagnostics.recordExpiredReservations(expiredReservations)
 		globalAccountProtection.reservationCleanupDB = db
 		globalAccountProtection.reservationCleanupAt = now
 	}
@@ -436,7 +474,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`, storedAuthID, storedAuthIndex, storedSource, stor
 func chooseProtectedCandidate(states []protectionCandidate, rotationKey string, affinityKeys ...string) (protectionCandidate, error) {
 	affinityKey := firstNonEmptyString(affinityKeys...)
 	if bound, ok := boundProtectedCandidate(states, affinityKey); ok && bound.InFlight < bound.Limit {
-		return bound, nil
+		highestPriority, found := highestAvailableProtectionPriority(states)
+		if !found || bound.Candidate.Priority == highestPriority {
+			return bound, nil
+		}
 	}
 	eligible := make([]protectionCandidate, 0, len(states))
 	for _, state := range states {
@@ -461,6 +502,21 @@ func chooseProtectedCandidate(states []protectionCandidate, rotationKey string, 
 		Message:    "all Codex auth candidates are at their configured concurrency limit; retry after an in-flight request completes",
 		HTTPStatus: http.StatusServiceUnavailable,
 	}
+}
+
+func highestAvailableProtectionPriority(states []protectionCandidate) (int, bool) {
+	highest := 0
+	found := false
+	for _, state := range states {
+		if state.InFlight >= state.Limit {
+			continue
+		}
+		if !found || state.Candidate.Priority > highest {
+			highest = state.Candidate.Priority
+			found = true
+		}
+	}
+	return highest, found
 }
 
 func (m *accountProtectionManager) stopUsageRefreshLocked() {
@@ -573,6 +629,11 @@ type protectionRowsQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
+type protectionReservationStore interface {
+	protectionRowsQueryer
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 type protectionUsageSample struct {
 	Aliases []string
 	Tokens  int64
@@ -591,14 +652,21 @@ func (m *accountProtectionManager) loadUsageSnapshot(ctx context.Context, db *sq
 	return index.samples, nil
 }
 
-func (m *accountProtectionManager) loadUsageIndex(ctx context.Context, db *sql.DB, since int64) (*protectionUsageIndex, error) {
+func (m *accountProtectionManager) loadUsageIndex(_ context.Context, db *sql.DB, since int64) (*protectionUsageIndex, error) {
 	now := time.Now()
 	if usage, fresh, stale := m.cachedUsageIndex(db, since, now); fresh {
 		return usage, nil
-	} else if stale && m.startUsageRefresh(db, since, now) {
+	} else if stale {
+		m.startUsageRefresh(db, since, now)
 		return usage, nil
 	}
-	return m.loadUsageIndexSync(ctx, db, since)
+	// Token volume is a soft-demotion signal. An empty cold-start snapshot can
+	// temporarily miss a demotion, but it cannot bypass the transactional hard
+	// concurrency limit. Serving it immediately keeps SQLite aggregation out of
+	// the first-token path while the exact window is loaded in the background.
+	usage := m.seedUsageIndex(db, since)
+	m.startUsageRefresh(db, since, now)
+	return usage, nil
 }
 
 func (m *accountProtectionManager) cachedUsageIndex(db *sql.DB, since int64, now time.Time) (*protectionUsageIndex, bool, bool) {
@@ -607,15 +675,27 @@ func (m *accountProtectionManager) cachedUsageIndex(db *sql.DB, since int64, now
 	if m.usageDB != db || m.usage == nil || since < m.usageSince {
 		return nil, false, false
 	}
-	maxAdvance := int64(accountProtectionUsageMaxStaleness/time.Second) + 1
-	if since-m.usageSince > maxAdvance {
-		return nil, false, false
-	}
+	maxAdvance := int64(accountProtectionUsageMaxWindowAdvance/time.Second) + 1
 	age := now.Sub(m.usageLoadedAt)
 	if age < 0 {
 		age = 0
 	}
-	return m.usage, age < accountProtectionUsageRefreshInterval, age < accountProtectionUsageMaxStaleness
+	fresh := since-m.usageSince <= maxAdvance && age < accountProtectionUsageRefreshInterval
+	return m.usage, fresh, true
+}
+
+func (m *accountProtectionManager) seedUsageIndex(db *sql.DB, since int64) *protectionUsageIndex {
+	m.usageCacheMu.Lock()
+	defer m.usageCacheMu.Unlock()
+	if m.usageDB == db && m.usage != nil && since >= m.usageSince {
+		return m.usage
+	}
+	usage := newProtectionUsageIndex(nil)
+	m.usageDB = db
+	m.usageSince = since
+	m.usageLoadedAt = time.Time{}
+	m.usage = usage
+	return usage
 }
 
 func (m *accountProtectionManager) startUsageRefresh(db *sql.DB, since int64, now time.Time) bool {
@@ -624,11 +704,8 @@ func (m *accountProtectionManager) startUsageRefresh(db *sql.DB, since int64, no
 	if m.usageDB != db || m.usage == nil || since < m.usageSince {
 		return false
 	}
-	maxAdvance := int64(accountProtectionUsageMaxStaleness/time.Second) + 1
-	if since-m.usageSince > maxAdvance {
-		return false
-	}
-	if now.Sub(m.usageLoadedAt) < accountProtectionUsageRefreshInterval {
+	maxAdvance := int64(accountProtectionUsageMaxWindowAdvance/time.Second) + 1
+	if since-m.usageSince <= maxAdvance && now.Sub(m.usageLoadedAt) < accountProtectionUsageRefreshInterval {
 		return true
 	}
 	if m.usageRefreshing {
@@ -640,13 +717,14 @@ func (m *accountProtectionManager) startUsageRefresh(db *sql.DB, since int64, no
 	}
 	done := make(chan struct{})
 	generation := m.usageGeneration
+	cachedSince := m.usageSince
 	m.usageRefreshing = true
 	m.usageRefreshDone = done
-	go m.refreshUsageIndex(ctx, generation, db, since, done)
+	go m.refreshUsageIndex(ctx, generation, db, cachedSince, since, done)
 	return true
 }
 
-func (m *accountProtectionManager) refreshUsageIndex(ctx context.Context, generation uint64, db *sql.DB, since int64, done chan struct{}) {
+func (m *accountProtectionManager) refreshUsageIndex(ctx context.Context, generation uint64, db *sql.DB, cachedSince, targetSince int64, done chan struct{}) {
 	defer close(done)
 	defer m.finishUsageRefresh(ctx, generation, done)
 	refreshCtx, cancel := context.WithTimeout(ctx, accountProtectionUsageRefreshTimeout)
@@ -658,15 +736,18 @@ func (m *accountProtectionManager) refreshUsageIndex(ctx context.Context, genera
 	if refreshCtx.Err() != nil || !m.usageRefreshCurrent(ctx, generation, done) {
 		return
 	}
-	usage, err := loadProtectionUsageSnapshot(refreshCtx, db, since)
+	usage, err := loadProtectionUsageSnapshot(refreshCtx, db, targetSince)
 	if err != nil || refreshCtx.Err() != nil {
 		return
 	}
 	index := newProtectionUsageIndex(usage)
 	m.usageCacheMu.Lock()
-	if m.usageCtx == ctx && m.usageGeneration == generation && m.usageRefreshDone == done && ctx.Err() == nil {
+	// cachedSince describes the stale snapshot served while this worker loads
+	// targetSince. Keep them separate: an advanced-window refresh may publish
+	// only if no other request replaced the source cache in the meantime.
+	if m.usageCtx == ctx && m.usageGeneration == generation && m.usageRefreshDone == done && m.usageDB == db && m.usageSince == cachedSince && ctx.Err() == nil {
 		m.usageDB = db
-		m.usageSince = since
+		m.usageSince = targetSince
 		m.usageLoadedAt = time.Now()
 		m.usage = index
 	}
@@ -688,33 +769,6 @@ func (m *accountProtectionManager) finishUsageRefresh(ctx context.Context, gener
 	}
 }
 
-func (m *accountProtectionManager) loadUsageIndexSync(ctx context.Context, db *sql.DB, since int64) (*protectionUsageIndex, error) {
-	if err := m.usageMu.lock(ctx); err != nil {
-		return nil, err
-	}
-	defer m.usageMu.unlock()
-	if usage, fresh, _ := m.cachedUsageIndex(db, since, time.Now()); fresh {
-		return usage, nil
-	}
-	m.usageCacheMu.RLock()
-	generation := m.usageGeneration
-	m.usageCacheMu.RUnlock()
-	usage, err := loadProtectionUsageSnapshot(ctx, db, since)
-	if err != nil {
-		return nil, err
-	}
-	index := newProtectionUsageIndex(usage)
-	m.usageCacheMu.Lock()
-	if m.usageGeneration == generation {
-		m.usageDB = db
-		m.usageSince = since
-		m.usageLoadedAt = time.Now()
-		m.usage = index
-	}
-	m.usageCacheMu.Unlock()
-	return index, nil
-}
-
 type protectionReservationSample struct {
 	Aliases []string
 	Count   int
@@ -731,7 +785,7 @@ type protectionSnapshot struct {
 }
 
 func loadProtectionSnapshot(ctx context.Context, db protectionRowsQueryer, since int64, now int64) (protectionSnapshot, error) {
-	reservations, err := loadProtectionReservationSnapshot(ctx, db, now)
+	reservations, err := loadProtectionReservationSnapshot(ctx, db, providerCodex, now)
 	if err != nil {
 		return protectionSnapshot{}, err
 	}
@@ -793,13 +847,13 @@ func newProtectionSnapshotWithUsageIndex(reservations []protectionReservationSam
 	return snapshot
 }
 
-func loadProtectionReservationSnapshot(ctx context.Context, db protectionRowsQueryer, now int64) ([]protectionReservationSample, error) {
+func loadProtectionReservationSnapshot(ctx context.Context, db protectionRowsQueryer, provider string, now int64) ([]protectionReservationSample, error) {
 	var snapshot []protectionReservationSample
 	rows, err := db.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, auth_file, COUNT(*)
 FROM account_protection_reservations
-WHERE expires_at > ?
-GROUP BY auth_id, auth_index, source, auth_file`, now)
+WHERE provider=? AND expires_at > ?
+GROUP BY auth_id, auth_index, source, auth_file`, provider, now)
 	if err != nil {
 		return snapshot, err
 	}
@@ -830,7 +884,7 @@ func loadProtectionUsageSnapshot(ctx context.Context, db protectionRowsQueryer, 
 	rows, err := db.QueryContext(ctx, `
 SELECT auth_id, auth_index, source, SUM(total_tokens)
 FROM usage_events INDEXED BY idx_usage_events_provider_requested
-WHERE provider IN ('codex','Codex','CODEX') AND requested_at >= ?
+WHERE provider IN ('codex','Codex','CODEX') AND generate=1 AND requested_at >= ?
 GROUP BY auth_id, auth_index, source`, since)
 	if err != nil {
 		return snapshot, err
@@ -891,71 +945,71 @@ func (snapshot *protectionSnapshot) metrics(aliases []string) (int, int64) {
 	return inFlight, tokens
 }
 
-func releaseProtectionReservation(ctx context.Context, db *sql.DB, rec usageRecord) error {
-	if provider := strings.TrimSpace(rec.Provider); provider != "" && !strings.EqualFold(provider, "codex") {
-		return nil
+func releaseProtectionReservation(ctx context.Context, db protectionReservationStore, rec usageRecord) (bool, error) {
+	provider := strings.ToLower(strings.TrimSpace(rec.Provider))
+	if provider != "codex" {
+		return false, nil
 	}
-	recordAliases := normalizeAccountAliases(rec.AuthID, rec.AuthIndex, rec.Source, rec.AuthFile)
-	recordStrictAliases := strictAuthStateAliasesForValues(rec.AuthID, rec.AuthIndex, rec.Source, rec.AuthFile)
-	if len(recordStrictAliases) > 0 {
-		recordAliases = recordStrictAliases
+	column, identity := protectionReservationReleaseIdentity(rec)
+	if column == "" || identity == "" {
+		return false, nil
 	}
-	if len(recordAliases) == 0 {
-		return nil
-	}
-	condition, conditionArgs := sqlLowerInCondition([]string{"auth_id", "auth_index", "source", "auth_file"}, recordAliases)
-	if condition == "" {
-		return nil
-	}
-	args := []any{time.Now().Unix()}
-	args = append(args, conditionArgs...)
 	rows, err := db.QueryContext(ctx, `
-SELECT id, auth_id, auth_index, source, auth_file
+SELECT id
 FROM account_protection_reservations
-WHERE expires_at > ?
-AND (`+condition+`)
-ORDER BY created_at, id`, args...)
+WHERE provider=? AND expires_at > ?
+AND lower(`+column+`)=?
+ORDER BY created_at, id`, provider, time.Now().Unix(), identity)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var matchIDs []int64
 	for rows.Next() {
 		var id int64
-		var authID, authIndex, source, authFile string
-		if err := rows.Scan(&id, &authID, &authIndex, &source, &authFile); err != nil {
+		if err := rows.Scan(&id); err != nil {
 			_ = rows.Close()
-			return err
-		}
-		reservationAliases := normalizeAccountAliases(authID, authIndex, source, authFile)
-		if len(recordStrictAliases) > 0 {
-			reservationAliases = strictAuthStateAliasesForValues(authID, authIndex, source, authFile)
-			if len(reservationAliases) == 0 {
-				continue
-			}
-		}
-		if !aliasesOverlap(recordAliases, reservationAliases) {
-			continue
+			return false, err
 		}
 		matchIDs = append(matchIDs, id)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return err
+		return false, err
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return false, err
 	}
-	_, err = deleteFirstProtectionReservation(ctx, db, matchIDs)
-	return err
+	return deleteFirstProtectionReservation(ctx, db, provider, matchIDs)
+}
+
+func protectionReservationReleaseIdentity(rec usageRecord) (string, string) {
+	for _, value := range []string{rec.AuthFile, rec.AuthIndex, rec.AuthID, rec.Source} {
+		if file := fileNameIfJSON(value); file != "" {
+			return "auth_file", normalizeAccountAlias(file)
+		}
+	}
+	for _, candidate := range []struct {
+		column string
+		value  string
+	}{
+		{column: "auth_index", value: rec.AuthIndex},
+		{column: "auth_id", value: rec.AuthID},
+		{column: "source", value: rec.Source},
+	} {
+		if identity := normalizeAccountAlias(candidate.value); identity != "" {
+			return candidate.column, identity
+		}
+	}
+	return "", ""
 }
 
 // deleteFirstProtectionReservation conditionally deletes one reservation from
 // a snapshot of matching IDs. Concurrent usage callbacks may select the same
 // oldest row; RowsAffected lets the loser advance to the next row instead of
 // reporting success while leaving a reservation behind.
-func deleteFirstProtectionReservation(ctx context.Context, db *sql.DB, matchIDs []int64) (bool, error) {
+func deleteFirstProtectionReservation(ctx context.Context, db protectionReservationStore, provider string, matchIDs []int64) (bool, error) {
 	for _, id := range matchIDs {
-		result, err := db.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE id=?`, id)
+		result, err := db.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE id=? AND provider=?`, id, provider)
 		if err != nil {
 			return false, err
 		}
@@ -976,7 +1030,7 @@ func applyAccountProtectionState(ctx context.Context, db *sql.DB, accounts []acc
 		return
 	}
 	now := time.Now().Unix()
-	_, _ = db.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE expires_at <= ?`, now)
+	_, _ = db.ExecContext(ctx, `DELETE FROM account_protection_reservations WHERE provider=? AND expires_at <= ?`, providerCodex, now)
 	candidates := make([]schedulerAuthCandidate, len(accounts))
 	for i := range accounts {
 		account := &accounts[i]

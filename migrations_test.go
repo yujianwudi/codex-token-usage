@@ -20,7 +20,7 @@ func TestResetNormalizationRunsOnlyDuringV4Migration(t *testing.T) {
 		t.Fatal(err)
 	}
 	const milliseconds = int64(1_700_000_000_000)
-	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, primary_reset_at, secondary_reset_at) VALUES (1, ?, ?)`, milliseconds, milliseconds); err != nil {
+	if _, err := db.Exec(`INSERT INTO usage_events (requested_at, provider, primary_reset_at, secondary_reset_at) VALUES (1, 'codex', ?, ?)`, milliseconds, milliseconds); err != nil {
 		t.Fatal(err)
 	}
 	if err := migrateSQLiteStore(context.Background(), db, path); err != nil {

@@ -1,0 +1,46 @@
+name: CPA Compatibility Watch
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpa-compat-watch-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26.5"
+
+jobs:
+  compatibility:
+    name: Verify CPA ${{ matrix.channel }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        channel:
+          - latest-release
+          - latest-main
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Dynamically load plugin in CPA
+        shell: bash
+        env:
+          CPA_COMPAT_CHANNEL: ${{ matrix.channel }}
+          CPA_COMPAT_GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/check-cpa-compat.sh

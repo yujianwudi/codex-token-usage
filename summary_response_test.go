@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTruncateSummaryResponsePreservesExactRequestedLimit(t *testing.T) {
@@ -74,5 +75,47 @@ func TestCachedSummaryPathSanitizationHandlesLegacyMaps(t *testing.T) {
 	sanitizeSummaryDiagnosticPaths(data)
 	if data["db_path"].(string) != first {
 		t.Fatalf("opaque path label was not idempotent: %q -> %q", first, data["db_path"])
+	}
+}
+
+func TestSummaryCacheErrorIsStoredAndReturnedAsFixedCode(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	key := normalizeSummaryCacheKey(summaryCacheKey{Window: "24h", Limit: 50})
+	secret := `C:\Users\private\usage.db sk-proj-summary-error-canary-1234567890`
+	entry := summaryCacheEntry{
+		data:     map[string]any{"totals": totalsRow{}},
+		cachedAt: time.Now(),
+		err:      secret,
+	}
+	if err := s.saveSummaryCacheEntry(ctx, key, entry); err != nil {
+		t.Fatal(err)
+	}
+	db, _, err := s.open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := db.QueryRowContext(ctx, `SELECT last_error FROM summary_cache WHERE cache_key=?`, summaryCacheStorageKey(key)).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != "summary_refresh_failed" {
+		t.Fatalf("stored summary error=%q, want fixed code", stored)
+	}
+	loaded, ok, err := s.loadSummaryCacheEntry(ctx, key)
+	if err != nil || !ok {
+		t.Fatalf("load summary cache ok=%v err=%v", ok, err)
+	}
+	data := cloneCachedSummary(loaded, key, normalizePluginConfig(defaultPluginConfig()), 0)
+	precompute, ok := data["precompute"].(summaryPrecomputeInfo)
+	if !ok {
+		t.Fatalf("cached summary precompute=%#v, want summaryPrecomputeInfo", data["precompute"])
+	}
+	if precompute.LastError != "summary_refresh_failed" {
+		t.Fatalf("cached summary error=%q, want summary_refresh_failed", precompute.LastError)
+	}
+	encoded := fmt.Sprint(data)
+	if strings.Contains(encoded, "sk-proj-") || strings.Contains(encoded, `C:\Users\private`) {
+		t.Fatalf("cached summary exposed legacy error details: %s", encoded)
 	}
 }

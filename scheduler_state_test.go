@@ -809,7 +809,7 @@ func TestQueryActiveAutobansDoesNotRewriteUsageHistory(t *testing.T) {
 		VALUES (?, 'codex', ?, 1)`, time.Now().Unix(), int64(1_800_000_000_000)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := queryActiveAutobans(context.Background(), db, time.Now().Unix()); err != nil {
+	if _, err := queryActiveAutobans(context.Background(), db, providerCodex, time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
 	var resetAt int64

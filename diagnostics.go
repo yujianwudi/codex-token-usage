@@ -31,16 +31,18 @@ var diagnosticPathLabelKey = func() []byte {
 }()
 
 type databaseDiagnostics struct {
-	Path                 string `json:"path"`
-	SizeBytes            int64  `json:"size_bytes"`
-	UsageEvents          int64  `json:"usage_events"`
-	QuotaTriggerRuns     int64  `json:"quota_trigger_runs"`
-	AutobanRows          int64  `json:"autoban_rows"`
-	InvalidAuthRows      int64  `json:"invalid_auth_rows"`
-	LatestEventAt        string `json:"latest_event_at,omitempty"`
-	LatestEventAgeSecs   int64  `json:"latest_event_age_seconds,omitempty"`
-	LatestTriggerAt      string `json:"latest_trigger_at,omitempty"`
-	LatestTriggerAgeSecs int64  `json:"latest_trigger_age_seconds,omitempty"`
+	Path                 string                      `json:"path"`
+	SizeBytes            int64                       `json:"size_bytes"`
+	UsageEvents          int64                       `json:"usage_events"`
+	QuotaTriggerRuns     int64                       `json:"quota_trigger_runs"`
+	AutobanRows          int64                       `json:"autoban_rows"`
+	InvalidAuthRows      int64                       `json:"invalid_auth_rows"`
+	StateProviderRows    map[string]map[string]int64 `json:"state_provider_rows,omitempty"`
+	UnsupportedProviders map[string]int64            `json:"unsupported_provider_rows,omitempty"`
+	LatestEventAt        string                      `json:"latest_event_at,omitempty"`
+	LatestEventAgeSecs   int64                       `json:"latest_event_age_seconds,omitempty"`
+	LatestTriggerAt      string                      `json:"latest_trigger_at,omitempty"`
+	LatestTriggerAgeSecs int64                       `json:"latest_trigger_age_seconds,omitempty"`
 }
 
 type authDiagnostics struct {
@@ -59,10 +61,18 @@ type authDiagnostics struct {
 }
 
 type schedulerDiagnostics struct {
-	ActiveBanCount      int    `json:"active_ban_count"`
-	FilteredCandidates  int    `json:"filtered_candidates"`
-	UnmatchedActiveBans int    `json:"unmatched_active_bans"`
-	LastFilteredAt      string `json:"last_filtered_at,omitempty"`
+	ActiveBanCount                   int    `json:"active_ban_count"`
+	FilteredCandidates               int    `json:"filtered_candidates"`
+	UnmatchedActiveBans              int    `json:"unmatched_active_bans"`
+	LastFilteredAt                   string `json:"last_filtered_at,omitempty"`
+	ActiveReservations               int64  `json:"active_reservations"`
+	OldestReservationAgeSeconds      int64  `json:"oldest_reservation_age_seconds,omitempty"`
+	ExpiredReservationsCleaned       int64  `json:"expired_reservations_cleaned"`
+	LegacyUncorrelatedReleaseMatched int64  `json:"legacy_uncorrelated_release_matched"`
+	LegacyUncorrelatedReleaseMissed  int64  `json:"legacy_uncorrelated_release_unmatched"`
+	ReservationDBBusyCount           int64  `json:"reservation_db_busy_count"`
+	ReservationLockWaitMicroseconds  int64  `json:"reservation_lock_wait_microseconds"`
+	ReservationInsertMicroseconds    int64  `json:"reservation_insert_microseconds"`
 }
 
 type schedulerDiagnosticsTracker struct {
@@ -90,6 +100,35 @@ func (t *schedulerDiagnosticsTracker) status(activeBans int) schedulerDiagnostic
 		out.UnmatchedActiveBans = 0
 	}
 	return out
+}
+
+func (t *schedulerDiagnosticsTracker) recordReservationTiming(lockWait, insertLatency time.Duration, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.state.ReservationLockWaitMicroseconds = maxInt64(0, lockWait.Microseconds())
+	t.state.ReservationInsertMicroseconds = maxInt64(0, insertLatency.Microseconds())
+	if isSQLiteBusyError(err) {
+		t.state.ReservationDBBusyCount++
+	}
+}
+
+func (t *schedulerDiagnosticsTracker) recordExpiredReservations(count int64) {
+	if count <= 0 {
+		return
+	}
+	t.mu.Lock()
+	t.state.ExpiredReservationsCleaned += count
+	t.mu.Unlock()
+}
+
+func (t *schedulerDiagnosticsTracker) recordLegacyReservationRelease(matched bool) {
+	t.mu.Lock()
+	if matched {
+		t.state.LegacyUncorrelatedReleaseMatched++
+	} else {
+		t.state.LegacyUncorrelatedReleaseMissed++
+	}
+	t.mu.Unlock()
 }
 
 type providerDiagnostics struct {
@@ -335,12 +374,22 @@ func execDeleteBatchesLimited(ctx context.Context, db *sql.DB, query string, cut
 
 func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts []accountRow, providers []providerRow, invalidAuths []invalidAuthRow, autobans []autobanRow, externalAlerts []externalUseAlert) diagnosticsSummary {
 	priceState := globalModelPriceUpdater.status()
+	scheduler := globalSchedulerDiagnostics.status(len(autobans))
+	now := time.Now().Unix()
+	var oldest int64
+	_ = db.QueryRowContext(ctx, `
+SELECT COUNT(*), COALESCE(MIN(created_at),0)
+FROM account_protection_reservations
+WHERE provider=? AND expires_at>?`, providerCodex, now).Scan(&scheduler.ActiveReservations, &oldest)
+	if oldest > 0 {
+		scheduler.OldestReservationAgeSeconds = maxInt64(0, now-oldest)
+	}
 	return diagnosticsSummary{
 		Database:      queryDatabaseDiagnostics(ctx, db, dbPath),
 		AuthFiles:     buildAuthDiagnostics(accounts, invalidAuths, autobans, externalAlerts),
 		CodexAuth:     globalCodexAuthSource.status(),
 		XAIAuth:       globalXAIAuthSource.status(),
-		Scheduler:     globalSchedulerDiagnostics.status(len(autobans)),
+		Scheduler:     scheduler,
 		Providers:     buildProviderDiagnostics(providers),
 		ModelPrices:   buildModelPriceDiagnostics(priceState),
 		APIKeyPrivacy: apiKeyFingerprintStatus(ctx, db, dbPath),
@@ -359,6 +408,7 @@ func queryDatabaseDiagnostics(ctx context.Context, db *sql.DB, path string) data
 		AutobanRows:      queryCount(ctx, db, `SELECT COUNT(*) FROM autoban_bans`),
 		InvalidAuthRows:  queryCount(ctx, db, `SELECT COUNT(*) FROM invalid_auths`),
 	}
+	out.StateProviderRows, out.UnsupportedProviders = queryStateProviderDiagnostics(ctx, db)
 	if ts := queryMaxUnix(ctx, db, `SELECT COALESCE(MAX(requested_at),0) FROM usage_events`); ts > 0 {
 		out.LatestEventAt = unixTime(ts)
 		out.LatestEventAgeSecs = maxInt64(0, now-ts)
@@ -368,6 +418,56 @@ func queryDatabaseDiagnostics(ctx context.Context, db *sql.DB, path string) data
 		out.LatestTriggerAgeSecs = maxInt64(0, now-ts)
 	}
 	return out
+}
+
+func queryStateProviderDiagnostics(ctx context.Context, db *sql.DB) (map[string]map[string]int64, map[string]int64) {
+	supported := map[string]map[string]struct{}{
+		// Usage analytics intentionally accepts third-party Providers. Keep the
+		// distribution visible without classifying those rows as unsupported.
+		"usage_events":                    nil,
+		"quota_trigger_runs":              {providerCodex: {}},
+		"invalid_auths":                   {providerCodex: {}},
+		"autoban_bans":                    {providerCodex: {}},
+		"xai_account_states":              {providerXAI: {}},
+		"account_protection_reservations": {providerCodex: {}},
+	}
+	counts := make(map[string]map[string]int64, len(supported))
+	unsupported := make(map[string]int64)
+	for table, supportedProviders := range supported {
+		rows, err := db.QueryContext(ctx, `SELECT provider, COUNT(*) FROM `+quoteSQLiteIdentifier(table)+` GROUP BY provider ORDER BY provider`)
+		if err != nil {
+			continue
+		}
+		tableCounts := map[string]int64{}
+		for rows.Next() {
+			var provider string
+			var count int64
+			if err := rows.Scan(&provider, &count); err != nil {
+				continue
+			}
+			provider = canonicalProvider(provider)
+			if provider == "" {
+				provider = "invalid"
+			}
+			tableCounts[provider] += count
+			if supportedProviders != nil {
+				if _, ok := supportedProviders[provider]; !ok {
+					unsupported[table] += count
+				}
+			}
+		}
+		_ = rows.Close()
+		if len(tableCounts) > 0 {
+			counts[table] = tableCounts
+		}
+	}
+	if len(counts) == 0 {
+		counts = nil
+	}
+	if len(unsupported) == 0 {
+		unsupported = nil
+	}
+	return counts, unsupported
 }
 
 func databaseFileSize(path string) int64 {
@@ -697,7 +797,7 @@ func handleExportWithFilters(ctx context.Context, window, kind, format string, l
 			return logExportResult{records: records, headers: headers}, nil
 		})
 		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": err.Error()})
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": publicErrorMessage("export_failed")})
 		}
 		name := exportLogFileName(filters, format)
 		if strings.EqualFold(format, "json") {
@@ -706,13 +806,13 @@ func handleExportWithFilters(ctx context.Context, window, kind, format string, l
 		}
 		body, err := recordsToCSV(result.headers, result.records)
 		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": err.Error()})
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": publicErrorMessage("export_failed")})
 		}
 		return managementResponse{StatusCode: http.StatusOK, Headers: exportHeaders("text/csv; charset=utf-8", name), Body: body}
 	}
 	data, err := globalSummaryPrecomputer.summary(ctx, globalStore, window, limit)
 	if err != nil {
-		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
+		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": publicErrorMessage("summary_failed")})
 	}
 	records, headers := exportRecords(data, kind)
 	if strings.EqualFold(format, "json") {
@@ -721,7 +821,7 @@ func handleExportWithFilters(ctx context.Context, window, kind, format string, l
 	}
 	body, err := recordsToCSV(headers, records)
 	if err != nil {
-		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": err.Error()})
+		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": publicErrorMessage("export_failed")})
 	}
 	return managementResponse{StatusCode: http.StatusOK, Headers: exportHeaders("text/csv; charset=utf-8", kind+".csv"), Body: body}
 }
@@ -788,7 +888,7 @@ func exportRecords(data map[string]any, kind string) ([]map[string]string, []str
 		return modelExportRows(rows), []string{"provider", "model", "alias", "requests", "total_tokens", "cost_usd", "avg_latency_ms", "cache_rate"}
 	case "recent":
 		rows := append(anySlice[recentRow](data["recent"]), anySlice[recentRow](data["provider_recent"])...)
-		return recentExportRows(rows), []string{"time", "provider", "account", "model", "alias", "status_code", "failed", "total_tokens", "input_tokens", "output_tokens", "cost_usd", "latency_ms"}
+		return recentExportRows(rows), []string{"time", "provider", "account", "model", "alias", "generate", "status_code", "failed", "total_tokens", "input_tokens", "output_tokens", "cost_usd", "latency_ms"}
 	default:
 		return accountExportRows(anySlice[accountRow](data["accounts"])), []string{"account", "auth_index", "provider", "requests", "success_rate", "total_tokens", "cost_usd", "quota_total_estimate", "quota_remaining_estimate", "invalid_auth", "external_use_suspected", "last_seen"}
 	}
@@ -872,7 +972,7 @@ SELECT requested_at,
 CASE WHEN ` + usageScopeSQL("codex") + ` THEN 'codex' WHEN ` + usageScopeSQL("xai") + ` THEN 'xai' ELSE 'providers' END AS scope_key,
 ` + providerExpr + ` AS provider_key,
 api_key, auth_id, auth_index, source, model, alias, reasoning_effort, service_tier,
-latency_ms, ttft_ms, status_code, failed, input_tokens, output_tokens, reasoning_tokens,
+generate, latency_ms, ttft_ms, status_code, failed, input_tokens, output_tokens, reasoning_tokens,
 cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens
 FROM usage_events
 WHERE ` + strings.Join(where, " AND ") + `
@@ -886,7 +986,7 @@ LIMIT ?`
 	defer rows.Close()
 	headers := []string{
 		"time", "scope", "provider", "account", "api_key", "auth_id", "auth_index", "source",
-		"model", "alias", "status_code", "failed", "input_tokens", "output_tokens", "cached_tokens",
+		"model", "alias", "generate", "status_code", "failed", "input_tokens", "output_tokens", "cached_tokens",
 		"cache_read_tokens", "cache_creation_tokens", "reasoning_tokens", "total_tokens", "cost_usd",
 		"latency_ms", "ttft_ms", "output_tokens_per_second", "error_summary",
 	}
@@ -895,10 +995,10 @@ LIMIT ?`
 		var ts int64
 		var scope, provider, apiKey, authID, authIndex, source, model, alias, reasoning, serviceTier string
 		var latency, ttft, input, output, reasoningTokens, cached, cacheRead, cacheCreation, total int64
-		var status, failedInt int
+		var status, generatedInt, failedInt int
 		if err := rows.Scan(
 			&ts, &scope, &provider, &apiKey, &authID, &authIndex, &source, &model, &alias, &reasoning, &serviceTier,
-			&latency, &ttft, &status, &failedInt, &input, &output, &reasoningTokens, &cached, &cacheRead, &cacheCreation, &total,
+			&generatedInt, &latency, &ttft, &status, &failedInt, &input, &output, &reasoningTokens, &cached, &cacheRead, &cacheCreation, &total,
 		); err != nil {
 			return nil, nil, err
 		}
@@ -915,11 +1015,14 @@ LIMIT ?`
 			TotalTokens:         total,
 		}
 		cost := 0.0
-		if value, ok := costForTokens(costRow, prices); ok {
-			cost = value
+		generated := generatedInt != 0
+		if generated {
+			if value, ok := costForTokens(costRow, prices); ok {
+				cost = value
+			}
 		}
 		throughput := ""
-		if output > 0 {
+		if generated && output > 0 {
 			ms := latency
 			if ttft > ms {
 				ms = ttft
@@ -951,6 +1054,7 @@ LIMIT ?`
 			"source":                   safeExportIdentity(source, apiKey),
 			"model":                    model,
 			"alias":                    alias,
+			"generate":                 strconv.FormatBool(generated),
 			"status_code":              strconv.Itoa(status),
 			"failed":                   strconv.FormatBool(failed),
 			"input_tokens":             strconv.FormatInt(input, 10),
@@ -1049,6 +1153,7 @@ func recentExportRows(rows []recentRow) []map[string]string {
 			"account":       safeExportLabel(firstNonEmptyString(r.AuthIndex, r.Source)),
 			"model":         r.Model,
 			"alias":         r.Alias,
+			"generate":      strconv.FormatBool(r.Generate),
 			"status_code":   strconv.Itoa(r.StatusCode),
 			"failed":        strconv.FormatBool(r.Failed),
 			"total_tokens":  strconv.FormatInt(r.TotalTokens, 10),
