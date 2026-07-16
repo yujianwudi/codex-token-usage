@@ -24,7 +24,6 @@ fi
 printf '%s  %s\n' "${asset_sha256}" "${asset}" | sha256sum -c -
 
 python3 - "${root}/schema.go" "${asset}" "${work}" <<'PY'
-import ctypes
 import hashlib
 import json
 import os
@@ -34,20 +33,6 @@ import sqlite3
 import subprocess
 import sys
 import zipfile
-
-
-class Buffer(ctypes.Structure):
-    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
-
-
-class PluginAPI(ctypes.Structure):
-    _fields_ = [
-        ("abi_version", ctypes.c_uint32),
-        ("call", ctypes.c_void_p),
-        ("free_buffer", ctypes.c_void_p),
-        ("shutdown", ctypes.c_void_p),
-    ]
-
 
 def snapshot(directory: pathlib.Path) -> dict[str, tuple[object, ...]]:
     result = {}
@@ -152,12 +137,37 @@ match = re.search(r"const schemaSQL = `\r?\n(.*?)\r?\n`", source, re.DOTALL)
 if match is None:
     raise SystemExit("cannot extract schemaSQL from schema.go")
 
-library = ctypes.CDLL(str(library_path), mode=os.RTLD_LOCAL)
+def invoke_v0138(data_dir: pathlib.Path) -> None:
+    auth_dir = data_dir / "auth"
+    auth_dir.mkdir(mode=0o700, exist_ok=True)
+    isolated_home = work / f"home-{data_dir.name}"
+    isolated_home.mkdir(mode=0o700)
+    result_path = work / f"result-{data_dir.name}.json"
+    child = r'''
+import ctypes
+import json
+import os
+import pathlib
+import sys
 
+
+class Buffer(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+
+class PluginAPI(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("call", ctypes.c_void_p),
+        ("free_buffer", ctypes.c_void_p),
+        ("shutdown", ctypes.c_void_p),
+    ]
+
+
+library = ctypes.CDLL(sys.argv[1], mode=os.RTLD_LOCAL)
 init = library.cliproxy_plugin_init
 init.argtypes = (ctypes.c_void_p, ctypes.POINTER(PluginAPI))
 init.restype = ctypes.c_int
-
 call = library.cliproxyPluginCall
 call.argtypes = (
     ctypes.c_char_p,
@@ -173,37 +183,54 @@ shutdown = library.cliproxyPluginShutdown
 shutdown.argtypes = ()
 shutdown.restype = None
 
-
-def invoke_v0138(data_dir: pathlib.Path) -> None:
-    auth_dir = data_dir / "auth"
-    auth_dir.mkdir(mode=0o700, exist_ok=True)
-    os.environ["CPA_TOKEN_USAGE_DIR"] = str(data_dir)
-    os.environ["CPA_AUTH_DIR"] = str(auth_dir)
-    os.environ["CPA_CONFIG_PATH"] = str(data_dir / "missing-config.yaml")
-    os.environ["CPA_CONFIG_FILE"] = str(data_dir / "missing-config.yaml")
-    plugin = PluginAPI()
-    init_code = init(None, ctypes.byref(plugin))
-    if init_code != 0 or plugin.abi_version != 1:
-        raise SystemExit(f"v0.1.38 init failed: code={init_code} abi={plugin.abi_version}")
-    request = json.dumps(
-        {
-            "Provider": "codex",
-            "RequestedAt": "2026-07-16T00:00:00Z",
-            "Detail": {"TotalTokens": 1},
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-    request_buffer = (ctypes.c_uint8 * len(request)).from_buffer_copy(request)
-    response = Buffer()
+plugin = PluginAPI()
+init_code = init(None, ctypes.byref(plugin))
+if init_code != 0 or plugin.abi_version != 1:
+    raise SystemExit(f"v0.1.38 init failed: code={init_code} abi={plugin.abi_version}")
+request = json.dumps(
+    {
+        "Provider": "codex",
+        "RequestedAt": "2026-07-16T00:00:00Z",
+        "Detail": {"TotalTokens": 1},
+    },
+    separators=(",", ":"),
+).encode("utf-8")
+request_buffer = (ctypes.c_uint8 * len(request)).from_buffer_copy(request)
+response = Buffer()
+try:
     code = call(b"usage.handle", request_buffer, len(request), ctypes.byref(response))
     raw_response = ctypes.string_at(response.ptr, response.len) if response.ptr else b""
+finally:
     if response.ptr:
         free_buffer(response.ptr, response.len)
     shutdown()
-    if code != 0:
-        raise SystemExit(f"v0.1.38 usage.handle returned ABI code {code}")
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps({"code": code, "response": raw_response.decode("utf-8")}),
+    encoding="utf-8",
+)
+'''
+    child_env = os.environ.copy()
+    child_env.update(
+        {
+            "HOME": str(isolated_home),
+            "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+            "CPA_TOKEN_USAGE_DIR": str(data_dir),
+            "CPA_AUTH_DIR": str(auth_dir),
+            "CPA_CONFIG_PATH": str(data_dir / "missing-config.yaml"),
+            "CPA_CONFIG_FILE": str(data_dir / "missing-config.yaml"),
+        }
+    )
+    subprocess.run(
+        [sys.executable, "-c", child, str(library_path), str(result_path)],
+        check=True,
+        env=child_env,
+    )
+    invocation = json.loads(result_path.read_text(encoding="utf-8"))
+    result_path.unlink()
+    if invocation.get("code") != 0:
+        raise SystemExit(f"v0.1.38 usage.handle returned ABI code {invocation.get('code')}")
     try:
-        envelope = json.loads(raw_response)
+        envelope = json.loads(invocation.get("response", ""))
     except json.JSONDecodeError as exc:
         raise SystemExit("v0.1.38 returned invalid JSON") from exc
     result = envelope.get("result", {})
