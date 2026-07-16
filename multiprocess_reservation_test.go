@@ -470,6 +470,17 @@ func TestReservationWriterLockFailsClosedWithinSchedulerBudget(t *testing.T) {
 	if err := initializeSQLiteStore(context.Background(), db, path); err != nil {
 		t.Fatal(err)
 	}
+	// Occupy the sole primary connection so this test deterministically proves
+	// the scheduler uses store.dbPath instead of querying PRAGMA database_list.
+	// The latter can open another primary _journal_mode=WAL connection and wait
+	// until the scheduler context expires while the reservation writer is held.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	mainConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mainConn.Close() })
 	locker, err := openSQLiteReservationDB(path)
 	if err != nil {
 		t.Fatal(err)
@@ -487,6 +498,14 @@ func TestReservationWriterLockFailsClosedWithinSchedulerBudget(t *testing.T) {
 	previousCfg := globalAccountProtection.config()
 	globalAccountProtection.configure(cfg)
 	t.Cleanup(func() { globalAccountProtection.configure(previousCfg) })
+	// Keep the soft-usage snapshot fresh so this test isolates the primary-path
+	// lookup and reservation writer lock without launching a background reader.
+	globalAccountProtection.usageCacheMu.Lock()
+	globalAccountProtection.usageDB = db
+	globalAccountProtection.usageSince = time.Now().Unix() - int64(cfg.AccountProtectionTokenWindowSeconds) - 1
+	globalAccountProtection.usageLoadedAt = time.Now()
+	globalAccountProtection.usage = newProtectionUsageIndex(nil)
+	globalAccountProtection.usageCacheMu.Unlock()
 	s := &store{db: db, dbPath: path}
 	defer s.close()
 	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
@@ -497,6 +516,10 @@ func TestReservationWriterLockFailsClosedWithinSchedulerBudget(t *testing.T) {
 		Attributes: map[string]string{"auth_index": "locked", "plan_type": "free"},
 	}}, cfg, "writer-lock")
 	elapsed := time.Since(started)
+	ctxErr := ctx.Err()
+	if closeErr := mainConn.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
 	if err == nil {
 		t.Fatal("writer lock failed open and dispatched a protected candidate")
 	}
@@ -504,8 +527,11 @@ func TestReservationWriterLockFailsClosedWithinSchedulerBudget(t *testing.T) {
 	if errors.As(err, &reject) && reject.Code == "account_protection_saturated" {
 		t.Fatalf("writer lock was misreported as saturated: %v", err)
 	}
-	if !isSQLiteBusyError(err) && !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("error=%v, want a temporary scheduler database failure", err)
+	if !isSQLiteBusyError(err) {
+		t.Fatalf("error=%v, want a bounded SQLite writer-lock failure", err)
+	}
+	if ctxErr != nil {
+		t.Fatalf("writer lock exhausted the scheduler context: %v", ctxErr)
 	}
 	if elapsed >= 650*time.Millisecond {
 		t.Fatalf("writer lock elapsed=%v, want at least 100ms safety margin below the 750ms scheduler deadline", elapsed)

@@ -18,9 +18,17 @@ const accountProtectionReservationBusyTimeoutMS = 200
 // In-memory databases cannot be reopened as the same database, so unit tests
 // using :memory: retain the ordinary handle and rely on their single process.
 func (s *store) reservationTransactionDB(ctx context.Context, mainDB *sql.DB) (*sql.DB, func(), error) {
-	path, err := reservationSQLiteMainDatabasePath(ctx, mainDB)
-	if err != nil {
-		return nil, nil, err
+	// The store already owns the canonical file path in production. Prefer it
+	// before querying PRAGMA database_list: a concurrent usage refresh can hold
+	// the primary pool's existing connection, and opening another primary DSN
+	// would repeat journal_mode=WAL negotiation while a writer lock is held.
+	path := knownReservationSQLitePath(s, mainDB)
+	if path == "" {
+		var err error
+		path, err = reservationSQLiteMainDatabasePath(ctx, mainDB)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	if path == "" {
 		return mainDB, func() {}, nil
@@ -67,6 +75,30 @@ func (s *store) reservationTransactionDB(ctx context.Context, mainDB *sql.DB) (*
 	}
 	s.mu.Unlock()
 	return db, func() { _ = db.Close() }, nil
+}
+
+func knownReservationSQLitePath(s *store, mainDB *sql.DB) string {
+	if s == nil || mainDB == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db != mainDB {
+		return ""
+	}
+	path := strings.TrimSpace(s.dbPath)
+	if isMemorySQLitePath(path) {
+		return ""
+	}
+	return path
+}
+
+func isMemorySQLitePath(path string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(path))
+	return normalized == ":memory:" ||
+		strings.HasPrefix(normalized, "file::memory:") ||
+		strings.Contains(normalized, "?mode=memory") ||
+		strings.Contains(normalized, "&mode=memory")
 }
 
 func openSQLiteReservationDB(path string) (*sql.DB, error) {
