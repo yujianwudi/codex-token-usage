@@ -498,16 +498,28 @@ func TestReservationWriterLockFailsClosedWithinSchedulerBudget(t *testing.T) {
 	previousCfg := globalAccountProtection.config()
 	globalAccountProtection.configure(cfg)
 	t.Cleanup(func() { globalAccountProtection.configure(previousCfg) })
+	s := &store{db: db, dbPath: path}
+	defer s.close()
 	// Keep the soft-usage snapshot fresh so this test isolates the primary-path
 	// lookup and reservation writer lock without launching a background reader.
 	globalAccountProtection.usageCacheMu.Lock()
+	previousUsageDB := globalAccountProtection.usageDB
+	previousUsageSince := globalAccountProtection.usageSince
+	previousUsageLoadedAt := globalAccountProtection.usageLoadedAt
+	previousUsage := globalAccountProtection.usage
 	globalAccountProtection.usageDB = db
 	globalAccountProtection.usageSince = time.Now().Unix() - int64(cfg.AccountProtectionTokenWindowSeconds) - 1
 	globalAccountProtection.usageLoadedAt = time.Now()
 	globalAccountProtection.usage = newProtectionUsageIndex(nil)
 	globalAccountProtection.usageCacheMu.Unlock()
-	s := &store{db: db, dbPath: path}
-	defer s.close()
+	defer func() {
+		globalAccountProtection.usageCacheMu.Lock()
+		globalAccountProtection.usageDB = previousUsageDB
+		globalAccountProtection.usageSince = previousUsageSince
+		globalAccountProtection.usageLoadedAt = previousUsageLoadedAt
+		globalAccountProtection.usage = previousUsage
+		globalAccountProtection.usageCacheMu.Unlock()
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
 	defer cancel()
 	started := time.Now()
